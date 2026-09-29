@@ -1,0 +1,23 @@
+# Dependencies and build products
+node_modules/
+dist/
+releases/
+work/
+
+# Local accounts, backups and credentials
+account*.json
+account*.json.*
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Local logs and editor state
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
