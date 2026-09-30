@@ -5,13 +5,30 @@ const { Engine, initialState } = require('./core/engine.cjs');
 const { Store } = require('./core/store.cjs');
 const { Market } = require('./core/market.cjs');
 const { analyze } = require('./core/analysis.cjs');
+const { evaluateEntry, configureStrategy } = require('./core/strategy.cjs');
+const { StrategyMonitor } = require('./core/strategy-monitor.cjs');
+const { Screener, FIELDS, BOARDS, OPS, parseDescription } = require('./core/screener.cjs');
+const { ScreenerStore } = require('./core/screener-store.cjs');
+const { Research, externalUrl } = require('./core/research.cjs');
 const { symbolOf, session, cnTime } = require('./core/common.cjs');
 const testDirArg = process.argv.find(a => a.startsWith('--test-data-dir='));
 if (testDirArg && !app.isPackaged) app.setPath('userData', testDirArg.split('=').slice(1).join('='));
 if (!app.requestSingleInstanceLock()) app.quit();
-let win, store, engine, market, timer, refreshing, fatal = '', quotes = {}, connection = { ok: false, message: '正在连接行情服务', at: null };
+let win, store, engine, market, monitor, screener, timer, refreshing, fatal = '', quotes = {}, connection = { ok: false, message: '正在连接行情服务', at: null };
 const indices = ['sh000001', 'sz399001', 'sz399006'];
-function state() { return { account: engine.s, stats: engine.stats(quotes), quotes: { ...engine.s.marks, ...quotes }, connection, session: session(), date: cnTime().date, now: Date.now(), dataPath: app.getPath('userData'), warning: fatal || store.warning }; }
+function strategySymbols() { return [...new Set([...engine.s.watchlist, ...engine.s.lots.map(l => l.symbol)])]; }
+function state() {
+  const signals = {};
+  for (const symbol of strategySymbols()) {
+    signals[symbol] = evaluateEntry(engine, symbol, quotes[symbol], monitor?.snapshots[symbol]);
+    if (fatal || !connection.ok) {
+      signals[symbol].buyable = false;
+      if (signals[symbol].status === '可以买入') signals[symbol].status = fatal ? '交易已暂停' : '等待有效行情';
+      signals[symbol].reasons.unshift(fatal || '行情连接不可用，等待恢复');
+    }
+  }
+  return { account: engine.s, stats: engine.stats(quotes), quotes: { ...engine.s.marks, ...quotes }, signals, connection, session: session(), date: cnTime().date, now: Date.now(), dataPath: app.getPath('userData'), warning: fatal || store.warning };
+}
 function publish() { if (win && !win.isDestroyed()) win.webContents.send('state', state()); }
 function transaction(fn) {
   if (fatal) throw Error(fatal);
@@ -26,9 +43,12 @@ async function refresh() {
     try {
       const batch = await market.quotes(symbols); Object.assign(quotes, batch);
       const missing = symbols.filter(s => !batch[s]);
-      connection = { ok: true, message: missing.length ? `${missing.length} 只股票暂缺报价` : '行情接口已连接', at: Date.now() };
-      try { transaction(() => engine.tick(batch)); } catch (e) { fatal = `账户保存失败，交易已暂停：${e.message}`; }
+      const sources = [...new Set(Object.values(batch).map(q => q.source).filter(Boolean))];
+      const displayOnly = Object.values(batch).filter(q => !indices.includes(q.symbol) && q.canTrade === false).length;
+      connection = { ok: true, message: [missing.length ? `${missing.length} 只股票暂缺报价` : '行情接口已连接', displayOnly ? `${displayOnly} 只股票行情仅供展示，暂停模拟成交` : ''].filter(Boolean).join(' · '), sources, at: Date.now() };
+      try { transaction(() => engine.tick(batch, monitor.snapshots)); } catch (e) { fatal = `账户保存失败，交易已暂停：${e.message}`; }
     } catch (e) { connection = { ok: false, message: `行情连接失败：${e.message}`, at: connection.at }; }
+    monitor.scan(strategySymbols()).catch(() => {});
     publish(); return state();
   })().finally(() => { refreshing = null; });
   return refreshing;
@@ -46,12 +66,29 @@ app.whenReady().then(() => {
   try { engine = new Engine(store.load() || initialState()); store.save(engine.s); }
   catch (e) { dialog.showErrorBox('观澜 · 账户无法载入', `${e.message}\n数据目录：${app.getPath('userData')}`); app.quit(); return; }
   market = new Market((url, opts) => net.fetch(url, opts));
+  const research = new Research((url, opts) => net.fetch(url, opts));
+  screener = new Screener((url, opts) => net.fetch(url, opts), new ScreenerStore(app.getPath('userData')), (symbol, signal) => market.strategyHistory(symbol, signal, true));
+  monitor = new StrategyMonitor(market, () => new Date(), publish);
   win = new BrowserWindow({ width: 1536, height: 980, minWidth: 1120, minHeight: 760, backgroundColor: '#0b1220', title: '观澜 · A股模拟交易', icon: path.join(__dirname, 'assets/icon.png'), autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   win.webContents.on('will-navigate', event => event.preventDefault());
   handler('state', () => state());
   handler('refresh', refresh);
+  handler('research:get', input => research.get(input));
+  handler('research:open', input => shell.openExternal(externalUrl(input)));
+  handler('screener:meta', () => ({ fields: FIELDS, boards: BOARDS, ops: OPS }));
+  handler('screener:parse', input => parseDescription(input));
+  handler('screener:status', () => screener.progress);
+  handler('screener:cancel', () => { screener.cancel(); return true; });
+  handler('screener:history', () => ({ snapshots: screener.history.list(), warning: screener.history.warning }));
+  handler('screener:run', input => screener.run(input?.query, engine.s.watchlist.slice(), input?.force === true, input?.snapshotId ?? null));
+  handler('screener:open', async input => {
+    const symbol = symbolOf(input);
+    // Company research remains accessible when quote services are unavailable.
+    try { const fresh = await market.quotes([symbol]); if (fresh[symbol]) quotes[symbol] = fresh[symbol]; } catch {}
+    publish(); return symbol;
+  });
   handler('detail', async input => {
     const symbol = symbolOf(input.symbol), history = await market.history(symbol, !!input.force);
     let minute = null, minuteError = null;
@@ -72,6 +109,14 @@ app.whenReady().then(() => {
     const trade = transaction(() => engine.execute({ ...input, symbol }, fresh[symbol], quotes)); publish(); return trade;
   });
   handler('order', input => { const order = transaction(() => engine.place(input)); publish(); return order; });
+  handler('strategy:buy', async input => {
+    const symbol = symbolOf(input.symbol);
+    const snapshot = await monitor.load(symbol, true);
+    const fresh = await market.quotes([symbol]); Object.assign(quotes, fresh);
+    const trade = transaction(() => engine.strategyEntry({ ...input, symbol }, fresh[symbol], snapshot, quotes));
+    publish(); return trade;
+  });
+  handler('strategy:settings', input => { const next = configureStrategy(input); transaction(() => { engine.s.strategySettings = next; }); publish(); });
   handler('cancel', input => { transaction(() => engine.cancel(input)); publish(); });
   handler('risk', input => { transaction(() => engine.setRisk(input.symbol, input)); publish(); });
   handler('settings', input => { transaction(() => engine.configure(input)); startTimer(); publish(); });

@@ -1,6 +1,6 @@
 {
   "name": "guanlan-paper",
-  "version": "1.0.0",
+  "version": "1.4.0",
   "description": "观澜 A 股模拟交易桌面工具",
   "author": "Guanlan",
   "private": true,
@@ -17,9 +17,24 @@
   "build": {
     "appId": "local.guanlan.paper",
     "productName": "Guanlan",
-    "directories": { "output": "dist" },
-    "files": ["main.cjs", "preload.cjs", "core/**", "ui/**", "assets/**", "package.json"],
-    "win": { "target": "portable", "icon": "assets/icon.ico", "signExecutable": false },
-    "portable": { "artifactName": "Guanlan-${version}-win-x64.exe" }
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "core/**",
+      "ui/**",
+      "assets/**",
+      "package.json"
+    ],
+    "win": {
+      "target": "portable",
+      "icon": "assets/icon.ico",
+      "signExecutable": false
+    },
+    "portable": {
+      "artifactName": "Guanlan-${version}-win-x64.exe"
+    }
   }
 }

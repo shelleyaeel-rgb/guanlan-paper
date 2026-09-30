@@ -1,47 +1,117 @@
-const { cnTime } = require('./common.cjs');
-function parseQuotes(text, receivedAt = Date.now()) {
-  const result = {};
-  for (const m of text.matchAll(/v_((?:sh|sz)\d{6})="([^"]*)"/g)) {
-    const a = m[2].split('~');
-    if (a.length < 34 || !(+a[3] > 0) || !/^\d{14}$/.test(a[30])) continue;
-    const s = a[30], date = `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`, time = `${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}`;
-    result[m[1]] = { symbol: m[1], code: a[2], name: a[1], price: +a[3], prevClose: +a[4], open: +a[5], volume: +a[6] * 100,
-      bid: +a[9], bidSize: +a[10] * 100, ask: +a[19], askSize: +a[20] * 100,
-      change: +a[31], changePct: +a[32], high: +a[33], low: +a[34], amount: +a[37] * 10000,
-      turnover: +a[38] || 0, pe: +a[39] || null, pb: +a[46] || null, limitUp: +a[47] || null, limitDown: +a[48] || null,
-      date, time, timestamp: Date.parse(`${date}T${time}+08:00`), receivedAt, source: '腾讯财经公开行情' };
-  }
-  return result;
-}
+const { cnTime, session, symbolOf } = require('./common.cjs');
+const { SOURCES, INDEX_SYMBOLS, numeric, scaled, invalid, parseQuotes, parseSinaQuotes, validateBars, validateMinute, parseEastmoneyBars, parseEastmoneyIntraday } = require('./market-parsers.cjs');
+const TENCENT_ENDPOINTS = ['https://proxy.finance.qq.com/ifzqgtimg', 'https://web.ifzq.gtimg.cn'];
+const RETRYABLE_STATUS = new Set([429, 500, 501, 502, 503, 504]);
 class Market {
-  constructor(fetcher = fetch) { this.fetcher = fetcher; this.cache = new Map(); }
-  async request(url, gbk = false) {
-    const response = await this.fetcher(url, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://gu.qq.com/' }, signal: AbortSignal.timeout(12000), cache: 'no-store' });
-    if (!response.ok) throw Error(`行情服务 HTTP ${response.status}`);
-    return gbk ? new TextDecoder('gb18030').decode(await response.arrayBuffer()) : response.json();
+  constructor(fetcher = fetch, { clock = Date.now, requestTimeoutMs = 3500, cooldownMs = 30000 } = {}) {
+    this.fetcher = fetcher; this.clock = clock; this.requestTimeoutMs = requestTimeoutMs; this.cooldownMs = cooldownMs;
+    this.cache = new Map(); this.failures = new Map();
+  }
+  async request(url, gbk = false, signal = null) {
+    const host = new URL(url).hostname;
+    const referrer = host.endsWith('sinajs.cn') ? 'https://finance.sina.com.cn/' : host.endsWith('eastmoney.com') ? 'https://quote.eastmoney.com/' : 'https://gu.qq.com/';
+    const timeout = AbortSignal.timeout(this.requestTimeoutMs), combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    combined.throwIfAborted();
+    const response = await this.fetcher(url, { headers: { 'User-Agent': 'Mozilla/5.0', Referer: referrer }, signal: combined, cache: 'no-store' });
+    if (!response.ok) {
+      const error = Object.assign(Error(`HTTP ${response.status}（${host}）`), { status: response.status });
+      const retryAfter = response.headers?.get('retry-after');
+      if (retryAfter) error.retryAfterMs = Math.max(0, /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter) - this.clock());
+      try { await response.body?.cancel(); } catch {}
+      throw error;
+    }
+    const data = gbk ? new TextDecoder('gb18030').decode(await response.arrayBuffer()) : await response.json();
+    combined.throwIfAborted(); return data;
+  }
+  async attempt(key, load, signal, force = false) {
+    signal?.throwIfAborted();
+    const prior = this.failures.get(key);
+    if (prior && prior.until > this.clock() && (!force || prior.retryAfterUntil > this.clock())) throw Object.assign(Error(`暂缓重试（${prior.message}）`), { code: 'cooldown' });
+    try { const result = await load(); signal?.throwIfAborted(); this.failures.delete(key); return result; }
+    catch (error) {
+      signal?.throwIfAborted();
+      // A missing/invalid series for one stock must not disable other stocks on the same service.
+      if (error.code !== 'invalid') this.failures.set(key, { until: this.clock() + Math.max(this.cooldownMs, error.retryAfterMs || 0), retryAfterUntil: this.clock() + (error.retryAfterMs || 0), message: error.message });
+      throw error;
+    }
+  }
+  async route(label, candidates, signal = null, force = false) {
+    const deadline = AbortSignal.timeout(12000), combined = signal ? AbortSignal.any([signal, deadline]) : deadline, failures = [];
+    let allInvalid = true;
+    for (const candidate of candidates) {
+      combined.throwIfAborted();
+      try { return await this.attempt(candidate.key, () => candidate.load(combined), combined, force); }
+      catch (error) {
+        combined.throwIfAborted(); failures.push(`${candidate.name}：${error.message}`);
+        if (error.code !== 'invalid') allInvalid = false;
+        if (error.status && !RETRYABLE_STATUS.has(error.status)) break;
+      }
+    }
+    const error = Error(`${label}获取失败：${failures.join('；')}`);
+    if (allInvalid) error.code = 'invalid';
+    throw error;
   }
   async quotes(symbols) {
-    const data = parseQuotes(await this.request(`https://qt.gtimg.cn/q=${[...new Set(symbols)].join(',')}`, true));
-    if (!Object.keys(data).length) throw Error('未收到有效报价，请检查网络或稍后重试');
+    const requested = [...new Set(symbols.map(s => INDEX_SYMBOLS.has(s) ? s : symbolOf(s)))];
+    if (!requested.length) return {};
+    const now = this.clock(), data = {}, errors = [];
+    const fresh = q => q && q.timestamp <= now + 15000 && (!session(new Date(now)).open || (q.date === cnTime(now).date && now - q.timestamp <= 90000));
+    for (const provider of ['tencent', 'sina']) {
+      const needed = requested.filter(s => !fresh(data[s]));
+      if (!needed.length) break;
+      try {
+        const batch = await this.attempt(`quotes:${provider}`, async () => {
+          const url = provider === 'tencent' ? `https://qt.gtimg.cn/q=${needed.join(',')}` : `https://hq.sinajs.cn/list=${needed.join(',')}`;
+          const parsed = (provider === 'tencent' ? parseQuotes : parseSinaQuotes)(await this.request(url, true), this.clock());
+          const accepted = Object.fromEntries(needed.filter(s => parsed[s] && parsed[s].timestamp <= this.clock() + 15000).map(s => [s, parsed[s]]));
+          if (!Object.keys(accepted).length) throw invalid('未收到有效报价');
+          return accepted;
+        });
+        for (const symbol of needed) if (batch[symbol] && (!data[symbol] || batch[symbol].timestamp >= data[symbol].timestamp)) data[symbol] = batch[symbol];
+      } catch (error) { errors.push(`${SOURCES[provider]}：${error.message}`); }
+    }
+    if (!Object.keys(data).length) throw Error(`报价获取失败：${errors.join('；')}`);
     return data;
   }
+  async daily(symbol, adjustment, count, signal = null, force = false) {
+    symbol = symbolOf(symbol);
+    const qfq = adjustment === 'qfq', label = qfq ? '前复权日线' : '未复权日线';
+    const entry = (bars, provider) => ({ bars, provider, source: SOURCES[provider], adjustment: qfq ? '前复权' : '未复权', fetchedAt: this.clock() });
+    const candidates = TENCENT_ENDPOINTS.map((endpoint, i) => ({ key: `daily:${adjustment}:tencent:${i}`, name: `${SOURCES.tencent}${i ? '备用' : ''}`, load: async signal => {
+      const json = await this.request(`${endpoint}/appstock/app/fqkline/get?param=${symbol},day,,,${count},${qfq ? 'qfq' : ''}`, false, signal);
+      if (json?.code != null && json.code !== 0) throw invalid('腾讯日线返回错误');
+      const raw = json?.data?.[symbol]?.[qfq ? 'qfqday' : 'day'];
+      if (!Array.isArray(raw)) throw invalid(`未收到${label}`);
+      return entry(validateBars(raw, this.clock()), 'tencent');
+    } }));
+    const params = new URLSearchParams({ secid: `${symbol.startsWith('sh') ? 1 : 0}.${symbol.slice(2)}`, klt: '101', fqt: qfq ? '1' : '0', beg: '0', end: '20500101', lmt: String(count + 1), ut: '7eea3edcaed734bea9cbfc24409ed989', fields1: 'f1,f2,f3,f4,f5,f6', fields2: 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61' });
+    candidates.push({ key: `daily:${adjustment}:eastmoney`, name: SOURCES.eastmoney, load: async signal => entry(parseEastmoneyBars(await this.request(`https://push2his.eastmoney.com/api/qt/stock/kline/get?${params}`, false, signal), symbol, this.clock()).slice(-(count + 1)), 'eastmoney') });
+    return this.route(label, candidates, signal, force);
+  }
   async history(symbol, force = false) {
+    symbol = symbolOf(symbol);
     const hit = this.cache.get(symbol);
-    if (!force && hit && Date.now() - hit.fetchedAt < 60000) return hit;
-    const j = await this.request(`https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${symbol},day,,,640,qfq`);
-    const raw = j.data?.[symbol]?.qfqday;
-    if (!Array.isArray(raw) || raw.length < 30) throw Error('前复权日线不足，暂时无法分析');
-    const bars = raw.map(a => ({ date: a[0], open: +a[1], close: +a[2], high: +a[3], low: +a[4], volume: +a[5] * 100 }))
-      .filter(a => a.close > 0 && a.open > 0 && a.high >= a.low && a.date <= cnTime().date).sort((a, b) => a.date.localeCompare(b.date));
-    const entry = { bars, fetchedAt: Date.now(), adjustment: '前复权', source: '腾讯财经' };
-    this.cache.set(symbol, entry);
-    return entry;
+    if (!force && hit && this.clock() - hit.fetchedAt < 60000) return hit;
+    const entry = await this.daily(symbol, 'qfq', 640, null, force);
+    if (entry.bars.length < 30) throw Error('前复权日线不足，暂时无法分析');
+    this.cache.set(symbol, entry); return entry;
   }
   async intraday(symbol) {
-    const j = await this.request(`https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=${symbol}`);
-    const raw = j.data?.[symbol]?.data;
-    if (!Array.isArray(raw?.data)) throw Error('分时数据暂不可用');
-    return { date: raw.date, points: raw.data.map(s => { const a = s.split(' '); return { time: a[0], price: +a[1], volume: +a[2] * 100 }; }).filter(a => a.price > 0 && a.time <= '1500') };
+    symbol = symbolOf(symbol);
+    const entry = (data, provider) => ({ ...data, source: SOURCES[provider], provider, fetchedAt: this.clock() });
+    const candidates = TENCENT_ENDPOINTS.map((endpoint, i) => ({ key: `minute:tencent:${i}`, name: `${SOURCES.tencent}${i ? '备用' : ''}`, load: async signal => {
+      const json = await this.request(`${endpoint}/appstock/app/minute/query?code=${symbol}`, false, signal), data = json?.data?.[symbol], raw = data?.data;
+      if ((json?.code != null && json.code !== 0) || !Array.isArray(raw?.data) || raw.data.some(s => typeof s !== 'string')) throw invalid('分时数据暂不可用');
+      const points = raw.data.map(s => { const a = s.split(' '); return { time: a[0], price: numeric(a[1]), volume: scaled(a[2], 100) }; }).filter(p => p.time <= '1500');
+      return entry({ ...validateMinute(raw.date, points, this.clock()), prevClose: numeric(data.qt?.[symbol]?.[4]) }, 'tencent');
+    } }));
+    const params = new URLSearchParams({ secid: `${symbol.startsWith('sh') ? 1 : 0}.${symbol.slice(2)}`, ndays: '1', iscr: '0', fields1: 'f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11', fields2: 'f51,f52,f53,f54,f55,f56,f57,f58' });
+    candidates.push({ key: 'minute:eastmoney', name: SOURCES.eastmoney, load: async signal => entry(parseEastmoneyIntraday(await this.request(`https://push2.eastmoney.com/api/qt/stock/trends2/get?${params}`, false, signal), symbol, this.clock()), 'eastmoney') });
+    return this.route('分时', candidates);
+  }
+  async strategyHistory(symbol, signal = null, withMetadata = false) {
+    const entry = await this.daily(symbol, 'raw', 120, signal);
+    return withMetadata ? entry : entry.bars;
   }
 }
-module.exports = { Market, parseQuotes };
+module.exports = { Market, parseQuotes, parseSinaQuotes, parseEastmoneyBars, parseEastmoneyIntraday };
