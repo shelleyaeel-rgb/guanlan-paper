@@ -34,6 +34,8 @@ const { createEntryConditions, entryConditionNeedsFundamentals } = require('./co
 const { symbolOf, session, cnTime } = require('./core/common.cjs');
 const { decisionView, accountView } = require('./core/view-state.cjs');
 const { ViewStream } = require('./core/view-stream.cjs');
+const { AccountOperations } = require('./core/account-operations.cjs');
+const accountOperations = new AccountOperations(() => engine.s, fn => transaction(fn));
 const viewStream = new ViewStream();
 let viewSubscribed = false;
 const testDirArg = process.argv.find(a => a.startsWith('--test-data-dir='));
@@ -75,14 +77,19 @@ function state({ view = false } = {}) {
 }
 function publish(snapshot) {
   clearTimeout(publishTimer); publishTimer = null;
+  // Saving is the commit boundary. A renderer failure must never turn a
+  // committed operation into a business rejection; view resync recovers gaps.
+  try {
   if (win && !win.isDestroyed()) {
     const current = snapshot || state({ view: true });
     if (viewSubscribed) win.webContents.send('view:patch', viewStream.next(current));
     else win.webContents.send('state', current);
   }
+  return true;
+  } catch { return false; }
 }
 function publishAgencyPoolProgress() {
-  if (win && !win.isDestroyed() && agencyPool) win.webContents.send('agency:pool:progress', agencyPool.progressState());
+  try { if (win && !win.isDestroyed() && agencyPool) win.webContents.send('agency:pool:progress', agencyPool.progressState()); } catch {}
 }
 function schedulePublish() { if (!publishTimer) publishTimer = setTimeout(() => { publishTimer = null; publish(); }, 500); }
 function transaction(fn) {
@@ -96,9 +103,11 @@ function transaction(fn) {
 async function refresh() {
   if (refreshing) return refreshing;
   refreshing = (async () => {
+    const identity = accountOperations.capture();
     const symbols = [...new Set([...strategySymbols(), ...engine.s.orders.filter(o => o.status === 'pending').map(o => o.symbol), ...indices])];
     try {
-      const batch = await market.quotes(symbols); Object.assign(quotes, batch);
+      const batch = await market.quotes(symbols);
+      accountOperations.assertCurrent(identity); Object.assign(quotes, batch);
       const missing = symbols.filter(s => !batch[s]);
       const sources = [...new Set(Object.values(batch).map(q => q.source).filter(Boolean))];
       const displayOnly = Object.values(batch).filter(q => !indices.includes(q.symbol) && q.canTrade === false).length;
@@ -111,7 +120,10 @@ async function refresh() {
           if (!fatal) { fatal = `交易处理失败，交易已暂停：${e.message}`; agency?.invalidate(); }
         }
       }
-    } catch (e) { connection = { ok: false, message: `行情连接失败：${e.message}`, at: connection.at }; }
+    } catch (e) {
+      try { accountOperations.assertCurrent(identity); } catch { return state({ view: true }); }
+      connection = { ok: false, message: `行情连接失败：${e.message}`, at: connection.at };
+    }
     const holdings = [...new Set(engine.s.lots.map(lot => lot.symbol))], holdingSet = new Set(holdings);
     const symbolsToScan = strategySymbols().filter(symbol => !holdingSet.has(symbol));
     // Separate scan lanes keep holding history/notices ahead of background entry
@@ -132,6 +144,9 @@ function handler(name, fn) {
     if (event.sender !== win.webContents || event.senderFrame !== win.webContents.mainFrame) return { ok: false, error: '无效窗口来源' };
     try { return { ok: true, data: await fn(payload) }; } catch (e) { return { ok: false, error: e.message }; }
   });
+}
+function operationHandler(name, perform) {
+  handler(name, input => accountOperations.run(name, input, context => perform(input, context)));
 }
 app.on('second-instance', () => { if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); } });
 app.whenReady().then(() => {
@@ -215,7 +230,14 @@ app.whenReady().then(() => {
   handler('view:subscribe', () => { viewSubscribed = true; return viewStream.reset(state({ view: true })); });
   handler('view:refresh', refresh);
   handler('refresh', async () => { await refresh(); return state(); });
-  handler('agency:transfer', input => { const result = transaction(() => engine.agencyTransfer(input)); publish(); return result; });
+  handler('operation:status', input => accountOperations.status(input?.channel, input?.request));
+  operationHandler('agency:transfer', async (input, operation) => {
+    const symbols = [...new Set(engine.s.lots.filter(lot => lot.owner === input.strategyId).map(lot => lot.symbol))];
+    const fresh = symbols.length ? await market.quotes(symbols) : {};
+    operation.assertCurrent(); Object.assign(quotes, fresh);
+    const result = operation.commit(() => { engine.agencyTransfer(input, quotes); return engine.s.agency.transfers.at(-1); });
+    publish(); return result;
+  });
   handler('agency:configure', input => { const result = transaction(() => engine.agencyConfigure(input)); publish(); return result; });
   handler('agency:mode', input => { const result = transaction(() => engine.agencyMode(input)); publish(); if (input.mode === 'running') agency?.poll({ force: true, groupIds: [input.strategyId] }).catch(() => {}); return result; });
   handler('agency:member', async input => {
@@ -361,26 +383,38 @@ app.whenReady().then(() => {
   });
   handler('watch:add', async input => {
     const symbol = symbolOf(input);
+    const identity = accountOperations.capture();
     if (engine.s.watchlist.length >= 50) throw Error('自选股最多 50 只');
     const found = await market.quotes([symbol]);
+    accountOperations.assertCurrent(identity);
     if (!found[symbol]) throw Error('没有找到该股票的有效行情');
-    quotes[symbol] = found[symbol]; transaction(() => { if (!engine.s.watchlist.includes(symbol)) engine.s.watchlist.push(symbol); engine.s.marks[symbol] = found[symbol]; }); publish(); return symbol;
+    quotes[symbol] = found[symbol]; transaction(() => {
+      accountOperations.assertCurrent(identity);
+      if (!engine.s.watchlist.includes(symbol)) {
+        if (engine.s.watchlist.length >= 50) throw Error('自选股最多 50 只');
+        engine.s.watchlist.push(symbol);
+      }
+      engine.s.marks[symbol] = found[symbol];
+    }); publish(); return symbol;
   });
   handler('watch:remove', input => { const symbol = symbolOf(input); transaction(() => { engine.s.watchlist = engine.s.watchlist.filter(s => s !== symbol); }); publish(); });
-  handler('trade', async input => {
+  operationHandler('trade', async (input, operation) => {
     const symbol = symbolOf(input.symbol);
-    const fresh = await market.quotes([symbol]); Object.assign(quotes, fresh);
-    const trade = transaction(() => engine.execute({ ...input, symbol }, fresh[symbol], quotes)); publish(); return trade;
+    const symbols = [...new Set([symbol, ...(input.side === 'buy' ? engine.s.lots.map(lot => lot.symbol) : [])])];
+    const fresh = await market.quotes(symbols); operation.assertCurrent(); Object.assign(quotes, fresh);
+    const trade = operation.commit(() => engine.execute({ ...input, symbol }, fresh[symbol], quotes)); publish(); return trade;
   });
-  handler('order', input => { const order = transaction(() => engine.place(input)); publish(); return order; });
-  handler('strategy:buy', async input => {
+  operationHandler('order', (input, operation) => { const order = operation.commit(() => engine.place(input)); publish(); return order; });
+  operationHandler('strategy:buy', async (input, operation) => {
     const symbol = symbolOf(input.symbol), strategyId = strategyProfile(input.strategyId).id;
     if (strategyId !== engine.selectedStrategy(symbol)) throw Error('已选策略发生变化，请查看当前买卖计划后重新确认');
     if (!input.expected || input.expected.strategyId !== strategyId) throw Error('请先查看并确认当前策略的买卖计划');
     const snapshot = await monitor.load(symbol, true, needsFundamentals(symbol), needsNotices(symbol));
-    const fresh = await market.quotes([symbol]); Object.assign(quotes, fresh);
+    operation.assertCurrent();
+    const fresh = await market.quotes([...new Set([symbol, ...engine.s.lots.map(lot => lot.symbol)])]);
+    operation.assertCurrent(); Object.assign(quotes, fresh);
     research.assertNoticeCurrent(symbol, snapshot?.notices);
-    const trade = transaction(() => {
+    const trade = operation.commit(() => {
       research.assertNoticeCurrent(symbol, snapshot?.notices);
       return engine.strategyEntry({ ...input, symbol }, fresh[symbol], snapshot, quotes);
     });
@@ -407,7 +441,10 @@ app.whenReady().then(() => {
   });
   handler('reset', input => {
     if (input.confirm !== '重置') throw Error('请输入“重置”确认');
-    const next = new Engine(initialState(input.capital)).s; enableMarketPolicy(next); store.backup(engine.s); agency?.invalidate(); agencyPool?.cancel(); transaction(() => { engine.s = next; }); entryEvidenceWarning = ''; publish(); return true;
+    const next = new Engine(initialState(input.capital)).s;
+    next.createdAt = new Date(Math.max(Date.now(), Date.parse(engine.s.createdAt) + 1)).toISOString();
+    enableMarketPolicy(next); store.backup(engine.s); agency?.invalidate(); agencyPool?.cancel(); transaction(() => { engine.s = next; });
+    quotes = {}; entryEvidenceWarning = ''; publish(); return true;
   });
   handler('backup', async () => {
     const selected = await dialog.showSaveDialog(win, { title: '备份模拟账户', defaultPath: `观澜账户备份-${cnTime().date}.json`, filters: [{ name: 'JSON', extensions: ['json'] }] });

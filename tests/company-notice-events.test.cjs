@@ -71,6 +71,48 @@ test('真实终止融资与未出资投资可核验，实际清算投资缺失�
   assert.equal(evaluate(find('sz301269'), text => text + '公司已发生重大损失。').status, 'blocked');
   assert.notEqual(evaluate(find('sz301269'), text => text.replaceAll('尚未出资', '已经出资')).status, 'clear');
 });
+
+test('本次未出资须绑定公告时点和当前项目，历史或其他项目不能解除门槛', () => {
+  const item = find('sz301269');
+  const text = funding => `董事会审议通过终止本次投资的议案。${funding}本次终止不会对公司经营造成重大不利影响。`;
+  for (const funding of [
+    '公司于2025年尚未出资。本次投资于2026年已实缴出资1000万元，目前已出资款的清算回收尚未确定。',
+    '本次投资公司已实缴出资1000万元，尚有出资款未收回。公司另一个项目尚未出资。',
+    '截至本公告披露日，公司另一个项目尚未出资。',
+    '截至2025年10月13日，本次投资尚未出资。',
+    '本次投资尚未出资。',
+    '截至本公告披露日，公司尚未出资。',
+    '截至本公告披露日，公司与关联方共同投资其他基金尚未出资。',
+    '截至本公告披露日，无法确认本次投资尚未出资。',
+    '截至本公告披露日，不存在本次投资尚未出资的情况。',
+    '截至本公告披露日，本次投资尚未出资的说法不属实。'
+  ]) {
+    const result = evaluate(item, () => text(funding));
+    assert.equal(result.status, 'unverified', funding);
+    assert.ok(result.factReview.missingFields.includes('funded'));
+    assert.notEqual(result.factReview.eligibility.status, 'pass');
+    assert.ok(!result.warnings.some(warning => warning.code === 'investment-termination-observation'));
+  }
+  for (const funding of ['截至本公告披露日，本次投资尚未出资。', '截至2026年10月13日，本次投资尚未出资。']) {
+    const result = evaluate(item, () => text(funding));
+    assert.equal(result.status, 'clear', funding);
+    assert.equal(result.factReview.checks.find(check => check.key === 'funded').value, 0);
+  }
+  assert.equal(evaluate(item, original => original + '公司另一个项目已出资1000万元。').status, 'clear');
+});
+
+test('当前项目已出资、未收回和清算不明的相反披露不能被未出资句覆盖', () => {
+  const base = '董事会审议通过终止本次投资的议案。截至本公告披露日，本次投资尚未出资。本次终止不会对公司经营造成重大不利影响。';
+  for (const contrary of ['本次投资已实缴出资1000万元。', '本次投资公司已支付投资款1000万元。',
+    '本次投资尚有出资款未收回。', '本次投资清算回收尚未确定。', '本次投资仍待清算。',
+    '公司不存在重大损失，本次投资已实缴出资1000万元。', '公司不存在重大损失且本次投资已完成实缴1000万元。']) {
+    const result = evaluate(find('sz301269'), () => base + contrary);
+    assert.equal(result.status, 'unverified', contrary);
+    const funding = result.factReview.checks.find(check => check.key === 'funded');
+    assert.equal(funding.status, 'conflict'); assert.equal(funding.value, null);
+    assert.ok(funding.records.some(record => record.quote.includes(contrary.slice(0, -1))));
+  }
+});
 test('终止决议的否定不能当已完成，资产收购终止不能套用融资规则，承诺日期必须有效', () => {
   const financing = cases.find(item => item.symbol === 'sz300364' && /H股/.test(item.document.title));
   assert.notEqual(evaluate(financing, () => '董事会尚未审议通过终止H股发行的议案。公司生产经营正常。本次终止不会对公司经营造成影响。').status, 'clear');

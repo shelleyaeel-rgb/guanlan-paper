@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const { buildProductMetrics, metricsFromObservations } = require('../core/company-product-metrics.cjs');
 const { reportProductTables } = require('../core/company-evidence-structured.cjs');
+const { evaluateResearchRules } = require('../core/research-rules.cjs');
 const NOW = new Date('2026-10-15T10:00:00+08:00'), SYMBOL = 'sh600001';
 const shareHeader = '营业收入构成\n单位：万元\n本报告期 上年同期 同比增减\n金额 占营业收入比重 金额 占营业收入比重';
 const share = `${shareHeader}\n营业收入合计 200 100% 160 100% 25%\n分产品\n汽车扬声器 120 60% 80 50% 50%`;
@@ -176,6 +177,68 @@ test('current and prior revenue/cost originals calculate margin changes in perce
   assert.equal(metrics.grossMarginPct.value, 30); assert.equal(metrics.previousGrossMarginPct.value, 20);
   assert.ok(Math.abs(metrics.grossMarginChangePp.value - 10) < 1e-8);
   assert.equal(metrics.grossMarginChangePp.unit, '百分点'); assert.equal(metrics.grossMarginChangePp.usable, true);
+});
+
+const comparableCosts = ['七、合并财务报表项目注释', `单位：万元 币种：人民币
+项目 本期发生额 上期发生额
+收入 成本 收入 成本
+合计 120 84 100 80
+2 )主营业务(分产品)
+产品名称 本期发生额 上期发生额
+收入 成本 收入 成本
+汽车扬声器 120 84 100 80
+合计 120 84 100 80`];
+function reportedMarginChange(cell, unit = '', heading = '') {
+  return `${heading}${marginHeader}${unit}\n分产品\n汽车扬声器 120 84 30% 20% 5% ${cell}`;
+}
+function marginRule(productMetrics) {
+  return evaluateResearchRules({ version: 1, enabled: true, path: 'product', rules: [{ field: 'grossMarginChangePp', op: 'gt', value: 0 }] },
+    { symbol: SYMBOL, productMetrics }, NOW);
+}
+
+test('原始毛利率增减表只披露百分比时不把它当作百分点，也不忽略后放行', () => {
+  // Exercise both source-table parsers, then the real rule evaluation boundary.
+  for (const heading of ['', '三、主营业务分析\n']) for (const disclosure of ['-5%', '10%']) {
+    const result = build([reportedMarginChange(disclosure, '', heading), ...comparableCosts]);
+    const metric = fields(result).grossMarginChangePp;
+    assert.ok(Math.abs(metric.value - 10) < 1e-8);
+    assert.equal(metric.unit, '百分点');
+    assert.equal(metric.reportedValue, Number(disclosure.replace('%', '')));
+    assert.equal(metric.reportedUnit, '%');
+    assert.equal(metric.rawUnit, '%');
+    assert.equal(metric.status, 'pending'); assert.equal(metric.usable, false);
+    assert.equal(metric.reasonCode, 'reported-change-unit-unverified');
+    assert.equal(marginRule(result).status, 'pending'); assert.equal(marginRule(result).blocksEntry, true);
+    assert.equal(fields(result).grossMarginPct.usable, true, 'an ambiguous change does not erase current margin');
+    assert.ok(metric.sourceRefs.some(source => source.quote.includes(disclosure)));
+  }
+});
+
+test('明确百分点的原始表格须与同产品两期成本复算一致才能通过规则', () => {
+  for (const heading of ['', '三、主营业务分析\n']) for (const disclosure of ['10', '-5']) {
+    const result = build([reportedMarginChange(disclosure, '（百分点）', heading), ...comparableCosts]);
+    const metric = fields(result).grossMarginChangePp, matching = disclosure === '10';
+    assert.ok(Math.abs(metric.value - 10) < 1e-8);
+    assert.equal(metric.reportedValue, Number(disclosure)); assert.equal(metric.reportedUnit, '百分点');
+    assert.equal(metric.rawUnit, '百分点'); assert.equal(metric.usable, matching);
+    assert.equal(metric.status, matching ? 'available' : 'conflict');
+    assert.equal(metric.reasonCode, matching ? null : 'reported-calculated-mismatch');
+    assert.equal(marginRule(result).status, matching ? 'pass' : 'pending');
+    assert.equal(marginRule(result).blocksEntry, !matching);
+  }
+});
+
+test('毛利率增减单位缺失、与单元格冲突或不同原文披露值冲突时保留待核验', () => {
+  for (const table of [reportedMarginChange('-5'), reportedMarginChange('-5%', '（百分点）')]) {
+    const result = build([table, ...comparableCosts]), metric = fields(result).grossMarginChangePp;
+    assert.equal(metric.usable, false); assert.equal(metric.status, 'pending');
+    assert.equal(metric.rawValue, '-5' + (table.includes('-5%') ? '%' : ''));
+    assert.equal(metric.reportedValue, null, 'do not reinterpret an unverified source value');
+    assert.equal(marginRule(result).blocksEntry, true);
+  }
+  const conflict = build([reportedMarginChange('10', '（百分点）'), reportedMarginChange('-5', '（百分点）'), ...comparableCosts]);
+  assert.equal(fields(conflict).grossMarginChangePp.status, 'conflict');
+  assert.equal(marginRule(conflict).status, 'pending');
 });
 
 test('native Feike two-period product costs calculate margins and exclude later parent-only notes', () => {

@@ -21,6 +21,42 @@ const timeText = v => {
 };
 let state, selected = 'sh600519', detail, page = 'market', chartMode = 'day', side = 'buy', detailSeq = 0, toastTimer, settingsReady = false, detailBusy = false, riskDirty = false;
 const planSelectionPending = new Map();
+const operationClient = new GuanlanOperations.OperationClient({
+  storage: window.localStorage,
+  account: () => state && ({ createdAt: state.account.createdAt, dataPath: state.dataPath }),
+  call: (name, payload) => window.guanlan.call(name, payload), uuid: () => crypto.randomUUID(),
+  onChange: () => { if (state) renderPendingOperations(); }
+});
+function renderPendingOperations() {
+  let panel = $('pending-operation');
+  if (!panel) {
+    panel = document.createElement('div'); panel.id = 'pending-operation'; panel.className = 'warning hidden';
+    $('warning').after(panel);
+    panel.addEventListener('click', event => action(async () => {
+      const button = event.target.closest('[data-operation]'); if (!button) return;
+      if (button.dataset.operation === 'retry') {
+        const pending = operationClient.pending(); if (!pending) return;
+        const identity = state.account.createdAt;
+        if (!await confirmDialog('重试待核对操作', '重试原操作及原数量；若已经保存则返回原结果。若尚未执行，交易将使用重试时的行情重新校验。')) return;
+        if (state.account.createdAt !== identity) throw Error('模拟账户已变更，请重新确认');
+        if (operationClient.pending()?.request.requestId !== pending.request.requestId) throw Error('待核对操作已变化，请重新核对');
+        await operationClient.retry(); toast('原操作已核对并完成');
+      } else {
+        const result = await operationClient.query({ discardAbsent: button.dataset.operation === 'discard' });
+        toast(result.status === 'committed' ? '原操作已保存，已核对完成' : result.status === 'pending' ? '原操作仍在处理中，请稍后核对' : button.dataset.operation === 'discard' ? '已确认原操作未执行，可重新填写' : '原操作未执行，可重试或取消待核对记录');
+      }
+      await api('state'); renderPendingOperations();
+    }));
+  }
+  try {
+    const pending = operationClient.pending(); panel.classList.toggle('hidden', !pending);
+    if (!pending) return;
+    const p = pending.request;
+    const label = pending.channel === 'agency:transfer' ? `${strategyProfile(p.strategyId).name} 划拨 ¥ ${num(p.amount)}`
+      : `${p.symbol} · ${p.side === 'sell' ? '卖出' : '买入'} ${num(p.quantity, 0)} 股${p.limit ? ` · 限价 ${num(p.limit)}` : ''}`;
+    setHtml('pending-operation', `<strong>操作结果待核对</strong> · ${esc(label)}<p>请先核对这笔操作，再提交其他交易或划拨。重启后仍可核对同一笔。</p><button data-operation="query">查询结果</button> <button data-operation="retry">重试原操作</button> <button data-operation="discard">确认未执行后取消</button>`);
+  } catch { panel.classList.remove('hidden'); panel.textContent = '无法读取待核对操作，请恢复本地存储后重新打开应用；交易暂不可提交。'; }
+}
 let streamSnapshot = null, streamRevision = 0, viewResyncPromise = null, viewRetryTimer = null, viewRetryAt = 0, viewRetryFailures = 0;
 const pendingViewPatches = [];
 function acceptViewEnvelope(envelope) {
@@ -62,6 +98,7 @@ function receiveViewEnvelope(envelope) {
 function strategyProfile(id = 'swing') { return state?.strategyProfiles?.find(profile => profile.id === id) || { id, name: ({ 'ultra-short': '超短线', short: '短线', swing: '波段', long: '长线' })[id] || '策略', horizon: id === 'swing' ? '数日至数周观察' : '', entryDescription: '', exitDescription: '', dataDescription: '' }; }
 function selectedStrategyId(symbol = selected) { const risk = state?.account.risks[symbol], owner = state?.agency?.groups.find(g => g.members.some(m => m.symbol === symbol)); return risk?.strategy ? risk.strategyId || 'swing' : owner?.id || planSelectionPending.get(symbol) || state?.planSelections?.[symbol] || 'swing'; }
 async function api(name, payload) {
+  if (GuanlanOperations.channels.includes(name)) return operationClient.send(name, payload);
   const streamedRead = ['state', 'refresh'].includes(name) && window.guanlan.subscribeView && typeof GuanlanViewReceiver !== 'undefined';
   if (streamedRead && name === 'state') {
     // Establish a versioned baseline after the user's action. A late packet
@@ -144,6 +181,7 @@ function setHtml(target, html, context = '') {
 }
 function renderState(s) {
   state = s; const stat = s.stats, q = s.quotes[selected];
+  renderPendingOperations();
   $('session').textContent = s.session.label;
   const latest = s.connection.at ? new Date(s.connection.at).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '—';
   $('connection').className = 'connection' + (s.connection.ok ? '' : ' error') + (page === 'screener' ? ' hidden' : '');
@@ -321,7 +359,7 @@ $('buy-side').addEventListener('click',()=>setSide('buy'));$('sell-side').addEve
 $('order-type').addEventListener('change',()=>{$('limit-label').classList.toggle('hidden',$('order-type').value!=='limit');if(!$('limit-price').value&&state.quotes[selected])$('limit-price').value=state.quotes[selected].price;renderEstimate();});
 ['quantity','limit-price'].forEach(k=>$(k).addEventListener('input',renderEstimate));
 document.querySelectorAll('[data-qty]').forEach(b=>b.addEventListener('click',()=>{$('quantity').value=b.dataset.qty;renderEstimate();}));
-$('trade-form').addEventListener('submit',e=>{e.preventDefault();action(async()=>{const input={symbol:selected,side,quantity:Number($('quantity').value)},isLimit=$('order-type').value==='limit';if(isLimit)input.limit=Number($('limit-price').value);const ok=await confirmDialog(isLimit?'创建模拟条件单':'确认模拟交易',`<b>${esc(state.quotes[selected]?.name||selected)}</b> · ${selected}<br>${side==='buy'?'买入':'卖出'} ${num(input.quantity,0)} 股${isLimit?` · 限价 ¥ ${num(input.limit)}`:''}<p>${isLimit?'条件单持续有效，不冻结资金或股份；仅在程序运行、行情新鲜且满足交易规则时执行。':'提交后重新获取报价，以最新对手价加减滑点撮合，最终金额可能与当前预估略有差异。'}</p>`);if(!ok)return;$('trade-submit').disabled=true;try{const result=await api(isLimit?'order':'trade',input);toast(isLimit?'限价条件单已保存，可在持仓与委托中查看':`模拟${side==='buy'?'买入':'卖出'} ${result.quantity} 股，成交价 ${num(result.price)} 元`);riskDirty=false;syncRisk();}finally{renderEstimate();}});});
+$('trade-form').addEventListener('submit',e=>{e.preventDefault();action(async()=>{const input={symbol:selected,side,accountCreatedAt:state.account.createdAt,quantity:Number($('quantity').value)},isLimit=$('order-type').value==='limit';if(isLimit)input.limit=Number($('limit-price').value);const ok=await confirmDialog(isLimit?'创建模拟条件单':'确认模拟交易',`<b>${esc(state.quotes[selected]?.name||selected)}</b> · ${selected}<br>${side==='buy'?'买入':'卖出'} ${num(input.quantity,0)} 股${isLimit?` · 限价 ¥ ${num(input.limit)}`:''}<p>${isLimit?'条件单持续有效，不冻结资金或股份；仅在程序运行、行情新鲜且满足交易规则时执行。':'提交后重新获取报价，以最新对手价加减滑点撮合，最终金额可能与当前预估略有差异。'}</p>`);if(!ok)return;$('trade-submit').disabled=true;try{const result=await api(isLimit?'order':'trade',input);toast(isLimit?'限价条件单已保存，可在持仓与委托中查看':`模拟${side==='buy'?'买入':'卖出'} ${result.quantity} 股，成交价 ${num(result.price)} 元`);riskDirty=false;syncRisk();}finally{renderEstimate();}});});
 $('risk-form').addEventListener('input',()=>{riskDirty=true;});
 let strategySubmitting = false;
 $('plan-strategy').addEventListener('change', () => action(async () => {
@@ -340,11 +378,11 @@ $('strategy-buy').addEventListener('click', () => action(async () => {
   if (!signal?.buyable || planSelectionPending.has(symbol) || (signal.strategyId || 'swing') !== strategyId) return;
   strategySubmitting = true;
   try {
-    const p = signal.plan;
+    const p = signal.plan, accountCreatedAt = state.account.createdAt;
     const confirmed = await confirmDialog(`确认${profile.name}策略模拟买入`, `<b>${esc(state.quotes[symbol]?.name || symbol)}</b> · ${symbol}<br>${esc(profile.name)} · ${esc(profile.horizon)}<br>买入 ${signal.quantity} 股 · 买价上限 ${num(p.entry)} 元<br>止损 ${num(p.stop)} / 止盈 ${num(p.target)}<p>退出规则：${esc(profile.exitDescription)}</p><p>含费盈亏比 ${num(signal.economics.rewardRisk)}；按止损价估算亏损 ¥ ${cash(signal.economics.loss)}，不代表最大亏损。成交后启用动态计划和自动模拟卖出，保留建仓时的策略与参数。T+1 当天不可卖，实际亏损可能超过计划估计。</p>${entryRiskEvidence(signal.entryRisk, false)}<p>策略规则尚未经过收益回测。提交时重新获取所需数据与盘口；条件失效、买价上涨、策略或计划变化时拒绝成交。个人选股附加条件不自动加入买卖计划。</p>`);
     if (!confirmed) return;
     $('strategy-buy').disabled = true;
-    const trade = await api('strategy:buy', { symbol, strategyId, quantity: signal.quantity, expected: p });
+    const trade = await api('strategy:buy', { symbol, strategyId, quantity: signal.quantity, expected: p, accountCreatedAt });
     riskDirty = false; syncRisk(); toast(`${profile.name}策略买入 ${trade.quantity} 股，止盈止损计划已自动保存`);
   } finally { strategySubmitting = false; renderState(await api('state')); }
 }));

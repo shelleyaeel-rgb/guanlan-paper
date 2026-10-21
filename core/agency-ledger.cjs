@@ -2,6 +2,8 @@
 const { money, id, cnTime, symbolOf, numberIn } = require('./common.cjs');
 const { STRATEGY_PROFILES, evaluateEntry, configureStrategy, economics } = require('./strategy.cjs');
 const { fees } = require('./fees.cjs');
+const { holdingValuation } = require('./holding-valuation.cjs');
+const { maxOrderQuantity } = require('./order-quantity.cjs');
 const { checkNoticeRisk } = require('./entry-risk.cjs');
 const { validateMarketRegimeSnapshot } = require('./market-regime.cjs');
 const { calendarSession } = require('./trading-calendar.cjs');
@@ -357,16 +359,18 @@ function installAgency(Engine) {
     }
     return result;
   };
-  Engine.prototype.agencyTransfer = function({ strategyId, amount }) {
+  Engine.prototype.agencyTransfer = function({ strategyId, amount }, quotes = {}) {
     const group = groupOf(this, strategyId), numeric = Number(amount);
     if (group.members.some(m => memberAffectsEquity(this.s, m)) || groupHasUnresolvedCorporate(this.s, group.id)) throw Error('策略有待对账或待核验股票，先恢复有效净值后再划拨');
     if (!Number.isFinite(numeric) || numeric === 0 || Math.abs(numeric * 100 - money(numeric)) > 0.00001) throw Error('划拨金额须为非零金额，最多两位小数');
     const change = money(numeric), agency = this.s.agency;
     if (!cents(change)) throw Error('划拨金额超出范围');
     if (change > agency.manualCash || -change > availableCorporateCash(this.s, group.id, this.clock())) throw Error('可划拨现金不足，持仓资金及股息税预留不能转出');
-    const before = groupView(this, group).equity;
+    const valuation = holdingValuation(this.s.lots.filter(lot => lot.owner === group.id), quotes, this.s.marks, this.clock(), '划拨策略资金');
+    const before = groupView(this, group, valuation).equity;
     const unitValue = group.units > 0 ? before / group.units : group.unitValue;
     if (!(unitValue > 0) && change > 0) throw Error('策略净值已归零，需重置账户后重新分配资金');
+    Object.assign(this.s.marks, valuation);
     group.units += change / (unitValue || 1); if (before + change === 0 || Math.abs(group.units) < 1e-7) group.units = 0;
     if (unitValue > 0) group.unitValue = unitValue;
     group.cash += change; group.netFunding += change; agency.manualCash -= change;
@@ -621,7 +625,7 @@ function installAgency(Engine) {
     if (this.agencyPendingExit(symbol)) throw Error('已有待完成退出目标，等待原目标完成后再研判');
     const intent = { decisionId: input.decisionId, strategyId: group.id, symbol, action: input.action, targetQuantity: Math.max(0, p.quantity - desired), status: 'pending', createdAt: this.clock().toISOString(), tradeIds: [] };
     a.executionIntents.push(intent); bump(this);
-    const max = Math.min(desired, p.available, Math.floor(this.liquidity(q, 'sell')));
+    const max = Math.min(maxOrderQuantity(symbol), desired, p.available, Math.floor(this.liquidity(q, 'sell')));
     const quantity = max === p.available ? max : symbol.startsWith('sh688') ? (max >= 200 ? max : 0) : Math.floor(max / 100) * 100;
     if (!quantity) return { pending: true, decisionId: input.decisionId, symbol, side: 'sell', quantity: 0, owner: group.id, reason: '退出目标已保存；受 T+1 或盘口数量限制，等待后续可成交报价' };
     this._agencyContext = context;

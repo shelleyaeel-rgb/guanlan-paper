@@ -18,7 +18,7 @@ async function host(items = []) {
   const snapshot = { notices: await research.get({ symbol, section: 'notices', force: true }) };
   const engine = new Engine(initialState(), () => new Date(now)); engine.s.watchlist = [symbol];
   const calls = { entries: 0, saves: 0, loads: [] }, handlers = {};
-  engine.strategyEntry = () => { calls.entries++; return { id: 'isolated-entry', symbol }; };
+  engine.strategyEntry = () => { calls.entries++; const trade = { id: 'isolated-entry', symbol }; engine.s.trades.push(trade); return trade; };
   const testing = { engine, research, snapshot, handlers, calls, beforeClone: null,
     store: { warning: '', save() { calls.saves++; } },
     monitor: { snapshots: { [symbol]: snapshot }, async load(...args) { calls.loads.push(args); return snapshot; } },
@@ -30,11 +30,11 @@ async function host(items = []) {
         : localRequire(name) });
   vm.runInContext(mainSource, context, { filename: mainPath });
   vm.runInContext('engine = testing.engine; research = testing.research; monitor = testing.monitor; market = testing.market; store = testing.store; connection = { ok: true }; handler = (name, callback) => { testing.handlers[name] = callback; };', context);
-  const start = mainSource.indexOf("  handler('strategy:buy'"), end = mainSource.indexOf("  handler('strategy:select'", start);
+  const start = mainSource.indexOf("  operationHandler('strategy:buy'"), end = mainSource.indexOf("  handler('strategy:select'", start);
   assert.ok(start >= 0 && end > start);
   vm.runInContext(mainSource.slice(start, end), context, { filename: 'main.cjs:strategy-buy' });
   return { testing, engine, research, snapshot, calls,
-    buy: () => handlers['strategy:buy'](input),
+    buy: () => handlers['strategy:buy']({ ...input, requestId: 'notice-buy', accountCreatedAt: engine.s.createdAt }),
     signal: () => vm.runInContext('state().signals["sz000001"]', context),
     async refresh(nextItems = data.items, error = '') {
       now += 1000; data = { items: nextItems, total: nextItems.length }; failure = error;

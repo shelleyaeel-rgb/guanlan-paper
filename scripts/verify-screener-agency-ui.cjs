@@ -15,7 +15,7 @@ const group = (current, id = 'swing') => current.agency.groups.find(item => item
 const checks = [], errors = []; let desktop, page;
 async function call(name, payload) {
   return page.evaluate(async ({ name, payload }) => {
-    const result = await window.guanlan.call(name, payload);
+    if (['trade', 'order', 'strategy:buy', 'agency:transfer'].includes(name)) payload = { ...payload, requestId: crypto.randomUUID(), accountCreatedAt: (await window.guanlan.call('state')).data.account.createdAt }; const result = await window.guanlan.call(name, payload);
     if (!result.ok) throw Error(result.error);
     return result.data;
   }, { name, payload });

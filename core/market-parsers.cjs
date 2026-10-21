@@ -25,8 +25,11 @@ function parseQuotes(text, receivedAt = Date.now()) {
     if (a.length < 35 || !(numeric(a[3]) > 0) || a[2] !== m[1].slice(2) || !/^\d{14}$/.test(a[30])) continue;
     const s = a[30], date = `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`, time = `${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}`;
     const at = timestamp(date, time); if (at === null) continue;
-    result[m[1]] = completeQuote({ symbol: m[1], code: a[2], name: a[1], price: numeric(a[3]), prevClose: numeric(a[4]), open: numeric(a[5]), volume: scaled(a[6], 100),
-      bid: numeric(a[9]), bidSize: scaled(a[10], 100), ask: numeric(a[19]), askSize: scaled(a[20], 100),
+    // Tencent's HS adapter reports STAR volume and book sizes in shares;
+    // ordinary A shares use 100-share lots (same convention as the screener).
+    const shareUnit = m[1].startsWith('sh688') ? 1 : 100;
+    result[m[1]] = completeQuote({ symbol: m[1], code: a[2], name: a[1], price: numeric(a[3]), prevClose: numeric(a[4]), open: numeric(a[5]), volume: scaled(a[6], shareUnit),
+      bid: numeric(a[9]), bidSize: scaled(a[10], shareUnit), ask: numeric(a[19]), askSize: scaled(a[20], shareUnit),
       change: numeric(a[31]), changePct: numeric(a[32]), high: numeric(a[33]), low: numeric(a[34]), amount: scaled(a[37], 10000),
       turnover: numeric(a[38]), pe: numeric(a[39]), pb: numeric(a[46]), limitUp: numeric(a[47]), limitDown: numeric(a[48]),
       date, time, timestamp: at, receivedAt, provider: 'tencent', source: SOURCES.tencent });

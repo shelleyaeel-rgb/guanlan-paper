@@ -162,7 +162,8 @@ function reportProductTables(document, options = {}) {
     for (let i = 0; i < lines.length; i++) {
       if (!scopes.get(page)?.[i]?.eligible) continue;
       if (/^分产品(?:或服务)?$/.test(compact(lines[i]))) {
-        const headerStart = Math.max(0, i - 12), header = compact(lines.slice(headerStart, i).join(''));
+        const headerStart = Math.max(0, i - 12), rawHeader = compact(lines.slice(headerStart, i).join(''));
+        const header = rawHeader.replace(/\((?:%|个?百分点)\)/g, '');
         if (!/营业收入营业成本毛利率营业收入比上年同期增减营业成本比上年同期增减毛利率比上年同期增减$/.test(header)) continue;
         const before = compact(lines.slice(0, i).join(''));
         if (!/本报告期|报告期内|主营业务分析/.test(before) || /(?:上年度|上年同期|历史)(?:产品|分产品)(?:收入|情况)/.test(before)
@@ -180,11 +181,13 @@ function reportProductTables(document, options = {}) {
           if (row.subject && observe) observe(page, lines, headerStart, row.end, { subject: row.subject, unit, rowStart: row.start + 1,
             table: 'product-revenue-margin', cells: row.numeric,
             columns: ['currentRevenue', 'currentCost', 'reportedGrossMarginPct', 'reportedRevenueGrowthPct', 'reportedCostGrowthPct', 'reportedGrossMarginChange'],
-            percentageHeaders: /毛利率\(%\)/.test(header) ? [2] : [],
+            percentageHeaders: [...(/毛利率\(%\)/.test(rawHeader) ? [2] : []), ...(/营业收入比上年同期增减\(%\)/.test(rawHeader) ? [3] : []),
+              ...(/营业成本比上年同期增减\(%\)/.test(rawHeader) ? [4] : []), ...(/毛利率比上年同期增减\(%\)/.test(rawHeader) ? [5] : [])],
+            percentagePointHeaders: /毛利率比上年同期增减\(个?百分点\)/.test(rawHeader) ? [5] : [],
             total: totalIndex >= 0 && totalUnit === unit ? { cells: totalNumeric, unit, columns: ['currentTotalRevenue', 'previousTotalRevenue', 'reportedTotalRevenueGrowthPct'],
               percentageHeaders: [], locations: span(document, page, lines, totalIndex - 1, totalIndex).locations } : null });
           if (!row.subject || row.values?.length !== 6 || !columnTypesMatch(row.numeric, 6, [2, 3, 4, 5])
-            || !percentCell(row.numeric, 2) && !/毛利率\(%\)/.test(header)) continue;
+             || !percentCell(row.numeric, 2) && !/毛利率\(%\)/.test(rawHeader)) continue;
           const [revenue, cost, margin] = row.values;
           if (!(revenue > 0) || cost < 0 || Math.abs((1 - cost / revenue) * 100 - margin) > 0.03) continue;
           facts.push(span(document, page, lines, headerStart, row.end, { subject: row.subject, revenue, unit, table: 'product-revenue-margin', rowStart: row.start + 1,

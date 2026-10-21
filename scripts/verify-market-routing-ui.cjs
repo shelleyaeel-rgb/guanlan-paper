@@ -36,7 +36,7 @@ let desktop;
   assert.match(await page.locator('#stock-time').innerText(), /新浪财经/);
   assert.match(await page.locator('#quote-capability').innerText(), /缺少涨跌停/);
   assert.equal(await page.locator('#trade-submit').isDisabled(), true);
-  const rejectedTrade = await page.evaluate(() => window.guanlan.call('trade', { symbol: 'sz000001', side: 'buy', quantity: 100 }));
+  const rejectedTrade = await page.evaluate(() => window.guanlan.call('trade', { symbol: 'sz000001', side: 'buy', quantity: 100, requestId: crypto.randomUUID(), accountCreatedAt: state.account.createdAt }));
   assert.equal(rejectedTrade.ok, false); assert.match(rejectedTrade.error, /仅供展示/);
   const liveSina = await page.evaluate(() => ({ source: state.quotes.sz000001.source, quoteDate: state.quotes.sz000001.date, quoteTime: state.quotes.sz000001.time, canTrade: state.quotes.sz000001.canTrade }));
   await page.screenshot({ path: path.join(output, 'sina-display-only.png'), fullPage: true });

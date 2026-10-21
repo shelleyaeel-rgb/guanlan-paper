@@ -1,6 +1,7 @@
 const { cnTime, money, yuan, numberIn } = require('./common.cjs');
 const { dailyIndicators } = require('./daily-indicators.cjs');
 const { fees } = require('./fees.cjs');
+const { maxOrderQuantity } = require('./order-quantity.cjs');
 const { STRATEGY_PROFILES, strategyProfile, LONG_FINANCE_RULES, LONG_FINANCE_POLICY_NOTE } = require('./strategy-profiles.cjs');
 const { checkMarketRisk } = require('./entry-risk.cjs');
 const { checkNoticeWithEvidence } = require('./company-notice-review.cjs');
@@ -269,7 +270,7 @@ function evaluateEntry(engine, symbol, q, snapshot, requestedQuantity, strategyI
   const stat = engine.stats({ [symbol]: q }), budget = Math.floor(stat.equity * config.riskPercent / 100), star = symbol.startsWith('sh688'), minimum = star ? 200 : 100, step = star ? 1 : 100;
   // Strategy facades supply their own cash; ordinary manual plans cannot spend allocated strategy funds.
   const availableCash = Math.min(stat.cash, stat.manualCash ?? stat.cash);
-  let maxQuantity = Math.min(1000000, Math.floor(engine.liquidity(q, 'buy')), Math.floor(stat.equity * settings.maxPosition / money(price)), Math.floor(availableCash / money(price)));
+  let maxQuantity = Math.min(maxOrderQuantity(symbol), Math.floor(engine.liquidity(q, 'buy')), Math.floor(stat.equity * settings.maxPosition / money(price)), Math.floor(availableCash / money(price)));
   const units = n => star ? n : Math.floor(n / 100) * 100;
   maxQuantity = units(maxQuantity);
   // Binary search includes minimum commissions and exact cent rounding in the budget.

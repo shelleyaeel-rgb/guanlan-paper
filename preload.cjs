@@ -5,6 +5,7 @@ for (const name of ['agency:transfer', 'agency:configure', 'agency:mode', 'agenc
 for (const name of ['evidence:list', 'evidence:save', 'evidence:remove', 'evidence:open']) allowed.add(name);
 allowed.add('research:inspect');
 allowed.add('capital:add');
+allowed.add('operation:status');
 allowed.add('view:state'); allowed.add('view:refresh');
 allowed.add('view:subscribe');
 contextBridge.exposeInMainWorld('guanlan', {

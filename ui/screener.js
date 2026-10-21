@@ -29,7 +29,7 @@ function renderScreenStrategy() {
   $('screen-strategy').value = screenStrategyId;
   $('screen-strategy-info').innerHTML = preset ? `<b>${esc(preset.horizon)}</b><p>${esc(preset.summary)}</p><p>${esc(preset.entryNotes)}</p><p class="tiny">${esc(preset.limitations)}</p>` : screenQuery.performance?.enabled ? '<p>自定义选股已启用预告 / 快报条件，将批量检查近期公告及敏感公告原文。正式财报和开仓规则仍独立核验。</p>' : '<p>自定义选股只按所选条件筛选，公告未批量核验。打开股票后，四类买卖计划都会另查公告；指标匹配不代表公告风险检查通过。</p>';
   if (preset) $('screen-strategy-info').innerHTML += `<p class="screen-risk-policy">四类策略共用公告检查：最近 14 个自然日公告标题，事件待核验或数据不足时单列排除，修改指标不取消检查。${['short', 'ultra-short'].includes(screenStrategyId) ? '当前短线策略另查行情时点、跌停与买盘；当日跌幅达到 5% 暂停候选。5% 为保守观察阈值，未经收益验证。' : '波段、长线沿用各自的价格和财务条件，公告检查独立于持有周期。'}</p>`;
-  if (preset?.id === 'long') $('screen-strategy-info').innerHTML += '<p class="screen-risk-policy">长线财务：最近完整年度加权 ROE ≥ 8%；最新累计扣非净利润金额 > 0、同比 ≥ 0、经营现金流净额 > 0 分别核验。最新累计 ROE 仅作趋势观察。下方修改的是本次个人筛选条件；加入自动交易后还须满足内置长线门槛，放宽筛选阈值不能覆盖内置规则。</p>';
+  if (preset?.id === 'long') $('screen-strategy-info').innerHTML += '<p class="screen-risk-policy">长线财务：最近完整年度加权 ROE ≥ 8%；最新累计扣非净利润金额 > 0、同比 ≥ 0、经营现金流净额 > 0 分别核验。最新累计 ROE 仅作趋势观察。模板行的阈值修改仅用于本次筛选；另行添加的个人条件会在加入自动交易时保存。实际开仓还须满足内置长线门槛，放宽筛选阈值不能覆盖内置规则。</p>';
   $('screen-description-label').textContent = preset ? '追加我的条件（与策略同时满足）' : '用一句话描述';
   $('screen-parse').textContent = preset ? '追加并选股 ↗' : '文字选股 ↗';
 }
@@ -141,19 +141,13 @@ async function screenFromText() {
   if (screenBusy) return;
   setScreenBusy(true);
   try {
-    const result = await api('screener:parse', screenStrategyId ? { text: $('screen-description').value, baseQuery: screenQuery } : $('screen-description').value);
+    // Custom text replaces numeric/universe filters, while research conditions
+    // are retained. Let the same backend merge validate both modes before any
+    // editor state changes; incompatible industry paths must leave it intact.
+    const baseQuery = screenStrategyId ? screenQuery : { ...screenQuery, scope: 'all', boards: [], excludeST: false, rules: [] };
+    const result = await api('screener:parse', { text: $('screen-description').value, baseQuery });
     screenPersonalRules = screenStrategyId ? [...new Map([...screenPersonalRules, ...result.addedRules].map(rule => [JSON.stringify(rule), rule])).values()] : result.query.rules;
-    const retainedEvidence = screenQuery.evidence, retainedResearch = screenQuery.research, retainedPerformance = screenQuery.performance;
     screenQuery = result.query;
-    if (retainedEvidence) {
-      const parsedEvidence = screenQuery.evidence;
-      screenQuery.evidence = parsedEvidence ? { ...structuredClone(retainedEvidence), ...parsedEvidence,
-        conditions: [...new Set([...(retainedEvidence.conditions || []), ...(parsedEvidence.conditions || [])])],
-        leadership: parsedEvidence.leadership || retainedEvidence.leadership || '',
-        minSegmentRevenuePct: Math.max(retainedEvidence.minSegmentRevenuePct ?? 0, parsedEvidence.minSegmentRevenuePct ?? 0) } : structuredClone(retainedEvidence);
-    }
-    if (retainedResearch && !screenQuery.research) screenQuery.research = structuredClone(retainedResearch);
-    if (retainedPerformance && !screenQuery.performance) screenQuery.performance = structuredClone(retainedPerformance);
     syncScreenRules(); screenTextPending = false; screenChanged(false); renderScreenRules();
     $('screen-description').value = '';
     $('screen-text-status').textContent = `已${screenStrategyId ? '追加个人条件，保留策略与原有条件' : '替换数值条件'}；已保留原研究标签和研究指标条件。${result.notes.join(' ')}`;

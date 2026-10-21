@@ -88,6 +88,46 @@ function reviewClinical(document, all) {
       : approved ? '本次批准开展临床试验，尚非药品获批上市；后续试验、审批及商业化仍有不确定性'
         : '本次为公司披露的试验结果；顶线数据不是最终报告，不进行跨试验疗效比较，也不推断获批或商业化成功')] });
 }
+function currentUnfundedInvestment(document, all) {
+  const reason = '未能核实截至本公告披露时本次投资尚未出资；已实施投资须继续核验账面价值、清算回收和实际损益';
+  const ownInvestment = text => /(?:本次|此次)(?:终止的?)?(?:共同)?投资/.test(text);
+  const otherInvestment = text => /(?:另一(?:个|项)?|其他)(?:投资)?项目|另一项投资/.test(text);
+  const currentDate = entry => {
+    if (/此前|原先|当时|曾经|最初|过去|历史上|若|如果|拟|预计|无法确认|不能确认|并非/.test(entry.value)) return false;
+    const dates = [...entry.value.matchAll(/(20\d{2})年(?:(\d{1,2})月(?:(\d{1,2})日)?)?/g)];
+    if (dates.some(match => !match[2] || !match[3] || `${match[1]}-${match[2].padStart(2, '0')}-${match[3].padStart(2, '0')}` !== document.publishedAt?.slice(0, 10))) return false;
+    return /截至(?:本公告(?:披露)?(?:之)?日|公告披露日|目前)|目前|现时/.test(entry.value)
+      || /截至20\d{2}年\d{1,2}月\d{1,2}日/.test(entry.value) && dates.length > 0;
+  };
+  const funding = field(all, 'funded', '本次投资已出资状态', /(?:(?:本次|此次)(?:终止的?)?投资|共同投资[^，,。；]{0,60}|公司)[^，,。；]{0,25}尚未出资/, () => 0, reason,
+    (entry, match) => {
+      if (!currentDate(entry) || otherInvestment(entry.value)) return false;
+      const before = entry.value.slice(0, match.index).split(/[，,]/).at(-1);
+      const after = entry.value.slice(match.index + match[0].length).split(/[，,]/)[0];
+      if (/(?:不存在|并非|不是|否认)[^，,]{0,20}$/.test(before)
+        || /(?:不属实|不准确|有误|不存在)/.test(after)) return false;
+      if (ownInvestment(match[0])) return true;
+      // A named joint investment must be the one explicitly being terminated;
+      // a generic "company has not funded" sentence cannot supply its identity.
+      const name = /共同投资([^，,。；]{2,60}?)尚未出资/.exec(entry.value)?.[1];
+      return !!name && (compact(document.title).includes(`终止投资${name}`)
+        || all.some(other => ownInvestment(other.value) && other.value.includes(`终止投资${name}`)));
+    });
+  const contrary = all.filter(entry => {
+    if (otherInvestment(entry.value) && !ownInvestment(entry.value)) return false;
+    if (!/公司|本次|此次|该(?:项目|投资)|出资款/.test(entry.value)) return false;
+    const funded = entry.value.split(/[，,]|但是|然而|不过|但/).some(clause =>
+      [...clause.matchAll(/已(?:经)?(?:实际)?(?:实缴)?出资|已(?:经)?(?:完成)?实缴|实缴(?:出资|金额)|已(?:经)?(?:支付|缴纳)[^，,。；]{0,10}(?:出资|投资)款/g)]
+        .some(match => !/(?:尚未|并未|未曾|没有|未|无需|并无|不存在)(?:实际)?$/.test(clause.slice(0, match.index))));
+    const unsettled = /(?:出资款|投资款)[^。；]{0,40}(?:未收回|未回收|尚未|未能|待核实|不确定)|(?:清算|回收)[^。；]{0,25}(?:尚未|未确定|未完成|待核实|不确定)|(?:尚未|仍待)[^。；]{0,10}(?:清算|回收)/.test(entry.value);
+    return funded || unsettled;
+  });
+  if (contrary.length) return { ...funding, status: 'conflict', value: null,
+    records: [...funding.records, ...contrary.map(record)],
+    reason: '原文存在已出资、尚未回收或清算待定的事实，不能按未出资计划解除本次投资终止门槛' };
+  return funding;
+}
+
 function reviewTermination(document, all) {
   const title = compact(document.title);
   const decision = field(all, 'decision', '本次终止决定', /(?:审议通过[^。；]{0,130}终止|(?:同意|决定|决议|经各方充分协商)[^。；]{0,70}终止|已签署[^。；]{0,50}终止协议)/,
@@ -107,10 +147,9 @@ function reviewTermination(document, all) {
     return finish(document, 'financing-termination', '融资计划终止', [decision, operations, impact],
       { warnings: [warning('financing-termination-observation', '终止的是本次融资计划，不等同于现有股票终止上市；未来融资需求及资金状况仍需结合财务指标判断')] });
   }
-  const funding = field(all, 'funded', '本次投资已出资状态', /(?:本次投资|共同投资[^。；]{0,60}|公司)[^。；]{0,25}尚未出资/, () => 0,
-    '未能确认未出资；已实施投资须继续核验账面价值、清算回收和实际损益');
+  const funding = currentUnfundedInvestment(document, all);
   return finish(document, 'investment-termination', '投资项目终止', [decision, funding, impact],
-    { warnings: [warning('investment-termination-observation', '按本篇披露核验未出资投资计划终止；不将计划投资额计为已发生损失或已实现回收')] });
+    { warnings: funding.status === 'verified' ? [warning('investment-termination-observation', '按本篇披露核验未出资投资计划终止；不将计划投资额计为已发生损失或已实现回收')] : [] });
 }
 function reviewLitigation(document, all) {
   const role = field(all, 'role', '公司诉讼身份', /(?:公司(?:所处的诉讼地位|为|作为)[:：]?(原告|被告)|(?:原告|被告)[:：][^。；]{0,80}(?:本公司|股份有限公司))/, match => match[1] || match[0]);

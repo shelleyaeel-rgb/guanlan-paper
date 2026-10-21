@@ -4,6 +4,9 @@ const { strategyDefaults, configureStrategy, evaluateEntry, updateDynamicRisk, s
 const { migrateAgency, validAgency, installAgency } = require('./agency-ledger.cjs');
 const { memberAffectsEquity, corporateBalances, availableCorporateCash, groupHasUnresolvedCorporate } = require('./corporate-ledger.cjs');
 const { validCapitalFlows, capitalPerformance, MAX_ADDITION_CENTS, MAX_CUMULATIVE_CENTS, identifier } = require('./capital-flows.cjs');
+const { holdingValuation } = require('./holding-valuation.cjs');
+const { maxOrderQuantity } = require('./order-quantity.cjs');
+const { validClientRequests } = require('./account-operations.cjs');
 const defaults = { commission: 0.00025, minCommission: 5, stampTax: 0.0005, transferFee: 0.00001, slippageTicks: 1, maxPosition: 0.3, refreshSeconds: 10 };
 function initialState(capital = 1000000) {
   const cents = money(numberIn(capital, 10000, 100000000, '初始资金'));
@@ -12,6 +15,7 @@ function initialState(capital = 1000000) {
 function validState(s) {
   if (!([1, 2].includes(s?.version) && Number.isSafeInteger(s.cash) && s.cash >= 0 && Number.isSafeInteger(s.initialCash) && s.initialCash > 0 && ['lots', 'orders', 'trades', 'equity', 'watchlist'].every(k => Array.isArray(s[k])) && s.settings && s.risks && s.marks && s.consumed)) return false;
   if (!validCapitalFlows(s)) return false;
+  if (!validClientRequests(s)) return false;
   if (s.agency !== undefined && !validAgency(s)) return false;
   if (s.planSelections === undefined) return true;
   if (!s.planSelections || typeof s.planSelections !== 'object' || Array.isArray(s.planSelections)) return false;
@@ -79,27 +83,13 @@ class Engine {
       if (existing.amount !== amount) throw Error('同一追加本金请求编号不能使用不同金额');
       return structuredClone(existing);
     }
-    const now = this.clock(), local = cnTime(now), today = local.date;
+    const now = this.clock();
     if (this.s.capitalFlows?.length && Date.parse(this.s.capitalFlows.at(-1).time) > now.getTime()) throw Error('系统时间早于上次追加本金记录');
     if (this.s.agency.groups.some(group => group.members.some(member => memberAffectsEquity(this.s, member))
       || groupHasUnresolvedCorporate(this.s, group.id)))
       throw Error('账户有待对账或待核验股票，先恢复有效净值后再追加本金');
-    const valuation = {}, auditQuotes = [];
-    // Freeze the 90-second freshness window at the morning session close
-    // during lunch. After the closing auction, require an actual closing quote.
-    const quoteFloor = local.minutes >= 900 ? Date.parse(`${today}T15:00:00+08:00`)
-      : local.minutes >= 690 && local.minutes < 780 ? Date.parse(`${today}T11:30:00+08:00`) - 90000
-        : now.getTime() - 90000;
-    for (const symbol of new Set(this.s.lots.map(lot => lot.symbol))) {
-      const quote = quotes[symbol] || this.s.marks[symbol];
-      if (!quote || quote.symbol !== symbol || !Number.isFinite(quote.price) || quote.price <= 0 || money(quote.price) <= 0
-        || !Number.isFinite(quote.timestamp) || quote.timestamp > now.getTime() + 15000
-        || quote.date !== today || cnTime(quote.timestamp).date !== today)
-        throw Error(`${symbol} 缺少当日有效持仓估值，不能追加本金`);
-      if (quote.timestamp < quoteFloor) throw Error(`${symbol} 持仓估值已过期，不能追加本金；盘中需 90 秒内报价，午休需上午收盘前 90 秒内或之后的报价，盘后需 15:00 或之后的收盘报价`);
-      valuation[symbol] = structuredClone(quote);
-      auditQuotes.push({ symbol, price: quote.price, timestamp: quote.timestamp, date: quote.date });
-    }
+    const valuation = holdingValuation(this.s.lots, quotes, this.s.marks, now, '追加本金');
+    const auditQuotes = Object.values(valuation).map(quote => ({ symbol: quote.symbol, price: quote.price, timestamp: quote.timestamp, date: quote.date }));
     const before = this.stats(valuation);
     if (!before.comparable || !Number.isSafeInteger(before.equity) || before.equity <= 0) throw Error('账户净值未能可靠确认，不能追加本金');
     if (before.cumulativeCapital + amount > MAX_CUMULATIVE_CENTS) throw Error('累计投入不能超过 1,000,000,000 元');
@@ -124,8 +114,9 @@ class Engine {
     if (!(q.volume > 0) || !(q.open > 0)) throw Error('停牌或无成交行情，暂停撮合');
     if (!Number.isFinite(q.limitUp) || !Number.isFinite(q.limitDown) || !(q.limitUp > q.limitDown) || !(q.limitDown > 0)) throw Error('缺少涨跌停信息；首版暂停无价格限制证券的撮合');
   }
-  validateQuantity(symbol, quantity, side) {
+  validateQuantity(symbol, quantity, side, limitOrder = false) {
     if (!Number.isInteger(quantity) || quantity <= 0 || quantity > 1000000) throw Error('数量须为 1 至 1,000,000 的整数');
+    if (quantity > maxOrderQuantity(symbol, limitOrder)) throw Error(`科创板${limitOrder ? '限价' : '市价'}单次申报最多 ${maxOrderQuantity(symbol, limitOrder).toLocaleString('en-US')} 股`);
     const star = symbol.startsWith('sh688'), p = this.positions().find(p => p.symbol === symbol);
     if (side === 'sell' && p && quantity === p.available) return;
     if (star ? quantity < 200 : quantity % 100 !== 0) throw Error(star ? '科创板单次申报至少 200 股；不足 200 股的可卖余额须一次卖出' : '买卖数量须为 100 股的整数倍；零股可卖余额须一次卖出');
@@ -141,19 +132,22 @@ class Engine {
     if (!['buy', 'sell'].includes(side)) throw Error('买卖方向无效');
     if (q?.symbol !== symbol) throw Error('行情代码不匹配');
     this.fresh(q);
-    const quantity = Number(input.quantity); this.validateQuantity(symbol, quantity, side);
+    const limit = input.limit == null ? null : numberIn(input.limit, 0.01, 100000, '限价');
+    if (limit !== null && Math.abs(limit * 100 - Math.round(limit * 100)) > 0.0001) throw Error('限价最多保留两位小数');
+    const quantity = Number(input.quantity); this.validateQuantity(symbol, quantity, side, limit !== null);
     const book = side === 'buy' ? q.ask : q.bid;
     if (!(book > 0) || this.liquidity(q, side) < quantity) throw Error('对手一档可见数量不足；本工具不模拟排队，可减少数量或等待新报价');
     const priceCents = money(book) + (side === 'buy' ? 1 : -1) * this.s.settings.slippageTicks;
     if (priceCents > money(q.limitUp) || priceCents < money(q.limitDown)) throw Error('加入滑点后的价格超出涨跌停范围，等待可成交报价');
     const price = yuan(priceCents);
-    if (input.limit != null && (side === 'buy' ? price > input.limit : price < input.limit)) throw Error('含滑点价格尚未满足限价');
+    if (limit !== null && (side === 'buy' ? price > limit : price < limit)) throw Error('含滑点价格尚未满足限价');
     const gross = priceCents * quantity, f = fees(gross, side, this.s.settings), now = this.clock(), date = cnTime(now).date;
     const trade = { id: id(), symbol, name: q.name, side, quantity, price, gross, fees: f, pnl: null, time: now.toISOString(), quoteTime: q.timestamp, quoteSource: q.source || '来源未标注', reason };
     if (side === 'buy') {
       if (this.s.risks[symbol]?.strategy) throw Error('该股票已有策略持仓，平仓前不能加仓，以保留原交易风控边界');
       if (gross + f.total > availableCorporateCash(this.s, undefined, this.clock())) throw Error('模拟可用资金不足（含股息税预留）');
-      const stat = this.stats(quotes), existing = stat.positions.find(p => p.symbol === symbol)?.value || 0;
+      const valuation = holdingValuation(this.s.lots, { ...quotes, [symbol]: q }, this.s.marks, now, '计算买入仓位');
+      const stat = this.stats(valuation), existing = stat.positions.find(p => p.symbol === symbol)?.value || 0;
       if (existing + gross > stat.equity * this.s.settings.maxPosition) throw Error(`超过单股仓位上限 ${(this.s.settings.maxPosition * 100).toFixed(0)}%，请调整数量或风控设置`);
       this.s.cash -= gross + f.total;
       this.s.lots.push({ id: id(), originId: trade.id, symbol, name: q.name, quantity, cost: gross + f.total, date });
@@ -179,7 +173,14 @@ class Engine {
   strategyEntry(input, q, snapshot, quotes = {}) {
     const symbol = symbolOf(input.symbol), selected = this.selectedStrategy(symbol), strategyId = strategyProfile(input.strategyId ?? selected).id;
     if (strategyId !== selected) throw Error('已选策略发生变化，请查看当前买卖计划后重新确认');
-    const evaluation = this._agencyContext ? this.agencyEvaluate(strategyId, symbol, q, snapshot, input.quantity, quotes) : evaluateEntry(this, symbol, q, snapshot, input.quantity, strategyId);
+    let evaluation;
+    if (this._agencyContext) evaluation = this.agencyEvaluate(strategyId, symbol, q, snapshot, input.quantity, quotes);
+    else {
+      const valuation = holdingValuation(this.s.lots, { ...quotes, [symbol]: q }, this.s.marks, this.clock(), '计算策略风险预算');
+      const evaluator = Object.create(this);
+      evaluator.stats = overrides => this.stats({ ...valuation, ...overrides });
+      evaluation = evaluateEntry(evaluator, symbol, q, snapshot, input.quantity, strategyId);
+    }
     if (!evaluation.buyable) throw Error(`${evaluation.status}：${evaluation.reasons.join('；')}`);
     const p = evaluation.plan;
     if (input.expected) {
@@ -205,7 +206,7 @@ class Engine {
   place(input) {
     const symbol = symbolOf(input.symbol), side = input.side;
     if (!['buy', 'sell'].includes(side)) throw Error('买卖方向无效');
-    const quantity = Number(input.quantity); this.validateQuantity(symbol, quantity, side);
+    const quantity = Number(input.quantity); this.validateQuantity(symbol, quantity, side, true);
     const limit = numberIn(input.limit, 0.01, 100000, '限价');
     if (Math.abs(limit * 100 - Math.round(limit * 100)) > 0.0001) throw Error('限价最多保留两位小数');
     if (this.s.orders.filter(o => o.status === 'pending').length >= 100) throw Error('最多保留 100 条待执行条件单');
@@ -255,7 +256,7 @@ class Engine {
         if (r.strategy && !agencyIntent) r.pendingExit = reason;
         if (!r.enabled) { r.note = `${reason}，自动卖出已暂停，等待用户启用`; continue; }
         if (!p.available) throw Error('已触发，但受 T+1 限制暂不可卖');
-        const max = Math.min(p.available, this.liquidity(q, 'sell'), agencyIntent ? Math.max(0, p.quantity - agencyIntent.targetQuantity) : p.quantity);
+        const max = Math.min(maxOrderQuantity(p.symbol), p.available, this.liquidity(q, 'sell'), agencyIntent ? Math.max(0, p.quantity - agencyIntent.targetQuantity) : p.quantity);
         const quantity = max === p.available ? max : p.symbol.startsWith('sh688') ? (max >= 200 ? Math.floor(max) : 0) : Math.floor(max / 100) * 100;
         if (!quantity) throw Error('已触发，对手一档数量不足，继续等待');
         events.push(this.agencyAutomaticSell({ symbol: p.symbol, side: 'sell', quantity, automatic: true }, q, quotes, reason)); r.note = `${reason}，已卖出 ${quantity} 股`;

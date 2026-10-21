@@ -10,6 +10,8 @@ fs.writeFileSync(controlPath, JSON.stringify({ now: '2026-09-30T10:00:00+08:00',
 const env = { ...process.env, GUANLAN_TEST_CONTROL: controlPath, GUANLAN_TEST_NETWORK_LOG: networkLog, GUANLAN_TEST_BATCH_LOG: batchLog }; delete env.ELECTRON_RUN_AS_NODE;
 const fixturePath = path.join(output, 'desktop.cjs');
 fs.writeFileSync(fixturePath, `require(${JSON.stringify(path.join(root, 'tests/fixtures/screener-agency-desktop.cjs'))});
+const { Market } = require(${JSON.stringify(path.join(root, 'core/market.cjs'))});
+Market.prototype.indexHistory = async function(symbol) { return { symbol, bars: await this.strategyHistory('sh600002'), source: '隔离指数日线', fetchedAt: Date.now(), adjustment: '未复权' }; };
 const { CorporateSource } = require(${JSON.stringify(path.join(root, 'core/corporate-source.cjs'))});
 CorporateSource.prototype.get = async function(input) { return { symbol: input.symbol, source: '隔离公司行为样本', status: 'ready', fetchedAt: Date.now(), coverageStart: input.fromDate, coverageEnd: '2026-09-30', coverageComplete: true, events: [], notices: [] }; };\n`);
 let desktop, page; const errors = [], checks = [];
@@ -52,7 +54,7 @@ async function backToScreen() { await page.locator('[data-page="screener"]').cli
   await run();
   const original = await page.evaluate(() => structuredClone(screenResult));
   assert.deepEqual(original.rows.map(row => row.symbol).sort(), ['sh600002', 'sh600003', 'sh600004']);
-  assert.ok(original.query.rules.some(rule => rule.field === 'roe' && rule.value === 10));
+  assert.ok(original.query.rules.some(rule => rule.field === 'annualRoeLatest' && rule.value === 10));
   assert.ok(original.query.rules.some(rule => rule.field === 'ma20' && rule.valueField === 'ma60'));
   await page.locator('[data-screen-agency="sh600002"]').click();
   assert.doesNotMatch(await page.locator('#agency-assign-conditions').innerText(), /10%|10 %/);

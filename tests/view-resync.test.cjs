@@ -14,7 +14,7 @@ const snapshot = (epoch = 'account-a', cash = 100, now = 1) => ({ account: { cas
 function host(call) {
   let now = 10000, sequence = 0;
   const timers = new Map(), frames = [], errors = [], calls = [];
-  const context = vm.createContext({ GuanlanViewReceiver: receiver,
+  const context = vm.createContext({ GuanlanViewReceiver: receiver, GuanlanOperations: require('../ui/operations.js'),
     Date: class extends Date { static now() { return now; } },
     setTimeout(callback, delay) { const id = ++sequence; timers.set(id, { callback, at: now + delay }); return id; },
     clearTimeout(id) { timers.delete(id); },

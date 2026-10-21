@@ -31,7 +31,14 @@ class Store {
   constructor(dir, { decode = value => value } = {}) { fs.mkdirSync(dir, { recursive: true }); this.file = path.join(dir, 'account.json'); this.warning = ''; this.decode = decode; this.validatedFile = null; this.validatedVersion = null; }
   read(file) { const state = this.decode(JSON.parse(fs.readFileSync(file, 'utf8'))); if (!validState(state)) throw Error('数据校验失败'); return state; }
   load() {
-    if (!fs.existsSync(this.file)) return null;
+    if (!fs.existsSync(this.file)) {
+      if (!fs.existsSync(this.file + '.bak')) return null;
+      try {
+        const state = this.read(this.file + '.bak');
+        this.warning = '账户主文件缺失，已恢复上一份自动备份。';
+        return state;
+      } catch { throw Error('账户主文件缺失，自动备份无法读取。备份已保留，请检查数据目录；程序没有重置账户。'); }
+    }
     try { return this.read(this.file); }
     catch (e) {
       try { const s = this.read(this.file + '.bak'); fs.copyFileSync(this.file, this.file + `.corrupt-${Date.now()}`); this.warning = '账户文件异常，已保留原文件并恢复上一份自动备份。'; return s; }
@@ -43,24 +50,24 @@ class Store {
       if (!validState(s)) throw Error('拒绝保存无效账户');
       const tmp = this.file + '.tmp';
       const fd = fs.openSync(tmp, 'w'); try { fs.writeFileSync(fd, JSON.stringify(s, null, 2), 'utf8'); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-      let replaced = false;
+      let replaced = false, good = false;
       if (fs.existsSync(this.file)) {
         // A successful save already validated this exact file. Check identity
         // before reusing that result; ctime also catches a restored mtime.
         let identity;
         try { identity = fileIdentity(this.file); } catch {}
-        let good = sameFile(this.validatedFile, identity), previousVersion = good ? this.validatedVersion : null;
+        good = sameFile(this.validatedFile, identity); let previousVersion = good ? this.validatedVersion : null;
         // Revalidate unknown files before allowing them to replace a good backup.
         if (!good || previousVersion == null) try { const prior = JSON.parse(fs.readFileSync(this.file, 'utf8')); good = validState(prior); previousVersion = prior.version; } catch { good = false; }
         if (good && s.version > previousVersion) { this.saveUpgrade(tmp, s.version, this.file); replaced = true; }
         else if (good) fs.copyFileSync(this.file, this.file + '.bak');
-        else if (s.version >= 2 && fs.existsSync(this.file + '.bak')) {
-          // Recovery may have loaded an old valid backup while the primary is
-          // corrupt. Upgrade that recovery source with the same protection.
-          let backup;
-          try { backup = JSON.parse(fs.readFileSync(this.file + '.bak', 'utf8')); } catch {}
-          if (validState(backup) && backup.version < s.version) { this.saveUpgrade(tmp, s.version, this.file + '.bak'); replaced = true; }
-        }
+      }
+      if (!good && s.version >= 2 && fs.existsSync(this.file + '.bak')) {
+        // Recovery may have loaded an old valid backup while the primary is
+        // corrupt or missing. Protect that source during a version upgrade.
+        let backup;
+        try { backup = JSON.parse(fs.readFileSync(this.file + '.bak', 'utf8')); } catch {}
+        if (validState(backup) && backup.version < s.version) { this.saveUpgrade(tmp, s.version, this.file + '.bak'); replaced = true; }
       }
       if (!replaced) replaceFileSync(tmp, this.file);
       // Failure to inspect the committed file only disables the optimization;

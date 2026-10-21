@@ -29,15 +29,18 @@ function sourceRef(observation) {
     quote: text.length <= 1600 ? text : `${text.slice(0, 500)}\n[…]\n${text.slice(-1000)}`, excerptTruncated: text.length > 1600 };
 }
 
-function parseCell(rawValue, field, unit, percentageHeader, source) {
+function parseCell(rawValue, field, unit, percentageHeader, source, percentagePointHeader = false) {
   const raw = compact(rawValue), percent = raw.includes('%'), negative = /^\(.*\)$/.test(raw);
   const numeric = (negative ? `-${raw.slice(1, -1)}` : raw).replace(/%$/, '');
-  const result = { field, rawValue: rawValue ?? null, rawUnit: percentageField(field) && (percent || percentageHeader) ? '%' : unit,
-    value: null, unit: currencyField(field) ? '元' : percentageField(field) ? '%' : unit, sourceRefs: [source], usable: false };
+  const marginChange = field === 'reportedGrossMarginChange';
+  const disclosedUnit = marginChange ? percent || percentageHeader ? '%' : percentagePointHeader ? '百分点' : null : null;
+  const result = { field, rawValue: rawValue ?? null, rawUnit: marginChange ? disclosedUnit : percentageField(field) && (percent || percentageHeader) ? '%' : unit,
+    value: null, unit: marginChange ? disclosedUnit : currencyField(field) ? '元' : percentageField(field) ? '%' : unit, sourceRefs: [source], usable: false };
   if (!raw || /^(?:[-—–]+|N\/?A|不适用)$/i.test(raw)) return { ...result, reasonCode: 'reported-placeholder', reason: '原表该位置为空或占位符，未按零处理' };
   if (!NUMBER.test(numeric)) return { ...result, reasonCode: 'cell-not-parsed', reason: '原文单元格无法可靠解析为数值' };
   if (!percentageField(field) && percent) return { ...result, reasonCode: 'cell-unit-mismatch', reason: '金额或数量位置出现百分比，未当作金额或数量使用' };
-  if (percentageField(field) && !percent && !percentageHeader) return { ...result, reasonCode: 'percentage-unit-unverified', reason: '原文增减值未明确百分比单位，未据此推断同比' };
+  if (marginChange && percentagePointHeader && (percent || percentageHeader)) return { ...result, reasonCode: 'cell-unit-mismatch', reason: '毛利率增减单元格百分比与表头百分点单位冲突，未换算或任选其一' };
+  if (percentageField(field) && !percent && !percentageHeader && !(marginChange && percentagePointHeader)) return { ...result, reasonCode: 'percentage-unit-unverified', reason: '原文增减值未明确比例单位，未据此推断同比或百分点变化' };
   if (currencyField(field) && !MONEY[unit]) return { ...result, reasonCode: 'currency-unit-unverified', reason: '金额单位尚未核实' };
   if (!currencyField(field) && !percentageField(field) && (!unit || MONEY[unit])) return { ...result, reasonCode: 'volume-unit-unverified', reason: '数量单位尚未核实或误用了金额单位' };
   const value = Number(numeric.replaceAll(',', '')) * (currencyField(field) ? MONEY[unit] : 1);
@@ -58,7 +61,7 @@ function readObservation(observation) {
   if (!columns.length) issues.push({ reasonCode: observation.issue || 'table-layout-not-verified', reason: '已定位产品行，但表头或单位未完整核实，未映射数值字段' });
   else if (cells.length !== columns.length) issues.push({ reasonCode: 'column-count-mismatch', reason: '原始单元格数量与表头不一致，未移动或拼补数值列' });
   else columns.forEach((field, index) => {
-    fields[field] = parseCell(cells[index], field, observation.unit, observation.percentageHeaders?.includes(index), source);
+    fields[field] = parseCell(cells[index], field, observation.unit, observation.percentageHeaders?.includes(index), source, observation.percentagePointHeaders?.includes(index));
     if (!fields[field].usable) issues.push({ field, reasonCode: fields[field].reasonCode, reason: fields[field].reason });
   });
   const total = observation.total;
@@ -99,7 +102,7 @@ const FORMULAS = {
   salesGrowthPct: { inputs: ['currentSalesVolume', 'previousSalesVolume'], report: 'reportedSalesGrowthPct', formula: '(当期销量 / 上年同期销量 - 1) × 100', calc: (a, b) => (a / b - 1) * 100, positive: [1] },
   grossMarginPct: { inputs: ['currentRevenue', 'currentCost'], report: 'reportedGrossMarginPct', formula: '(当期收入 - 当期成本) / 当期收入 × 100', calc: (a, b) => (a - b) / a * 100, positive: [0] },
   previousGrossMarginPct: { inputs: ['previousRevenue', 'previousCost'], report: 'reportedPreviousGrossMarginPct', formula: '(上年同期收入 - 上年同期成本) / 上年同期收入 × 100', calc: (a, b) => (a - b) / a * 100, positive: [0] },
-  grossMarginChangePp: { inputs: ['currentRevenue', 'currentCost', 'previousRevenue', 'previousCost'], report: 'reportedGrossMarginChangePp', formula: '当期毛利率 - 上年同期毛利率', calc: (a, b, c, d) => ((a - b) / a - (c - d) / c) * 100, positive: [0, 2] }
+  grossMarginChangePp: { inputs: ['currentRevenue', 'currentCost', 'previousRevenue', 'previousCost'], report: 'reportedGrossMarginChange', formula: '当期毛利率 - 上年同期毛利率', calc: (a, b, c, d) => ((a - b) / a - (c - d) / c) * 100, positive: [0, 2] }
 };
 
 function connectedGroups(observations) {
@@ -117,7 +120,8 @@ function connectedGroups(observations) {
 
 function deriveField(key, observations, groups, rawMetrics) {
   const spec = FORMULAS[key], unit = key.endsWith('Pp') ? '百分点' : '%';
-  const reported = selectField(observations.map(row => row.fields[spec.report]), unit), calculations = [];
+  const disclosures = observations.map(row => row.fields[spec.report]).filter(Boolean);
+  const reported = selectField(disclosures, unit), calculations = [];
   let obstruction = null;
   for (const row of groups) {
     const inputs = spec.inputs.map(field => row.fields[field]);
@@ -130,10 +134,21 @@ function deriveField(key, observations, groups, rawMetrics) {
     calculations.push({ value, unit, usable: true, sourceRefs: unique(inputs.flatMap(input => input.sourceRefs)), tolerance: row.table === 'product-period-comparison' ? .15 : .03 });
   }
   const result = selectField(calculations, unit), operandConflict = spec.inputs.some(field => rawMetrics[field]?.status === 'conflict');
+  // A percent change in a ratio is not its percentage-point difference. An
+  // ambiguous or malformed disclosed change cannot be silently ignored just
+  // because four independent amounts are available for a calculation.
+  const unverifiedChange = key === 'grossMarginChangePp' && disclosures.some(value =>
+    value.reasonCode !== 'reported-placeholder' && (!value.usable || value.unit !== unit));
+  if (unverifiedChange) return { ...result, formula: spec.formula, usable: false, status: 'pending', verification: null,
+    reportedValue: reported.usable ? reported.value : null, reportedUnit: reported.usable ? reported.unit : null,
+    rawValue: reported.rawValue, rawUnit: reported.rawUnit, reasonCode: 'reported-change-unit-unverified',
+    reason: '原文毛利率增减的单位或数值尚未核实；百分比不能直接视为百分点，计算值仅供查看',
+    sourceRefs: unique([...result.sourceRefs, ...reported.sourceRefs]) };
   if (result.usable && !operandConflict) {
     const disagreement = reported.status === 'conflict' || reported.usable && Math.abs(result.value - reported.value) > Math.max(.03, ...calculations.map(value => value.tolerance));
     return { ...result, formula: spec.formula, verification: disagreement ? 'mismatch' : 'calculated', usable: !disagreement,
       status: disagreement ? 'conflict' : 'available', reportedValue: reported.usable ? reported.value : null,
+      reportedUnit: reported.usable ? reported.unit : null,
       rawValue: reported.rawValue, rawUnit: reported.rawUnit, reasonCode: disagreement ? 'reported-calculated-mismatch' : null,
       reason: disagreement ? '原文披露比例与原始金额或数量复算结果不一致，均保留供核验' : null,
       sourceRefs: unique([...result.sourceRefs, ...reported.sourceRefs]) };

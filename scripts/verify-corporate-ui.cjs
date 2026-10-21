@@ -11,7 +11,7 @@ scenario({});
 const env = { ...process.env, GUANLAN_TEST_CONTROL: control, GUANLAN_TEST_NETWORK_LOG: path.join(output, 'unexpected-network.jsonl'), GUANLAN_TEST_EXTERNAL_LOG: externalLog };
 delete env.ELECTRON_RUN_AS_NODE;
 let desktop, page; const errors = [], checks = [];
-async function call(name, payload) { return page.evaluate(async ({ name, payload }) => { const result = await window.guanlan.call(name, payload); if (!result.ok) throw Error(result.error); return result.data; }, { name, payload }); }
+async function call(name, payload) { return page.evaluate(async ({ name, payload }) => { if (['trade', 'order', 'strategy:buy', 'agency:transfer'].includes(name)) payload = { ...payload, requestId: crypto.randomUUID(), accountCreatedAt: (await window.guanlan.call('state')).data.account.createdAt }; const result = await window.guanlan.call(name, payload); if (!result.ok) throw Error(result.error); return result.data; }, { name, payload }); }
 async function waitState(predicate, timeout = 20000) {
   const start = Date.now(); let current;
   while (Date.now() - start < timeout) { current = await call('state'); if (predicate(current)) return current; await new Promise(resolve => setTimeout(resolve, 100)); }

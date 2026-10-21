@@ -10,7 +10,7 @@ const GROWTH_ROUNDING_PCT = 0.03;
 const marginHeader = '营业收入营业成本毛利率营业收入比上年同期增减营业成本比上年同期增减毛利率比上年同期增减';
 const shareHeader = '本报告期上年同期同比增减金额占营业收入比重金额占营业收入比重';
 const supportedNameWraps = new Set(['功能化学品', '高分子新材料', '铝箔及铝箔坯料', '销售铝箔及铝箔坯料']);
-const cleanHeader = text => compact(text).replace(/\(%\)/g, '');
+const cleanHeader = text => compact(text).replace(/\((?:%|个?百分点)\)/g, '');
 function columnTypesMatch(text, size, percentageColumns) {
   const cells = String(text).trim().replace(/-\s+(?=\d)/g, '-').split(/\s+/);
   return cells.length === size && cells.every((cell, index) => !cell.includes('%') || percentageColumns.includes(index));
@@ -205,6 +205,7 @@ function productTableFacts(document, api) {
         percentageHeaders: layout === 'shares' ? [...(/占营业收入比重\(%\)/.test(rawHeader) ? [1, 3] : []), ...(/同比增减\(%\)/.test(rawHeader) ? [4] : [])]
           : [...(/毛利率\(%\)/.test(rawHeader) ? [2] : []), ...(/营业收入比上年同期增减\(%\)/.test(rawHeader) ? [3] : []),
             ...(/营业成本比上年同期增减\(%\)/.test(rawHeader) ? [4] : []), ...(/毛利率比上年同期增减\(%\)/.test(rawHeader) ? [5] : [])],
+        percentagePointHeaders: layout === 'margin' && /毛利率比上年同期增减\(个?百分点\)/.test(rawHeader) ? [5] : [],
         total: rawTotal ? { unit, cells: rawTotal.numeric, columns: ['currentTotalRevenue', 'reportedTotalSharePct', 'previousTotalRevenue', 'reportedPreviousTotalSharePct', 'reportedTotalRevenueGrowthPct'],
           percentageHeaders: /同比增减\(%\)/.test(rawHeader) ? [4] : [], locations: span(document, page, lines, rawTotal.line, rawTotal.line).locations } : null,
         issue: layout ? null : 'table-layout-not-verified' });

@@ -13,7 +13,7 @@ const env = { ...process.env, GUANLAN_TEST_CONTROL: controlPath, GUANLAN_TEST_NE
 let desktop, page; const errors = [], checks = [];
 const group = (current, id = 'swing') => current.agency.groups.find(item => item.id === id);
 const logEntries = () => fs.existsSync(poolLog) ? fs.readFileSync(poolLog, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : [];
-async function call(name, payload) { return page.evaluate(async ({ name, payload }) => { const result = await window.guanlan.call(name, payload); if (!result.ok) throw Error(result.error); return result.data; }, { name, payload }); }
+async function call(name, payload) { return page.evaluate(async ({ name, payload }) => { if (['trade', 'order', 'strategy:buy', 'agency:transfer'].includes(name)) payload = { ...payload, requestId: crypto.randomUUID(), accountCreatedAt: (await window.guanlan.call('state')).data.account.createdAt }; const result = await window.guanlan.call(name, payload); if (!result.ok) throw Error(result.error); return result.data; }, { name, payload }); }
 async function refresh() { await page.evaluate(async () => renderState(await api('state'))); }
 async function launch() {
   desktop = await _electron.launch({ executablePath: require('electron'), args: [path.join(root, 'tests/fixtures/agency-pool-desktop.cjs'), `--test-data-dir=${accountPath}`], cwd: root, env });
