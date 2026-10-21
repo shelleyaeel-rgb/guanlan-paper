@@ -11,7 +11,9 @@ function fixture() {
   const engine = new Engine(initialState(100000), () => now);
   const q = (overrides = {}) => ({ symbol: 'sz000001', name: '策略测试', price: 10.1, prevClose: 10.05, open: 10, low: 10, high: 10.2, volume: 100000,
     bid: 10.09, ask: 10.1, bidSize: 20000, askSize: 20000, limitUp: 11.05, limitDown: 9.05, timestamp: now.getTime(), date: cnTime(now).date, ...overrides });
-  const snapshot = (overrides = {}) => ({ fetchedAt: now.getTime(), technical: { asOf: '2026-09-28', close: 10.05, ma5: 10, ma20: 10, ma60: 9.5,
+  const snapshot = (overrides = {}) => ({ fetchedAt: now.getTime(),
+    notices: { symbol: 'sz000001', section: 'notices', source: '东方财富', status: 'empty', fetchedAt: now.getTime(), checkedAt: now.getTime(), data: { items: [], total: 0 } },
+    technical: { asOf: '2026-09-28', close: 10.05, ma5: 10, ma20: 10, ma60: 9.5,
     atr: 0.4, macd: 0.1, rsi: 55, volumeRatio: 1, trend: true, breakout: false, support: 9.7, resistance: 11.5, entryLow: 9.9, entryHigh: 10.3, stop: 9.6, target: 11.5, dates: ['2026-09-28'], ...overrides } });
   const buy = quantity => engine.strategyEntry({ symbol: '000001', quantity }, q(), snapshot());
   return { engine, q, snapshot, buy, day: date => { now = new Date(date); } };
@@ -61,7 +63,7 @@ test('趋势、回踩、盘中确认和含费空间分别阻止不合格买入',
   assert.deepEqual(engine.s, before);
 });
 
-test('缺失、过期、基准错配日线及停牌/跨日报价不会发出可以买入', () => {
+test('缺失、过期、基准错配日线及停牌/跨日报价不会放行模拟建仓', () => {
   const { engine, q, snapshot } = fixture();
   for (const snap of [null, { error: '断线' }, { ...snapshot(), fetchedAt: 0 }, snapshot({ close: 20 })]) assert.equal(evaluateEntry(engine, 'sz000001', q(), snap).buyable, false);
   for (const quote of [q({ timestamp: 0 }), q({ volume: 0 }), q({ date: '2026-09-28' }), q({ ask: 0 })]) assert.equal(evaluateEntry(engine, 'sz000001', quote, snapshot()).buyable, false);
@@ -75,7 +77,8 @@ test('一档数量、余额、单股仓位和科创板最低数量约束计划�
   engine.s.cash = 10000000; engine.s.settings.maxPosition = 0.01;
   assert.equal(evaluateEntry(engine, 'sz000001', q(), snapshot()).buyable, false);
   engine.s.settings.maxPosition = 0.3;
-  const star = evaluateEntry(engine, 'sh688001', q({ symbol: 'sh688001', askSize: 201 }), snapshot());
+  const starSnapshot = snapshot(); starSnapshot.notices.symbol = 'sh688001';
+  const star = evaluateEntry(engine, 'sh688001', q({ symbol: 'sh688001', askSize: 201 }), starSnapshot);
   assert.equal(star.buyable, true); assert.equal(star.quantity, 201);
 });
 

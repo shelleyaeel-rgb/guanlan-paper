@@ -105,7 +105,9 @@ test('零均量标记不可判断；无波动日线仍可用于技术选股，�
   assert.equal(screen(snapshot([{ ...row(), ...d }]), parse('RSI40–75')).matched, 1);
   assert.throws(() => technicals(data, now), /波动/);
   const engine = { clock: () => now, s: { settings: {}, strategySettings: {} }, positions: () => [], fresh() {} };
-  const signal = evaluateEntry(engine, 'sh600001', { date: '2026-09-30', prevClose: 10, ask: 10 }, { fetchedAt: now.getTime(), technical: { asOf: '2026-09-29', close: 10, trend: true, macd: 1, rsi: 50, volumeRatio: null } });
+  const signal = evaluateEntry(engine, 'sh600001', { date: '2026-09-30', prevClose: 10, ask: 10 }, { fetchedAt: now.getTime(),
+    notices: { symbol: 'sh600001', section: 'notices', source: '东方财富', status: 'empty', fetchedAt: now.getTime(), data: { items: [], total: 0 } },
+    technical: { asOf: '2026-09-29', close: 10, trend: true, macd: 1, rsi: 50, volumeRatio: null } });
   assert.equal(signal.status, '等待趋势'); assert.equal(signal.buyable, false);
 });
 
@@ -151,6 +153,60 @@ test('跨收盘时间与缓存到期重新加载，扫描以开始时间固定�
   result = await s.run(parse('RSI大于0'), []); assert.equal(result.rows[0].technicalAsOf, '2026-09-30'); assert.equal(calls, 2);
   s.dailyLoader = async () => { calls++; return data; };
   time = new Date('2026-09-30T15:01:02+08:00'); await s.run(parse('RSI大于0'), []); assert.equal(calls, 3);
+});
+
+test('普通财务加技术筛选共用快照后的观察时点，财务请求跨收盘不引入新日线', async () => {
+  const time = new Date('2026-09-30T14:59:50+08:00'), observation = time.toISOString();
+  const data = [...bars(), { ...bars().at(-1), date: '2026-09-30', open: 999, close: 999, high: 1000, low: 998 }];
+  const s = scanner(async () => data, [row()], () => time);
+  s.financeLoader = async symbol => {
+    time.setTime(Date.parse('2026-09-30T15:00:05+08:00'));
+    return { symbol, section: 'finance', source: '东方财富', status: 'ready', fetchedAt: time.getTime(), data: { latest: { reportDate: '2026-06-30', noticeDate: '2026-08-15', roe: 15 } } };
+  };
+  const result = await s.run(parse('ROE大于10%，RSI大于0'), []);
+  assert.equal(result.rows.length, 1); assert.equal(result.rows[0].technicalAsOf, '2026-09-29');
+  assert.equal(result.financeScan.asOfCutoff, observation); assert.equal(result.technicalScan.asOfCutoff, observation);
+  assert.equal(result.technicalScan.startedAt, time.getTime()); assert.equal(result.rows[0].financeFetchedAt, time.getTime());
+  assert.equal(s.dailyCache.get('sh600001').cutoff, '2026-09-30:intraday');
+});
+
+test('显式观察时点按同一基准计算和复用缓存，收盘基准变化及真实TTL到期必须重载', async () => {
+  const time = new Date('2026-09-30T15:00:05+08:00'), observed = new Date('2026-09-30T14:59:50+08:00');
+  let calls = 0; const data = [...bars(), { ...bars().at(-1), date: '2026-09-30' }];
+  const s = scanner(async () => { calls++; return data; }, [row()], () => time);
+  const q = parse('RSI大于0'), signal = new AbortController().signal;
+  let result = await s.scanDaily(s.snapshot, q, [], false, signal, observed);
+  assert.equal(result.rows[0].technicalAsOf, '2026-09-29'); assert.equal(result.technicalScan.startedAt, time.getTime());
+  assert.equal(result.technicalScan.asOfCutoff, observed.toISOString());
+  await s.scanDaily(s.snapshot, q, [], false, signal, observed); assert.equal(calls, 1);
+  result = await s.scanDaily(s.snapshot, q, [], false, signal, time); assert.equal(calls, 2);
+  assert.equal(result.rows[0].technicalAsOf, '2026-09-30'); assert.equal(s.dailyCache.get('sh600001').cutoff, '2026-09-30:closed');
+  result = await s.scanDaily(s.snapshot, q, [], false, signal, observed); assert.equal(calls, 3);
+  assert.equal(result.rows[0].technicalAsOf, '2026-09-29');
+  time.setTime(time.getTime() + 60000);
+  await s.scanDaily(s.snapshot, q, [], false, signal, observed); assert.equal(calls, 4, '冻结观察时点不能冻结缓存的真实有效期');
+});
+
+test('日线缓存跨午夜重新匹配观察日期；异步修改clock返回的Date不能改变当次截止点', async () => {
+  const time = new Date('2026-09-29T23:59:55+08:00'), observed = time.toISOString(); let calls = 0;
+  const data = [...bars(), { ...bars().at(-1), date: '2026-09-30', open: 999, close: 999, high: 1000, low: 998 }];
+  const s = scanner(async () => { calls++; time.setTime(Date.parse('2026-09-30T00:00:05+08:00')); return data; }, [row()], () => time);
+  const signal = new AbortController().signal, q = parse('RSI大于0');
+  const first = await s.scanDaily(s.snapshot, q, [], false, signal);
+  assert.equal(first.rows[0].technicalAsOf, '2026-09-29'); assert.equal(first.technicalScan.asOfCutoff, observed);
+  assert.equal(s.dailyCache.get('sh600001').cutoff, '2026-09-29:closed');
+  const second = await s.scanDaily(s.snapshot, q, [], false, signal);
+  assert.equal(calls, 2); assert.equal(second.rows[0].technicalAsOf, '2026-09-29');
+  assert.equal(s.dailyCache.get('sh600001').cutoff, '2026-09-30:intraday');
+});
+
+test('无效日线响应不是网络错误，失败不能沿用输入上已有的技术数值', async () => {
+  const s = scanner(async () => null), signal = new AbortController().signal;
+  const snapshot = { ...s.snapshot, rows: [{ ...s.snapshot.rows[0], close: 99, rsi: 60, technicalAsOf: '2026-09-29' }] };
+  const result = await s.scanDaily(snapshot, parse('RSI大于0'), [], false, signal);
+  assert.equal(result.technicalScan.failures.invalid, 1); assert.equal(result.technicalScan.failures.fetch, 0);
+  assert.equal(result.rows[0].technicalError, 'invalid'); assert.equal(result.rows[0].close, null);
+  assert.equal(result.rows[0].rsi, null); assert.equal(result.rows[0].technicalAsOf, null);
 });
 
 test('日线并发不超过三，取消停止排队并拒绝发布部分结果；可以重试', async () => {

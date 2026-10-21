@@ -1,0 +1,48 @@
+// Public market requests, isolated account, real renderer/preload/IPC; no orders.
+const { _electron } = require(process.env.GUANLAN_PLAYWRIGHT_PATH || 'playwright');
+const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict');
+const { TENCENT_SCREEN_SOURCE } = require('../core/screener-tencent.cjs');
+const root = path.resolve(__dirname, '..');
+fs.mkdirSync(path.join(root, 'work'), { recursive: true });
+const output = fs.mkdtempSync(path.join(root, 'work/free-screener-ui-')), dataPath = path.join(output, 'account');
+const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE; delete env.GUANLAN_TEST_CONTROL;
+const packaged = process.env.GUANLAN_PACKAGE_EXE;
+const report = { output, checkedAt: new Date().toISOString(), packaged: !!packaged, errors: [] };
+let desktop, page;
+(async () => {
+  desktop = await _electron.launch({ executablePath: packaged || require('electron'), args: packaged ? [`--user-data-dir=${dataPath}`] : [root, `--test-data-dir=${dataPath}`], cwd: root, env });
+  page = await desktop.firstWindow(); page.on('pageerror', e => report.errors.push(e.message));
+  await page.waitForFunction(() => typeof state !== 'undefined' && state?.account);
+  assert.equal(path.resolve(await page.evaluate(() => state.dataPath)), dataPath);
+  await page.locator('[data-page="screener"]').click();
+  await page.waitForFunction(() => typeof screenBusy !== 'undefined' && !screenBusy && (!!screenResult || !document.querySelector('#screen-error').classList.contains('hidden')), null, { timeout: 150000 });
+  report.live = await page.evaluate(() => screenResult ? { source: screenResult.source, eligibleCount: screenResult.eligibleCount, fetchedAt: screenResult.fetchedAt, missing: screenResult.missingByField, sourceText: document.querySelector('#screen-source').textContent } : { error: document.querySelector('#screen-error').textContent });
+  assert.equal(report.live.source, TENCENT_SCREEN_SOURCE, report.live.error);
+  assert.ok(report.live.eligibleCount > 5000);
+  assert.match(await page.locator('#screen-source').innerText(), /腾讯.*新浪/);
+  await page.screenshot({ path: path.join(output, 'latest.png'), fullPage: true });
+  const priorFetchedAt = report.live.fetchedAt;
+  await page.locator('#screen-run').click(); await page.locator('#screen-cancel').click();
+  await page.waitForFunction(() => !screenBusy);
+  assert.match(await page.locator('#screen-error').innerText(), /取消/);
+  assert.equal(await page.evaluate(() => screenResult.fetchedAt), priorFetchedAt);
+  assert.match(await page.locator('#screen-result-count').innerText(), /上次结果/);
+  const id = await page.locator('#screen-data-source option').nth(1).getAttribute('value');
+  assert.ok(id);
+  await page.locator('#screen-data-source').selectOption(id);
+  await page.locator('#screen-description').fill('动态市盈率大于0，动态市盈率小于20');
+  await page.locator('#screen-parse').click();
+  await page.waitForFunction(() => !screenBusy && screenResult?.dataMode === 'historical');
+  report.historical = await page.evaluate(() => ({ source: screenResult.source, matched: screenResult.matched, fetchedAt: screenResult.fetchedAt, valid: screenResult.rows.every(r => r.pe > 0 && r.pe < 20) }));
+  assert.equal(report.historical.source, TENCENT_SCREEN_SOURCE); assert.equal(report.historical.fetchedAt, priorFetchedAt); assert.equal(report.historical.valid, true);
+  assert.match(await page.locator('#screen-result-labels').innerText(), /历史快照/);
+  await desktop.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1120, 760));
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  await page.screenshot({ path: path.join(output, 'historical-small.png'), fullPage: true });
+  report.account = await page.evaluate(() => ({ trades: state.account.trades.length, orders: state.account.orders.length }));
+  assert.deepEqual(report.account, { trades: 0, orders: 0 }); assert.deepEqual(report.errors, []);
+  report.version = await desktop.evaluate(({ app }) => app.getVersion());
+  assert.equal(report.version, require('../package.json').version);
+  report.ok = true;
+})().catch(async e => { report.ok = false; report.error = e.message; process.exitCode = 1; if (page) await page.screenshot({ path: path.join(output, 'failed.png'), fullPage: true }).catch(() => {}); })
+  .finally(async () => { fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify(report, null, 2)); console.log(JSON.stringify(report, null, 2)); if (desktop) await desktop.close(); });

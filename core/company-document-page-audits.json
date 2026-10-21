@@ -1,0 +1,45 @@
+[
+  {
+    "id": "saltlake-2026-halfyear-cover-20261013",
+    "sourceSha256": "7dffb768395a615d67af497501511c056c2aaae77eec86fcdf2eaaf65fc47955",
+    "pages": 142,
+    "pageNumbers": [
+      1,
+      142
+    ],
+    "reviewedAt": "2026-10-13",
+    "reviewMethod": "visual-render-review",
+    "announcementId": "AN202608250006749206",
+    "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202608250006749206_1.pdf",
+    "description": "已目视核对原件第1及142页：同一彩色封面设计的封面、封底裁切页，仅含报告题名、公司名称、装饰照片及联系信息，无财务正文。仅此完整原件SHA256、142页及指定页码匹配时可按非正文处理；任何修改均使登记失效。"
+  },
+  {
+    "id": "western-mining-2025-annual-cover-20261014",
+    "sourceSha256": "7d630ca29015d851bdb8181b4ce14c6f66517b171af8f57fbe51a080aa63e390",
+    "pages": 194,
+    "pageNumbers": [
+      1,
+      194
+    ],
+    "reviewedAt": "2026-10-14",
+    "reviewMethod": "visual-render-review",
+    "announcementId": "AN202603251820744897",
+    "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202603251820744897_1.pdf",
+    "description": "已目视核对原件第1及194页：封面为报告标题、公司名、证券代码和装饰图；封底为照片、宣传语和联系信息，无财务正文或金额。仅完整原件SHA256、194页及指定页码全部匹配时登记为非正文，保留原页且不得参与数值核验。"
+  },
+  {
+    "id": "yto-2025-annual-decorative-20261014",
+    "sourceSha256": "d14fd26f26fff7967b381b808190da9e98f1a7d79dc93f7f56c0929d550a2ed7",
+    "pages": 305,
+    "pageNumbers": [
+      1,
+      4,
+      94
+    ],
+    "reviewedAt": "2026-10-14",
+    "reviewMethod": "visual-render-review",
+    "announcementId": "AN202604221821462394",
+    "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202604221821462394_1.pdf",
+    "description": "已目视核对原件第1、4、94页：第1页仅含公司名称、证券简称代码、年度报告标题及航空照片；第4、94页分别仅含释义、债券相关情况章节编号标题与装饰图，无财务或业务正文。仅完整原件SHA256、305页及指定页码全部匹配时登记为非正文，保留页级记录且不得参与数值核验。"
+  }
+]

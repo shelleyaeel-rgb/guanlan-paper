@@ -1,0 +1,12 @@
+{
+  "fixture": "company-native-symbols.pdf",
+  "sha256": "70cd7ecaac9a72830df61685b73df3fb1300912043d9ae2b85c31e7474a20b24",
+  "sourceTitle": "河北广电无线传媒股份有限公司2025年年度报告全文",
+  "announcementId": "AN202604161821264097",
+  "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202604161821264097_1.pdf",
+  "originalSha256": "42678af9a059a2bc3feeda2034b4fdb46193b807173630d596956ac7c04eaafe",
+  "originalPages": [21, 117, 118],
+  "preparation": "以pypdf从隔离原件复制第21、117、118页，保留原生字形、字体、文字层与页面内容。",
+  "reviewedAt": "2026-10-13",
+  "review": "渲染目视确认第21页Wingdings2 U+F0A3为空复选框，第117页SymbolMT U+F0B7为行首列表圆点；第118页使用相同字体及行首上下文。"
+}

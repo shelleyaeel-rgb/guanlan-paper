@@ -1,7 +1,7 @@
 // Deterministic research samples, never loaded by the packaged application.
 const data = rows => ({ success: true, result: { data: rows, count: rows.length } });
 function profile(symbol = 'sh600519') {
-  return data([{ SECUCODE: `${symbol.slice(2)}.${symbol.slice(0, 2).toUpperCase()}`, ORG_NAME: `测试公司 ${symbol}`, SECURITY_NAME_ABBR: '测试股票', MAIN_BUSINESS: '测试主营业务', EM2016: '测试行业', LISTING_DATE: '2001-08-27 00:00:00', ORG_PROFILE: '仅用于界面与数据解析验证' }]);
+  return data([{ SECUCODE: `${symbol.slice(2)}.${symbol.slice(0, 2).toUpperCase()}`, ORG_NAME: `测试公司 ${symbol}`, SECURITY_NAME_ABBR: '测试股票', MAIN_BUSINESS: '测试主营业务', EM2016: '食品饮料-食品加工', CSRC_INDUSTRY_NAME: '制造业-食品制造业', ORG_TYPE: '通用', ORG_TYPE_CODE: '4', LISTING_DATE: '2001-08-27 00:00:00', ORG_PROFILE: '仅用于界面与数据解析验证' }]);
 }
 function financialRow(symbol = 'sh600519', date = '2026-06-30') {
   return { SECUCODE: `${symbol.slice(2)}.${symbol.slice(0, 2).toUpperCase()}`, REPORT_DATE: date + ' 00:00:00', NOTICE_DATE: date.endsWith('12-31') ? `${+date.slice(0, 4) + 1}-03-20 00:00:00` : `${date.slice(0, 4)}-08-15 00:00:00`, UPDATE_DATE: '2026-08-20 00:00:00', CURRENCY: 'CNY', TOTALOPERATEREVE: 920e8, PARENTNETPROFIT: 440e8, KCFJCXSYJLR: 435e8, TOTALOPERATEREVETZ: 1.3, PARENTNETPROFITTZ: -1.9, KCFJCXSYJLRTZ: -2.1, NETCASH_OPERATE_PK: 700e8, ROEJQ: 16.75, ZCFZL: 15.19 };

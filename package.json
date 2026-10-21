@@ -1,6 +1,6 @@
 {
   "name": "guanlan-paper",
-  "version": "1.4.0",
+  "version": "1.8.5",
   "description": "观澜 A 股模拟交易桌面工具",
   "author": "Guanlan",
   "private": true,
@@ -28,6 +28,12 @@
       "assets/**",
       "package.json"
     ],
+    "asarUnpack": [
+      "node_modules/tesseract.js/**",
+      "node_modules/tesseract.js-core/**",
+      "node_modules/{bmp-js,idb-keyval,is-url,node-fetch,whatwg-url,tr46,webidl-conversions,opencollective-postinstall,regenerator-runtime,wasm-feature-detect,zlibjs}/**",
+      "assets/ocr/**"
+    ],
     "win": {
       "target": "portable",
       "icon": "assets/icon.ico",
@@ -36,5 +42,10 @@
     "portable": {
       "artifactName": "Guanlan-${version}-win-x64.exe"
     }
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "1.0.11",
+    "pdfjs-dist": "6.4.299",
+    "tesseract.js": "7.0.0"
   }
 }

@@ -3,10 +3,11 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { SNAPSHOT_FIELDS: FIELDS, BOARDS, fieldAvailable, quoteTimeAvailable, quoteRange } = require('./screener.cjs');
 const { cnTime, symbolOf } = require('./common.cjs');
-const SOURCE = '东方财富公开行情';
+const { TENCENT_SCREEN_SOURCE } = require('./screener-tencent.cjs');
+const SOURCES = new Set(['东方财富公开行情', TENCENT_SCREEN_SOURCE]);
 const validTime = value => Number.isSafeInteger(value) && value > 0 && value <= 8640000000000000;
 function validSnapshot(s) {
-  if (!s || s.source !== SOURCE || !validTime(s.startedAt) || !validTime(s.fetchedAt) || s.startedAt > s.fetchedAt || !Number.isInteger(s.sourceCount) || s.sourceCount < 1 || s.sourceCount > 15000 || !Number.isInteger(s.excludedCount) || s.excludedCount < 0 || !Array.isArray(s.rows) || !s.rows.length || s.rows.length + s.excludedCount !== s.sourceCount) return false;
+  if (!s || !SOURCES.has(s.source) || !validTime(s.startedAt) || !validTime(s.fetchedAt) || s.startedAt > s.fetchedAt || !Number.isInteger(s.sourceCount) || s.sourceCount < 1 || s.sourceCount > 15000 || !Number.isInteger(s.excludedCount) || s.excludedCount < 0 || !Array.isArray(s.rows) || !s.rows.length || s.rows.length + s.excludedCount !== s.sourceCount) return false;
   const seen = new Set();
   for (const row of s.rows) {
     try { if (symbolOf(row.symbol) !== row.symbol || seen.has(row.symbol)) return false; } catch { return false; }

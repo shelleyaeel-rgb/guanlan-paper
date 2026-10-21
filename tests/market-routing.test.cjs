@@ -178,6 +178,39 @@ test('Retry-After 等待期间手动强刷也不重复访问限流入口', async
   time += 30000; await market.history(symbol, true); assert.equal(primaryCalls, 2);
 });
 
+test('重新核验策略日线绕过普通故障冷却，自动检查仍等待冷却恢复', async () => {
+  let recovered = false, calls = 0;
+  const market = marketWith(async () => {
+    calls++;
+    return recovered ? jsonResponse(txDaily(raw, false)) : http(503);
+  });
+  await assert.rejects(market.strategyHistory(symbol), /HTTP 503/);
+  assert.equal(calls, 3);
+  recovered = true;
+  const monitor = new StrategyMonitor(market, () => new Date(now));
+  const automatic = await monitor.load(symbol);
+  assert.match(automatic.error, /暂缓重试/); assert.equal(calls, 3);
+  const explicit = await monitor.load(symbol, true);
+  assert.equal(explicit.error, undefined); assert.equal(explicit.technical.asOf, '2026-09-29');
+  assert.equal(explicit.provider, 'tencent'); assert.equal(calls, 4);
+});
+
+test('重新核验策略日线仍遵守服务端 Retry-After，到期后取得新日线', async () => {
+  let time = now, recovered = false, calls = 0;
+  const market = marketWith(async () => {
+    calls++;
+    return recovered ? jsonResponse(txDaily(raw, false)) : { ...http(429), headers: { get: () => '60' } };
+  }, { clock: () => time });
+  const monitor = new StrategyMonitor(market, () => new Date(time));
+  assert.match((await monitor.load(symbol)).error, /HTTP 429/); assert.equal(calls, 3);
+  recovered = true; time += 30001;
+  assert.match((await monitor.load(symbol, true)).error, /暂缓重试/); assert.equal(calls, 3);
+  time += 30000;
+  const retried = await monitor.load(symbol, true);
+  assert.equal(retried.error, undefined); assert.equal(retried.technical.asOf, '2026-09-29');
+  assert.equal(retried.fetchedAt, time); assert.equal(calls, 4);
+});
+
 test('东财分时每分钟手数转为累计股数，带独立日期、昨收及来源', async () => {
   const market = marketWith(async url => url.includes('eastmoney') ? jsonResponse(emMinute()) : http(503));
   const data = await market.intraday(symbol);
@@ -198,4 +231,41 @@ test('策略与技术筛选记录真实日线来源，保留股票池估值来�
   assert.equal(result.source, data.source); assert.equal(result.rows[0].technicalSource, '东方财富');
   assert.match(result.technicalScan.source, /东方财富/); assert.equal(result.rows[0].pe, 12);
   assert.equal(data.rows[0].technicalSource, undefined);
+});
+
+test('大股票池报价分批有界，并发调用共享限流且持仓报价不排在全部候选后', async () => {
+  const symbols = Array.from({ length: 421 }, (_, index) => `sh${600001 + index}`), calls = [], releases = [];
+  let active = 0, peak = 0;
+  const market = marketWith(async url => {
+    const requested = url.split('=').at(-1).split(','); calls.push(requested);
+    active++; peak = Math.max(peak, active);
+    if (calls.length <= 3) await new Promise(resolve => releases.push(resolve));
+    else await new Promise(resolve => setImmediate(resolve));
+    active--; return textResponse(requested.map(s => tencent(s)).join(''));
+  });
+  const bulk = market.quotes([...symbols, symbols[0]]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.length, 3);
+  const holding = market.quotes([symbol]);
+  for (const release of releases) release();
+  const [all, one] = await Promise.all([bulk, holding]);
+  assert.equal(Object.keys(all).length, symbols.length); assert.ok(one[symbol]);
+  assert.equal(peak, 3); assert.ok(calls.every(batch => batch.length <= 80));
+  assert.equal(calls.findIndex(batch => batch.includes(symbol)), 3, '后续持仓请求先于剩余批量请求获得并发名额');
+  assert.equal(market.quoteActive, 0); assert.equal(market.quoteWaiters.length, 0);
+});
+
+test('分批报价保留已成功批次，缺失股票逐批补源且无效批次不熔断其他标的', async () => {
+  const symbols = Array.from({ length: 181 }, (_, index) => `sh${600001 + index}`), calls = [];
+  const market = marketWith(async url => {
+    const requested = url.split('=').at(-1).split(','); calls.push({ url, requested });
+    const parsed = url.includes('gtimg') ? requested.slice(1).map(s => tencent(s)) : requested.map(s => sina(s));
+    return textResponse(parsed.join(''));
+  });
+  const all = await market.quotes(symbols);
+  assert.equal(Object.keys(all).length, symbols.length);
+  assert.equal(calls.filter(call => call.url.includes('sinajs')).length, 3);
+  assert.ok(calls.filter(call => call.url.includes('sinajs')).every(call => call.requested.length === 1));
+  assert.equal(all[symbols[0]].provider, 'sina'); assert.equal(all[symbols[1]].provider, 'tencent');
+  assert.equal(all[symbols[0]].canTrade, false);
 });
