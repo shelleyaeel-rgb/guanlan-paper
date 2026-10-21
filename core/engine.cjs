@@ -238,16 +238,17 @@ class Engine {
       const r = this.s.risks[p.symbol], q = quotes[p.symbol];
       if (!r || (!r.enabled && !r.strategy)) continue;
       try {
-        const agencyBlock = this.agencyAutomaticBlock(p.symbol, q, snapshots[p.symbol]);
-        if (agencyBlock) { r.note = agencyBlock; continue; }
+        const agencyCheck = this.agencyAutomaticCheck(p.symbol, q, snapshots[p.symbol], { allowVerifiedExit: true });
+        if (agencyCheck.reason) { r.note = agencyCheck.reason; continue; }
         this.fresh(q); r.peak = Math.max(r.peak || 0, q.price);
         const trailingStop = r.trailing ? r.peak * (1 - r.trailing / 100) : 0, threshold = Math.max(r.stop || 0, trailingStop);
         let reason = r.pendingExit || (threshold && q.price <= threshold ? '止损触发' : r.target && q.price >= r.target ? '止盈触发' : null);
         // Honor previously crossed boundaries before any adjustment. Never move a target away from a triggered exit.
-        if (!reason) {
+        if (!reason && !agencyCheck.exitOnly) {
           updateDynamicRisk(r, snapshots[p.symbol], q, this.clock());
           reason = r.pendingExit || (r.stop && q.price <= r.stop ? '止损触发' : r.target && q.price >= r.target ? '止盈触发' : null);
         }
+        if (agencyCheck.exitOnly) r.reviewNote = agencyCheck.dailyReason;
         const agencyIntent = !reason ? this.agencyPendingExit(p.symbol) : null;
         if (agencyIntent) reason = agencyIntent.action === 'reduce' ? '自动减仓目标待完成' : '自动退出目标待完成';
         if (!reason) { r.note = r.strategy ? `${r.enabled ? '持仓跟踪' : '自动卖出暂停'} · ${r.dynamic ? r.reviewNote : '日线复核已暂停，仅按已存价位监控；趋势与期限退出暂停'}` : '监控中'; continue; }

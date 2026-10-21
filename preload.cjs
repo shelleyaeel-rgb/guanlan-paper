@@ -4,6 +4,7 @@ const allowed = new Set(['state', 'refresh', 'detail', 'research:get', 'research
 for (const name of ['agency:transfer', 'agency:configure', 'agency:mode', 'agency:member', 'agency:members:add', 'agency:reconcile', 'agency:verify', 'agency:run', 'agency:pool:run', 'agency:pool:retry', 'agency:pool:cancel', 'agency:pool:status']) allowed.add(name);
 for (const name of ['evidence:list', 'evidence:save', 'evidence:remove', 'evidence:open']) allowed.add(name);
 allowed.add('research:inspect');
+allowed.add('capital:add');
 allowed.add('view:state'); allowed.add('view:refresh');
 allowed.add('view:subscribe');
 contextBridge.exposeInMainWorld('guanlan', {

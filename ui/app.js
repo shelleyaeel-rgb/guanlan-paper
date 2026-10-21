@@ -149,6 +149,7 @@ function renderState(s) {
   $('connection').className = 'connection' + (s.connection.ok ? '' : ' error') + (page === 'screener' ? ' hidden' : '');
   setHtml('connection', `<span class="dot"></span><span>${esc(s.connection.message)} · 最近获取 ${latest} · ${esc(s.connection.sources?.join(' / ') || '等待行情来源')} · 免费接口可能延迟</span>`);
   $('warning').textContent = s.warning || ''; $('warning').classList.toggle('hidden', !s.warning);
+  if (typeof renderCapital === 'function') renderCapital();
   const capitalNote = '累计投入 ¥ ' + cash(stat.cumulativeCapital ?? s.account.initialCash);
   const equityNote = stat.comparable === false ? ' · 含待核验权益，当前为暂估值' : stat.receivable || stat.taxReserve ? ` · 含应收 ¥ ${cash(stat.receivable || 0)} · 扣预计股息税 ¥ ${cash(stat.taxReserve || 0)}` : '';
   setHtml('account-cards', metric('账户净权益', '¥ ' + cash(stat.equity), capitalNote + equityNote) + metric('累计盈亏', signed(stat.pnl / 100), stat.comparable === false ? '暂估盈亏 · 收益率待对账' : '时间加权收益率 ' + (stat.returnPct == null ? '—' : signed(stat.returnPct * 100) + '%'), cls(stat.pnl)) + metric('账户现金', '¥ ' + cash(stat.cash), '手动可用 ¥ ' + cash(s.agency?.manualCash ?? stat.cash)) + metric('已实现卖出胜率', pct(stat.winRate), stat.sells ? `${stat.wins} 笔盈利 / ${stat.sells} 笔卖出 · 含费用` : '暂无已完成卖出，开始积累交易样本'));

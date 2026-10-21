@@ -71,7 +71,7 @@ function state({ view = false } = {}) {
       signals[symbol].reasons.unshift(fatal || '行情连接不可用，等待恢复');
     }
   }
-  return { account: view ? accountView(engine.s) : engine.s, stats: engine.stats(quotes), agency: { ...engine.agencyState(quotes, view ? { decisionView } : {}), runtime: { ...(agency ? agency.publicState() : { decisionMode: 'rules', rulesVersion: '1', intervalSeconds: 300, runningGroups: [], online: false, lastError: agencyError }), notices: noticeMonitor?.publicState() } }, agencyPool: agencyPool?.publicState(), quotes: { ...engine.s.marks, ...quotes }, signals, strategyProfiles: STRATEGY_PROFILES, planSelections: { ...engine.s.planSelections }, connection, session: session(), date: cnTime().date, now: Date.now(), dataPath: app.getPath('userData'), warning: fatal || store.warning || entryEvidenceWarning || agencyError };
+  return { account: view ? accountView(engine.s) : engine.s, accountPaused: !!fatal, stats: engine.stats(quotes), agency: { ...engine.agencyState(quotes, view ? { decisionView } : {}), runtime: { ...(agency ? agency.publicState() : { decisionMode: 'rules', rulesVersion: '1', intervalSeconds: 300, runningGroups: [], online: false, lastError: agencyError }), notices: noticeMonitor?.publicState() } }, agencyPool: agencyPool?.publicState(), quotes: { ...engine.s.marks, ...quotes }, signals, strategyProfiles: STRATEGY_PROFILES, planSelections: { ...engine.s.planSelections }, connection, session: session(), date: cnTime().date, now: Date.now(), dataPath: app.getPath('userData'), warning: fatal || store.warning || entryEvidenceWarning || agencyError };
 }
 function publish(snapshot) {
   clearTimeout(publishTimer); publishTimer = null;
@@ -395,6 +395,16 @@ app.whenReady().then(() => {
   handler('cancel', input => { transaction(() => engine.cancel(input)); publish(); });
   handler('risk', input => { transaction(() => engine.setRisk(input.symbol, input)); publish(); });
   handler('settings', input => { transaction(() => engine.configure(input)); startTimer(); publish(); });
+  handler('capital:add', input => {
+    const flow = transaction(() => {
+      if (input?.accountCreatedAt !== engine.s.createdAt) throw Error('模拟账户已变更，请刷新后重新确认追加本金');
+      return engine.addCapital(input, quotes);
+    });
+    // The flow is already committed. A failed view broadcast must not turn it
+    // into a business rejection that lets the renderer replace its request ID.
+    try { publish(); } catch {}
+    return flow;
+  });
   handler('reset', input => {
     if (input.confirm !== '重置') throw Error('请输入“重置”确认');
     const next = new Engine(initialState(input.capital)).s; enableMarketPolicy(next); store.backup(engine.s); agency?.invalidate(); agencyPool?.cancel(); transaction(() => { engine.s = next; }); entryEvidenceWarning = ''; publish(); return true;

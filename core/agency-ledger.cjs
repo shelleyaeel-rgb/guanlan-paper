@@ -20,6 +20,9 @@ const object = v => v && typeof v === 'object' && !Array.isArray(v);
 const sameEvidenceRef = (left, right) => validEntryEvidenceRef(left) && validEntryEvidenceRef(right)
   && ['version', 'hash', 'symbol', 'strategyId', 'decisionId', 'createdAt'].every(key => left[key] === right[key]);
 const validDate = d => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d) && Number.isFinite(Date.parse(d)) && new Date(d).toISOString().slice(0, 10) === d;
+const validExitPriceBasis = basis => object(basis) && validDate(basis.date) && validDate(basis.dailyAsOf) && basis.dailyAsOf < basis.date
+  && Number.isFinite(basis.prevClose) && basis.prevClose > 0 && Number.isFinite(basis.dailyClose) && basis.dailyClose > 0
+  && Number.isFinite(basis.checkedAt) && Number.isFinite(basis.corporateCheckedAt) && typeof basis.corporateBasis === 'string';
 function limitsOf(input = {}, prior = DEFAULT_LIMITS) {
   const v = { ...prior, ...input };
   const limits = {
@@ -133,6 +136,7 @@ function validAgency(s) {
         if (!object(m) || symbolOf(m.symbol) !== m.symbol || members.has(m.symbol) || !MEMBER_MODES.includes(m.mode)
           || !object(m.reconciliation) || !['clear', 'pending'].includes(m.reconciliation.status)) return false;
         if (m.entryConditions !== undefined && !validEntryConditions(m.entryConditions)) return false;
+        if (m.exitPriceBasis !== undefined && !validExitPriceBasis(m.exitPriceBasis)) return false;
         if (a.version >= 5 && !SELECTION_MODES.includes(m.selectionMode)) return false;
         if (m.legacyPoolConditions !== undefined && !validEntryConditions(m.legacyPoolConditions)) return false;
         if (m.monitoringCheck !== undefined && (!object(m.monitoringCheck) || !MONITORING_STATUSES.includes(m.monitoringCheck.status)
@@ -221,7 +225,15 @@ function pending(engine, member, reason, evidence = [], affectsEquity) {
   }
   return reason;
 }
-function corporateBlock(engine, symbol, q, snapshot) {
+function corporatePriceBasis(engine, symbol) {
+  return JSON.stringify([
+    engine.s.agency.corporateActions.filter(action => action.symbol === symbol).map(action =>
+      [action.eventId, action.terms, Boolean(action.exAppliedAt), Boolean(action.shareAppliedAt), action.manualEventId]),
+    engine.s.agency.corporateEvents.filter(event => event.symbol === symbol).map(event =>
+      [event.eventId, event.time, event.effectiveDate, event.shareNumerator, event.shareDenominator, event.riskPriceFactor])
+  ]);
+}
+function corporateBlock(engine, symbol, q, snapshot, allowVerifiedExit = false) {
   let found = membership(engine, symbol);
   if (!found) return { status: 'clear', reason: '' };
   const blocked = reason => ({ status: 'blocked', reason });
@@ -234,12 +246,24 @@ function corporateBlock(engine, symbol, q, snapshot) {
   // Current data availability is distinct from the persisted reconciliation
   // latch. Keep that latch until all price checks pass, but report today's
   // missing input instead of an already-resolved corporate-source failure.
-  if (typeof snapshot?.error === 'string' && snapshot.error.trim()) return waiting(snapshot.error.trim());
-  if (!q) return waiting('行情尚未获取，价格基准尚未核验，暂停自动交易');
-  if (!snapshot || snapshot.error || !snapshot.technical) return waiting('策略日线尚未获取，价格基准尚未核验，等待新鲜日线');
-  if (!Number.isFinite(snapshot.fetchedAt) || engine.clock().getTime() - snapshot.fetchedAt > 180000
-    || snapshot.fetchedAt > engine.clock().getTime() + 15000) return waiting('日线获取时间无效或已过期，价格基准尚未核验，等待新鲜日线');
-  const t = snapshot.technical;
+  if (!q) return waiting(typeof snapshot?.error === 'string' && snapshot.error.trim()
+    ? snapshot.error.trim() : '行情尚未获取，价格基准尚未核验，暂停自动交易');
+  const now = engine.clock().getTime(), basis = member.exitPriceBasis;
+  const dailyProblem = typeof snapshot?.error === 'string' && snapshot.error.trim() ? snapshot.error.trim()
+    : !snapshot || snapshot.error || !snapshot.technical ? '策略日线尚未获取，价格基准尚未核验，等待新鲜日线'
+      : !Number.isFinite(snapshot.fetchedAt) || now - snapshot.fetchedAt > 180000 || snapshot.fetchedAt > now + 15000
+        ? '日线获取时间无效或已过期，价格基准尚未核验，等待新鲜日线' : null;
+  if (dailyProblem) {
+    // An unavailable daily refresh must not disable an already verified exit.
+    // This is same-day price evidence, never permission to recalculate a plan
+    // or to clear an unresolved ledger/corporate-action latch.
+    if (!allowVerifiedExit || member.reconciliation.status !== 'clear' || member.awaitingVerification
+      || !validExitPriceBasis(basis) || basis.date !== q.date || q.symbol !== symbol
+      || basis.checkedAt > now || basis.corporateBasis !== corporatePriceBasis(engine, symbol)) return waiting(dailyProblem);
+    if (!Number.isFinite(q.prevClose) || Math.abs(basis.prevClose - q.prevClose) > 0.011)
+      return blocked(pending(engine, member, '行情与当日已核验价格基准不一致，等待重新核验完整日线', [{ verifiedReference: basis.prevClose, marketReference: q.prevClose, quoteDate: q.date }]));
+  }
+  const t = dailyProblem ? { asOf: basis.dailyAsOf, close: basis.dailyClose } : snapshot.technical;
   if (!validDate(t.asOf) || t.asOf >= q.date || !validDate(q.date)) return waiting('完整日线日期尚未核验，暂停自动交易');
   const reference = q.prevClose;
   const holding = engine.s.lots.some(l => l.symbol === symbol);
@@ -253,19 +277,25 @@ function corporateBlock(engine, symbol, q, snapshot) {
   if (!Number.isFinite(reference) || !Number.isFinite(expectedReference) || Math.abs(expectedReference - reference) > 0.011) {
     return blocked(pending(engine, member, '行情与完整日线价格基准不一致，需核实除权或缺失日线', [{ dailyClose: t.close, marketReference: reference, asOf: t.asOf, quoteDate: q.date }]));
   }
-  const check = checkNoticeRisk(snapshot.notices, symbol, engine.clock());
-  if (automatic?.status !== 'clear' && (!check.coverageComplete || !['clear', 'blocked', 'unverified'].includes(check.status) || !Array.isArray(snapshot.notices?.data?.items)
-    || !Number.isFinite(snapshot.notices.fetchedAt) || engine.clock().getTime() - snapshot.notices.fetchedAt > 300000)) return waiting('公司行为公告资料尚未核验，暂停自动交易');
+  const notices = snapshot?.notices, check = checkNoticeRisk(notices, symbol, engine.clock());
+  const cachedCorporate = dailyProblem && !notices && !snapshot?.corporateActions
+    && now - basis.corporateCheckedAt <= 300000 && basis.corporateCheckedAt <= now;
+  if (automatic?.status !== 'clear' && !cachedCorporate && (!check.coverageComplete || !['clear', 'blocked', 'unverified'].includes(check.status) || !Array.isArray(notices?.data?.items)
+    || !Number.isFinite(notices.fetchedAt) || now - notices.fetchedAt > 300000)) return waiting('公司行为公告资料尚未核验，暂停自动交易');
   const today = cnTime(engine.clock()).date;
   // A reviewed announcement may describe a future distribution. Reviewing it
   // without booking an entitlement is only a same-day acknowledgement.
   const reconciledIds = new Set(engine.s.agency.corporateEvents.filter(e => e.symbol === symbol
     && (!e.confirmationOnly || cnTime(e.time).date === today)).flatMap(e => [e.eventId, ...(e.noticeIds || [])]));
   for (const notice of automatic?.coveredNoticeIds || []) reconciledIds.add(notice);
-  const items = (automatic?.status === 'clear' ? [] : snapshot.notices.data.items).filter(item => /分红|派息|送股|送转|转增|除权|除息|权益分派|配股|利润分配实施/.test(item.title || '') && !reconciledIds.has(item.id));
+  const items = (automatic?.status === 'clear' || cachedCorporate ? [] : notices.data.items).filter(item => /分红|派息|送股|送转|转增|除权|除息|权益分派|配股|利润分配实施/.test(item.title || '') && !reconciledIds.has(item.id));
   if (items.length) return blocked(pending(engine, member, '发现分红送转等公司行为公告，核实生效日期及持仓权益后恢复', items.map(item => ({ id: item.id, title: item.title, date: item.date }))));
+  if (dailyProblem) return { status: 'clear', reason: '', exitOnly: true, dailyReason: dailyProblem };
   member.lastVerifiedAt = engine.clock().toISOString();
   member.lastVerifiedDate = q.date;
+  member.exitPriceBasis = { date: q.date, prevClose: q.prevClose, dailyAsOf: t.asOf, dailyClose: t.close, checkedAt: now,
+    corporateCheckedAt: automatic?.status === 'clear' ? snapshot.corporateActions.fetchedAt : notices.fetchedAt,
+    corporateBasis: corporatePriceBasis(engine, symbol) };
   if (member.reconciliation.status === 'pending') { member.reconciliation = { status: 'clear', reason: '' }; bump(engine); }
   member.awaitingVerification = false;
   return { status: 'clear', reason: '' };
@@ -381,15 +411,17 @@ function installAgency(Engine) {
     this.s.agency.decisions.push(entry); if (this.s.agency.decisions.length > 500) this.s.agency.decisions.splice(0, this.s.agency.decisions.length - 500);
     return entry;
   };
-  Engine.prototype.agencyAutomaticBlock = function(symbol, q, snapshot) {
-    const found = membership(this, symbol); if (!found) return null;
+  Engine.prototype.agencyAutomaticCheck = function(symbol, q, snapshot, { allowVerifiedExit = false } = {}) {
+    const found = membership(this, symbol); if (!found) return { status: 'clear', reason: '' };
     const record = result => {
       // Diagnostics do not grant execution permission or alter account
       // revisions. Corporate processing may replace member objects, so fetch
       // the current member before recording the outcome.
       const current = membership(this, symbol);
-      if (current) current.member.automaticCheck = { ...result, checkedAt: this.clock().toISOString() };
-      return result.reason || null;
+      const diagnostic = result.exitOnly ? { ...result, status: 'waiting',
+        reason: `${result.dailyReason}；日线复核暂停，已存价位和待完成退出目标继续监控` } : result;
+      if (current) current.member.automaticCheck = { ...diagnostic, checkedAt: this.clock().toISOString() };
+      return result;
     };
     if (found.group.mode === 'stopped') return record({ status: 'blocked', reason: '本策略全部自动操作已停止' });
     const trading = calendarSession(this.clock());
@@ -397,10 +429,13 @@ function installAgency(Engine) {
       // A holding's frequent risk tick must not erase the historical preparation
       // result. Preserve its original timestamp, but return the same closed-
       // session execution block; this diagnostic never grants trade permission.
-      if (trading.known && currentPreparation(found.member.automaticCheck, this.clock())) return trading.label;
+      if (trading.known && currentPreparation(found.member.automaticCheck, this.clock())) return { status: 'waiting', reason: trading.label };
       return record({ status: 'waiting', reason: trading.label });
     }
-    return record(corporateBlock(this, symbol, q, snapshot));
+    return record(corporateBlock(this, symbol, q, snapshot, allowVerifiedExit));
+  };
+  Engine.prototype.agencyAutomaticBlock = function(symbol, q, snapshot) {
+    return this.agencyAutomaticCheck(symbol, q, snapshot).reason || null;
   };
   Engine.prototype.agencyPrepare = function(symbol, q, snapshot) {
     const found = membership(this, symbol); if (!found) return null;
