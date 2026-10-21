@@ -1,4 +1,5 @@
 const { cnTime } = require('./common.cjs');
+const { parseTencentScreenQuotes } = require('./screener-tencent.cjs');
 const SOURCES = { tencent: '腾讯财经', sina: '新浪财经', eastmoney: '东方财富' };
 const INDEX_SYMBOLS = new Set(['sh000001', 'sz399001', 'sz399006']);
 const numeric = value => value == null || String(value).trim() === '' || !Number.isFinite(Number(value)) ? null : Number(value);
@@ -29,6 +30,15 @@ function parseQuotes(text, receivedAt = Date.now()) {
       change: numeric(a[31]), changePct: numeric(a[32]), high: numeric(a[33]), low: numeric(a[34]), amount: scaled(a[37], 10000),
       turnover: numeric(a[38]), pe: numeric(a[39]), pb: numeric(a[46]), limitUp: numeric(a[47]), limitDown: numeric(a[48]),
       date, time, timestamp: at, receivedAt, provider: 'tencent', source: SOURCES.tencent });
+    if (!INDEX_SYMBOLS.has(m[1])) {
+      try {
+        // Reuse the screener adapter for dynamic PE, quote volume ratio and KCB units.
+        // A truncated quote may still display/trade, but absent screening metrics
+        // remain unavailable to any saved entry constraint that needs them.
+        const row = parseTencentScreenQuotes(m[0], [m[1]], receivedAt)[0];
+        result[m[1]].screeningMetrics = { ...row, source: SOURCES.tencent };
+      } catch {}
+    }
   }
   return result;
 }

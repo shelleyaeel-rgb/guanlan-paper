@@ -1,6 +1,10 @@
 // Test-only market pages; the account and clock are isolated by strategy-desktop.
 const fs = require('node:fs');
 const { Screener } = require('../../core/screener.cjs');
+// This legacy table fixture deliberately feeds synthetic Eastmoney-shaped pages.
+// The free-provider adapter has separate request-level and real-network checks.
+const fetchAll = Screener.prototype.fetchAll;
+Screener.prototype.fetchAll = function(...args) { this.snapshotLoader = null; return fetchAll.apply(this, args); };
 Screener.prototype.page = async function(page) {
   const scenario = JSON.parse(fs.readFileSync(process.env.GUANLAN_TEST_CONTROL, 'utf8'));
   if (scenario.screenFail) throw Error('测试选股接口断线');

@@ -1,0 +1,80 @@
+{
+  "fixture": "company-native-embedded-checkboxes.pdf",
+  "sha256": "e9591fcee61248673adb4a447d1b9414f32ce18bb7d9c9d579974d383eec4f87",
+  "bytes": 563458,
+  "sourceTitle": "分众传媒信息技术股份有限公司2026年半年度报告",
+  "symbol": "sz002027",
+  "announcementId": "AN202608181828113472",
+  "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202608181828113472_1.pdf?1787076763000.pdf",
+  "originalSha256": "c4bcfa113ecf6b171cfb18f4a205a044cfaaa643869ff13a66dac724f1e93eb9",
+  "originalBytes": 2134645,
+  "originalPages": 180,
+  "pageMap": [
+    {
+      "fixturePage": 1,
+      "sourcePage": 33
+    },
+    {
+      "fixturePage": 2,
+      "sourcePage": 67
+    }
+  ],
+  "preparation": "pypdf PdfWriter.add_page copies source page objects, resources, content streams and embedded font program; no rasterization, text replacement or OCR. Extracted from isolated verification attachment, with no writes to account/cache. Decoded content streams and embedded Wingdings2 font bytes are identical to source.",
+  "fontIdentity": {
+    "pdfBaseFont": "CIDFont+F5",
+    "subtype": "Type0",
+    "encoding": "Identity-H",
+    "fontProgram": "TrueType",
+    "nameId6": "Wingdings2",
+    "nameIds1_3_4": "Wingdings 2",
+    "toUnicode": "<0035> -> <F052>",
+    "verifiedEmbeddedFontCopies": [
+      {
+        "fixturePage": 1,
+        "sourcePage": 33,
+        "fontResource": "/F3",
+        "baseFont": "/CIDFont+F5",
+        "fontProgramBytes": 20136,
+        "fontProgramSha256": "b6855ff7e030b4f8e89bde98196dc9d0f4013c4e2a023af8bcb996099f1954f2"
+      },
+      {
+        "fixturePage": 2,
+        "sourcePage": 67,
+        "fontResource": "/F4",
+        "baseFont": "/CIDFont+F5",
+        "fontProgramBytes": 20136,
+        "fontProgramSha256": "b6855ff7e030b4f8e89bde98196dc9d0f4013c4e2a023af8bcb996099f1954f2"
+      }
+    ]
+  },
+  "reviewedAt": "2026-10-14",
+  "review": "Original and extracted pages were rendered with Poppler and visually inspected. Source page 33 contains six checked options in financial/risk sections, including applicable/not-applicable and yes/no; source page 67 contains the joint-arrangement accounting policy choice. Checked-box appearance, surrounding text, and printed page numbers are retained without layout defects.",
+  "renderComparison": [
+    {
+      "sourcePage": 33,
+      "fixturePage": 1,
+      "sourceSize": [
+        1273,
+        1800
+      ],
+      "fixtureSize": [
+        1273,
+        1800
+      ],
+      "pixelIdentical": true
+    },
+    {
+      "sourcePage": 67,
+      "fixturePage": 2,
+      "sourceSize": [
+        1273,
+        1800
+      ],
+      "fixtureSize": [
+        1273,
+        1800
+      ],
+      "pixelIdentical": true
+    }
+  ]
+}

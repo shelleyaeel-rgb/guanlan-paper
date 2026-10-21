@@ -3,6 +3,7 @@ node_modules/
 dist/
 releases/
 work/
+/tmp/
 
 # Local accounts, backups and credentials
 account*.json

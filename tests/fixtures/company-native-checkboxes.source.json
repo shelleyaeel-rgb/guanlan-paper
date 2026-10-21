@@ -1,0 +1,12 @@
+{
+  "fixture": "company-native-checkboxes.pdf",
+  "sha256": "2868bc303ce993bea16b7e980b106551c7cde782c6dbb1c520f279edce233637",
+  "sourceTitle": "烟台正海生物科技股份有限公司2025年年度报告全文",
+  "announcementId": "AN202603301820863102",
+  "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202603301820863102_1.pdf",
+  "originalSha256": "123bb8c0ccfc5300b9f8ce0ba032f6dcb0e8035621a6346cbf7af1454cac5e66",
+  "originalPage": 134,
+  "preparation": "以pypdf从隔离原件复制第134页，保留原生字形、字体、文字层与页面内容；未使用用户账户或缓存写入。",
+  "reviewedAt": "2026-10-13",
+  "review": "已渲染目视确认租赁正文、7个勾选框（含适用及不适用）和44,034.73元。"
+}

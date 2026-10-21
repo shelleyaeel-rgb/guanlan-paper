@@ -1,0 +1,28 @@
+{
+  "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202604241821544469_1.pdf?1777049690000.pdf",
+  "announcementId": "AN202604241821544469",
+  "title": "陕西煤业股份有限公司2025年年度报告",
+  "sourceSha256": "63f2a34ff83a7f9e47c654d4f8e27086c3c8b65ccc66789465f722bd329881b2",
+  "sourcePages": 283,
+  "fixtureSha256": "ed2c743c39a8418fa55c98432fad5fb13cb8d4692fb8f9f580e6cce4216a28b8",
+  "pageMap": [
+    {
+      "fixturePage": 1,
+      "sourcePage": 73
+    },
+    {
+      "fixturePage": 2,
+      "sourcePage": 74
+    },
+    {
+      "fixturePage": 3,
+      "sourcePage": 75
+    },
+    {
+      "fixturePage": 4,
+      "sourcePage": 80
+    }
+  ],
+  "extraction": "pypdf PdfWriter.add_page copies original PDF page objects/resources; no rasterization, text replacement or OCR; retained adjacent native-text pages 73 and 80 as controls",
+  "purpose": "Mixed scanned audit text beneath native page furniture, with native-only controls; source extracted from local original for regression testing"
+}

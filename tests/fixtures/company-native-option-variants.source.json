@@ -1,0 +1,23 @@
+{
+  "fixture": "company-native-option-variants.pdf",
+  "sha256": "aeece6e944ac5775105d2e0a128b59a4ebc87edba4da8a8fe228fe795c582471",
+  "sources": [
+    {
+      "announcementId": "AN202603231820705998",
+      "name": "神火股份",
+      "originalPage": 25,
+      "originalSha256": "a666703bc261f51206f0484aa1d430fd6b8ff42ceefe57bb1f89c055c5aa3303",
+      "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202603231820705998_1.pdf"
+    },
+    {
+      "announcementId": "AN202604151821241540",
+      "name": "新和成",
+      "originalPage": 175,
+      "originalSha256": "1663c8f1f927a497902c0dfbf6b56c517902cf29b52d44be0ec7055244bc81e8",
+      "sourceUrl": "https://pdf.dfcfw.com/pdf/H2_AN202604151821241540_1.pdf"
+    }
+  ],
+  "preparation": "以pypdf从隔离原件复制两页，保留原生字形、字体、文字层和全部页面内容。",
+  "reviewedAt": "2026-10-14",
+  "review": "已渲染目视核对神火25页的口字形空框及现金流表，新和成175页的额外空框加勾及金融资产表。仅映射经字体和完整排他选项上下文核验的Wingdings2勾，保留口和额外空框，不删除内容。"
+}
