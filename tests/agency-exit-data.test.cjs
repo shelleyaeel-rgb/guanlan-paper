@@ -97,7 +97,7 @@ test('待完成减仓目标在日线失败和重启后继续执行，保持原�
 });
 
 test('日线回退路径仍保留T+1、部分成交、盘口去重和后续报价重试', () => {
-  const f = fixture();
+  const f = fixture(); f.verify();
   f.engine.s.risks[SYMBOL].pendingExit = '止损触发';
   assert.equal(f.tick(f.snapshot({ error: '日线暂缺' })).length, 0);
   assert.match(f.engine.s.risks[SYMBOL].note, /T\+1/);

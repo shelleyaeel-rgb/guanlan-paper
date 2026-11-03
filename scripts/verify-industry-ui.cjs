@@ -4,6 +4,9 @@ const fs = require('node:fs'), path = require('node:path'), assert = require('no
 const { evaluateEntryConditions } = require('../core/entry-conditions.cjs');
 const { companyBundle } = require('../tests/fixtures/company-evidence-data.cjs');
 const root = path.resolve(__dirname, '..');
+async function revealPoolControl(selector) {
+  await page.locator(selector).evaluate(element => { for (let parent = element.parentElement; parent; parent = parent.parentElement) if (parent.tagName === 'DETAILS') parent.open = true; });
+}
 fs.mkdirSync(path.join(root, 'work'), { recursive: true });
 const output = fs.mkdtempSync(path.join(root, 'work/industry-ui-')), accountPath = path.join(output, 'account');
 const control = path.join(output, 'control.json'), callsPath = path.join(output, 'calls.jsonl'), networkLog = path.join(output, 'network.jsonl');
@@ -40,7 +43,7 @@ const record = (symbol, rank, extra = {}) => ({ symbol, kind: 'mainRank', value:
 (async () => {
   await launch(); const before = await call('state');
   assert.ok((await call('screener:meta')).industry.fields.mainRankMax);
-  await page.locator('[data-page="agency"]').click(); const editor = page.locator('#agency-industry-controls');
+  await page.locator('[data-page="agency"]').click(); await revealPoolControl('#agency-industry-controls'); const editor = page.locator('#agency-industry-controls');
   assert.equal(await editor.locator('[data-industry-edit="mode"]').inputValue(), 'observe');
   assert.equal(await editor.locator('input').count(), 0);
   await editor.locator('[data-industry-edit="mode"]').selectOption('filter');
@@ -70,9 +73,9 @@ const record = (symbol, rank, extra = {}) => ({ symbol, kind: 'mainRank', value:
   assert.equal(entry.industryReview?.status || entry.selectionEvidence?.industryReview?.status, 'pass');
   await editor.locator('[data-industry-edit="minSegmentRevenuePct"]').fill('50'); await poolRun();
   account = await call('state'); assert.equal(account.agency.groups.flatMap(group => group.members).find(member => member.symbol === 'sh600010').entryConditions.evidence.industry.minSegmentRevenuePct, 32);
-  await page.locator('#agency-pool-mode').selectOption('strict'); assert.equal(await editor.isVisible(), false);
+  await revealPoolControl('#agency-pool-legacy'); await page.locator('#agency-pool-legacy').check(); assert.equal(await editor.isVisible(), false);
   await poolRun(); assert.equal(Object.hasOwn(calls().filter(item => item.name === 'agency:pool:run').at(-1).payload, 'industry'), false);
-  await page.locator('#agency-pool-mode').selectOption('strategy'); assert.equal(await editor.locator('[data-industry-edit="minSegmentRevenuePct"]').inputValue(), '50');
+  await page.locator('#agency-pool-legacy').uncheck(); await page.locator('#agency-pool-mode').selectOption('strategy'); assert.equal(await editor.locator('[data-industry-edit="minSegmentRevenuePct"]').inputValue(), '50');
   checks.push('Pool UI defaults to observation, rejects incomplete ranks before IPC, sends editable rules, renders original public-source values, persists new member rules, rechecks them, preserves member snapshots, and excludes industry from strict-mode payload while retaining draft.');
 
   await page.locator('[data-page="screener"]').click(); await page.waitForFunction(() => screenInitialized && !screenBusy);

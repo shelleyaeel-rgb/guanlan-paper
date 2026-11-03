@@ -130,27 +130,13 @@ function researchReviewHtml(review) {
   }).join('') : `<p class="agency-pending">产品未知：${esc(product.reason || '尚未可靠取得产品级指标；公司总收入、利润和现金流不能补填产品缺项。')}</p>`}</section><section class="research-metrics-panel" data-research-path="company"><h3>公司经营 · 独立替代路径</h3><div class="research-metrics-state ${!companySelected || assessment.status !== 'pass' ? 'is-pending' : ''}">经营判断：${esc(companyConclusion)}</div><p class="tiny">即使公司经营条件通过，也不表示某一产品前景已通过。</p>${company.reportDate ? `<p class="tiny">报告期 ${esc(company.reportDate)}</p>` : ''}${company.error || company.reason ? `<p class="agency-pending">${esc(company.error || company.reason)}</p>` : ''}${companySelected ? researchChecksHtml(assessment.checks) : ''}${researchMetricTable(company.metrics, 'company')}${company.limitation ? `<p class="tiny">${esc(company.limitation)}</p>` : ''}</section></div>${gaps.length ? `<section class="research-metric-gaps"><b>资料补全与核验</b><ul>${gaps.map(gap => `<li><b>${esc(gap.label || '资料待核验')}</b>：${esc(gap.reason || '')}${gap.action ? `<br>可继续：${esc(gap.action)}` : ''}</li>`).join('')}</ul><p class="tiny">未抓到、未解析或口径不能比较，不等同于公司未披露，也不等同于条件不符。</p></section>` : ''}${review.riskSignals?.length ? `<section class="research-metric-gaps"><b>另外发现的产品风险事实</b><ul>${review.riskSignals.map(risk => `<li>${esc(risk.subject || '')}：${esc(risk.reason || '')}</li>`).join('')}</ul></section>` : ''}${assessment.reasons?.length ? `<p class="tiny">本次判断：${assessment.reasons.map(esc).join('；')}</p>` : ''}${(review.limitations || []).map(text => `<p class="tiny">${esc(text)}</p>`).join('')}</div>`;
 }
 function researchInlineHtml(review) { return review ? `<details class="research-result-inline"><summary>产品指标与公司经营 · ${esc(researchStatusLabel(review.assessment?.status || review.status))}</summary>${researchReviewHtml(review)}</details>` : ''; }
-function researchInspectButton(symbol, origin = 'screen') { return `<button type="button" class="table-action" data-research-symbol="${esc(symbol)}" data-research-origin="${esc(origin)}">经营与产品资料</button>`; }
+function researchInspectButton(symbol, origin = 'agency') { return `<button type="button" class="table-action" data-research-symbol="${esc(symbol)}" data-research-origin="${esc(origin)}">经营与产品资料</button>`; }
 function researchInspectionRows(origin) {
   if (origin.startsWith('agency')) {
     const result = state?.agencyPool?.lastResult || {};
     return Object.keys(agencyPoolCategories).flatMap(key => result[key] || []);
   }
-  return [screenResult?.rows || [], screenResult?.researchPendingRows || [], screenResult?.researchFailedRows || [], screenResult?.evidencePendingRows || [], screenResult?.evidenceFailedRows || [], screenResult?.riskExcluded || []].flat();
-}
-function renderScreenResearchResults(result, search = '') {
-  const root = $('screen-research-results'), summary = result.researchScreen;
-  if (!summary) { root.innerHTML = ''; return; }
-  researchRulesUi.pages ||= { pending: 1, failed: 1 };
-  if (researchRulesUi.result !== result || researchRulesUi.search !== search) { researchRulesUi.pages = { pending: 1, failed: 1 }; researchRulesUi.result = result; researchRulesUi.search = search; }
-  const opened = new Set([...root.querySelectorAll('[data-research-group][open]')].map(element => element.dataset.researchGroup));
-  root.innerHTML = `<p class="screen-data-message">${esc(researchPathNames[summary.path] || '研究指标')}：符合 ${num(summary.passed ?? 0, 0)} 只 · 待核验 ${num(summary.pending ?? 0, 0)} 只 · 条件不符 ${num(summary.failed ?? 0, 0)} 只。研究条件与原有条件同时满足才进入候选。</p>` + [['pending', '待核验', result.researchPendingRows || []], ['failed', '条件不符', result.researchFailedRows || []]].map(([key, label, all]) => {
-    if (!all.length) return '';
-    const rows = all.filter(row => !search || `${row.symbol} ${row.name || ''}`.toLowerCase().includes(search));
-    const pages = Math.max(1, Math.ceil(rows.length / 20)); researchRulesUi.pages[key] = Math.min(pages, researchRulesUi.pages[key]);
-    const page = researchRulesUi.pages[key];
-    return `<details class="screen-evidence-group" data-research-group="${key}" ${opened.has(key) ? 'open' : ''}><summary>经营研究${label} · ${all.length} 只</summary><p class="tiny">这些股票不进入本次候选，也不加入批量自动交易。待核验表示资料不足以判断；条件不符表示已知数值未达到你设置的阈值。</p><div class="table-wrap">${table(['股票 / 代码', '判断原因', '查看资料'], rows.slice((page - 1) * 20, page * 20).map(row => [`<strong>${esc(row.name || row.symbol)}</strong><small>${esc(row.symbol)}</small>`, `<div class="screen-checks">${(row.researchReview?.assessment?.reasons || []).map(esc).join('；') || esc(researchStatusLabel(row.researchReview?.status))}</div>`, researchInspectButton(row.symbol)]))}</div><div class="screen-pagination"><span class="tiny">第 ${page} / ${pages} 页 · 搜索后 ${rows.length} 只</span><div><button type="button" class="subtle" data-research-page="${key}" data-step="-1" ${page <= 1 ? 'disabled' : ''}>上一页</button><button type="button" class="subtle" data-research-page="${key}" data-step="1" ${page >= pages ? 'disabled' : ''}>下一页</button></div></div></details>`;
-  }).join('');
+  return [];
 }
 function renderResearchInspection() {
   const current = researchRulesUi.inspection;
@@ -160,6 +146,7 @@ function renderResearchInspection() {
   $('research-metrics-content').innerHTML = current.review ? researchReviewHtml(current.review) : '<p class="tiny">正在取得资料；未知值不会按 0 参与判断。</p>';
   researchRuleEditor('research-inspect-rules', { get: () => current.query, set: value => { current.query = value; current.dirty = true; $('research-metrics-status').textContent = '查看规则已更改，请点击“按规则重新判断”。采用规则只更新筛选编辑区，不修改既有成员的已保存条件。'; }, showPath: true, busy: current.busy });
   for (const id of ['research-metrics-evaluate', 'research-metrics-products', 'research-metrics-retry', 'research-metrics-apply']) $(id).disabled = !!current.busy;
+  $('research-metrics-apply').classList.toggle('hidden', current.origin?.startsWith('agency') !== false);
 }
 async function inspectResearchMetrics({ includeProducts, force = false } = {}) {
   const current = researchRulesUi.inspection;
@@ -174,7 +161,7 @@ async function inspectResearchMetrics({ includeProducts, force = false } = {}) {
     const review = await api('research:inspect', { symbol: current.symbol, research: current.query, includeProducts: !!current.includeProducts, force });
     if (researchRulesUi.inspection !== current) return;
     current.review = review; current.dirty = false;
-    $('research-metrics-status').textContent = '资料已更新。本次查看不改变账户、候选资格或既有成员条件；采用规则后，请在筛选页重新执行。';
+    $('research-metrics-status').textContent = '资料已更新。本次查看不改变账户或候选资格；自动交易已停用研究条件。';
   } catch (error) {
     if (researchRulesUi.inspection !== current) return;
     $('research-metrics-error').textContent = error.message;
@@ -183,11 +170,11 @@ async function inspectResearchMetrics({ includeProducts, force = false } = {}) {
     if (researchRulesUi.inspection === current) { current.busy = false; renderResearchInspection(); }
   }
 }
-async function openResearchMetrics(symbol, origin = 'screen') {
+async function openResearchMetrics(symbol, origin = 'agency') {
   await loadScreenMeta();
   const row = researchInspectionRows(origin).find(row => row.symbol === symbol);
   const member = origin.startsWith('agency') ? agencyOwner(symbol)?.members.find(item => item.symbol === symbol) : null;
-  const chosen = origin === 'agency-member' ? member?.entryConditions?.research : origin === 'agency' ? agencyPoolResearch() : screenQuery.research;
+  const chosen = origin === 'agency-member' ? member?.entryConditions?.research : agencyPoolResearch();
   const review = origin === 'agency-member' ? null : row?.researchReview;
   const query = structuredClone(chosen || review?.query || member?.entryConditions?.research || { version: 1, enabled: false, path: 'company', rules: [] });
   const current = { session: ++researchRulesUi.session, symbol, name: row?.name || state?.quotes?.[symbol]?.name, origin, query, review, busy: false, dirty: false, includeProducts: !!review?.productMetrics?.products?.length };
@@ -199,8 +186,6 @@ async function openResearchMetrics(symbol, origin = 'screen') {
 document.addEventListener('click', event => {
   const button = event.target.closest('[data-research-symbol]');
   if (button) action(() => openResearchMetrics(button.dataset.researchSymbol, button.dataset.researchOrigin));
-  const pagination = event.target.closest('[data-research-page]');
-  if (pagination) { researchRulesUi.pages[pagination.dataset.researchPage] += Number(pagination.dataset.step); renderScreenResearchResults(screenResult, $('screen-result-search').value.trim().toLowerCase()); }
 });
 $('research-metrics-close').addEventListener('click', () => $('research-metrics-dialog').close());
 $('research-metrics-dialog').addEventListener('close', () => { researchRulesUi.inspection = null; });
@@ -210,12 +195,5 @@ $('research-metrics-retry').addEventListener('click', () => action(() => inspect
 $('research-metrics-apply').addEventListener('click', () => {
   const current = researchRulesUi.inspection;
   if (!current || current.busy) return;
-  const error = researchRuleError(current.query);
-  if (error) { $('research-metrics-error').textContent = error; return; }
-  if (current.origin.startsWith('agency')) {
-    agencyUi.researchDrafts ||= {}; agencyUi.screeningMode = current.query.path; agencyUi.researchDrafts[current.query.path] = structuredClone(current.query); renderAgencyPool();
-  } else {
-    screenQuery.research = structuredClone(current.query); screenChanged(); renderScreenRules();
-  }
-  $('research-metrics-dialog').close(); toast('已更新筛选编辑区，请重新执行筛选；既有成员条件保持原快照');
+  $('research-metrics-status').textContent = '自动交易已停用研究条件，此处仅供查看，不能应用为自动入池或开仓门槛。';
 });

@@ -2,12 +2,11 @@
 const { randomUUID } = require('node:crypto');
 const { AgencyRunner } = require('./agency-runner.cjs');
 const { evaluateRuleDecisions, ruleEvidence, RULES_VERSION, RULES_INTERVAL_MS } = require('./agency-rules.cjs');
-const { symbolOf } = require('./common.cjs');
+const { symbolOf, cnTime } = require('./common.cjs');
 const { calendarSession } = require('./trading-calendar.cjs');
-const { entryConditionNeedsFundamentals, usesAutomaticEvidence } = require('./entry-conditions.cjs');
-const { evaluateCompanyEvidence } = require('./company-evidence.cjs');
+const { automaticEntryConditions } = require('./entry-conditions.cjs');
+const { TECHNICAL_ENTRY_POLICY } = require('./strategy-profiles.cjs');
 const { poolQualificationPending, monitoringCheck } = require('./agency-monitoring.cjs');
-const { checkNoticeRisk } = require('./entry-risk.cjs');
 const { EntryConfirmationTracker, entryBasis } = require('./entry-confirmation.cjs');
 const { validateMarketRegimeSnapshot } = require('./market-regime.cjs');
 const CHECK_BATCH_SIZE = 20;
@@ -17,13 +16,13 @@ const ENTRY_SAMPLE_LIMIT = 80;
 // the only execution authority is a synchronous, persisted engine transaction.
 class AgencyService {
   constructor({ getEngine, transaction, market, entryMarket = market, monitor, getQuotes, acceptQuotes,
-    getSelectionEvidence = () => [], getAutomaticEvidence = null, getNoticeEvidence = null, noticeGuard = null, archiveEntryEvidence = null, getMarketRegime = () => null, onChange = () => {}, isAvailable = () => true, clock = Date.now, calendar = calendarSession } = {}) {
-    if (noticeGuard && typeof noticeGuard.assertNoticeCurrent !== 'function') throw Error('公告版本核验服务无效');
-    Object.assign(this, { getEngine, transaction, market, monitor, getQuotes, acceptQuotes, getSelectionEvidence, getAutomaticEvidence, getNoticeEvidence, noticeGuard, archiveEntryEvidence, onChange, isAvailable, clock, calendar });
+    getSelectionEvidence = () => [], getAutomaticEvidence = null, getNoticeEvidence = null, getEvidenceVersion = () => null, noticeGuard = null, archiveEntryEvidence = null, getMarketRegime = () => null, onChange = () => {}, isAvailable = () => true, clock = Date.now, calendar = calendarSession } = {}) {
+    Object.assign(this, { getEngine, transaction, market, monitor, getQuotes, acceptQuotes, getSelectionEvidence, getAutomaticEvidence, getNoticeEvidence, getEvidenceVersion, noticeGuard, archiveEntryEvidence, onChange, isAvailable, clock, calendar });
     this.getMarketRegime = getMarketRegime;
     this.entryMarket = entryMarket;
     this.entryTracker = new EntryConfirmationTracker(); this.entryContexts = new Map(); this.entrySampling = null;
     this.storageError = '';
+    this.entryPreparations = new Map(); this.preparingEntries = new Map(); this.preparationAttempts = new Map(); this.preparationSequence = 0;
     this.generation = 0; this.commitTail = Promise.resolve(); this.cycles = new Map(); this.pendingBuys = new Set();
     this.runner = new AgencyRunner({ clock, getGroups: () => this.groups(), getCandidates: group => this.candidates(group),
       evaluateRules: input => evaluateRuleDecisions(input, this.clock()), commit: (group, result, snapshot) => this.enqueueCommit(group, result, snapshot),
@@ -35,7 +34,7 @@ class AgencyService {
   token() { const a = this.getEngine().s.agency; return `${a.epoch}:${a.revision}:${this.generation}`; }
   publicState() {
     const runner = this.runner.status();
-    return { decisionMode: 'rules', rulesVersion: RULES_VERSION, intervalSeconds: RULES_INTERVAL_MS / 1000,
+    return { decisionMode: 'rules', rulesVersion: RULES_VERSION, entryPolicy: TECHNICAL_ENTRY_POLICY, intervalSeconds: RULES_INTERVAL_MS / 1000,
       marketRegime: this.currentMarketRegime(), entrySampling: { tracked: this.entryContexts.size, limit: ENTRY_SAMPLE_LIMIT },
       runningGroups: runner.runningGroups, lastError: this.storageError || runner.lastError,
       batchSize: CHECK_BATCH_SIZE, coverage: Object.fromEntries([...this.cycles].map(([id, cycle]) => [id, {
@@ -53,7 +52,8 @@ class AgencyService {
     const checked = validateMarketRegimeSnapshot(snapshot, this.clock());
     // Validation may rebuild an expired/unknown permission. Keep acquisition
     // progress available to the UI without changing that validated permission.
-    return { ...checked, ...(snapshot?.acquisition ? { acquisition: structuredClone(snapshot.acquisition) } : {}) };
+    return { ...checked, ...(snapshot?.acquisition ? { acquisition: structuredClone(snapshot.acquisition) } : {}),
+      ...(snapshot?.preparation ? { preparation: structuredClone(snapshot.preparation) } : {}) };
   }
   withEntryEvidence(symbol, strategyId, quote, snapshot = {}) {
     if (!this.getEngine().s.agency.marketPolicy?.enabled) return snapshot;
@@ -66,7 +66,14 @@ class AgencyService {
     if (!basis || !(quote?.price > 0)) return;
     const distance = Math.min(Math.abs(quote.price - basis.anchor), Math.abs(quote.price - basis.resistance)) / basis.atr;
     if (distance > 2) { this.entryContexts.delete(symbol); this.entryTracker.clear(symbol); return; }
-    this.entryContexts.set(symbol, { symbol, strategyId, snapshot: { technical: snapshot.technical, source: snapshot.source, fetchedAt: snapshot.fetchedAt }, distance, updatedAt: this.clock() });
+    this.entryContexts.set(symbol, { symbol, strategyId, snapshot: {
+      technical: structuredClone(snapshot.technical), source: snapshot.source, fetchedAt: snapshot.fetchedAt,
+      ...(snapshot.provider ? { provider: snapshot.provider } : {}),
+      ...(Object.hasOwn(snapshot, 'dailyEvidence') ? { dailyEvidence: structuredClone(snapshot.dailyEvidence) } : {}),
+      ...(snapshot.historyStatus ? { historyStatus: snapshot.historyStatus } : {}),
+      ...(snapshot.refreshError ? { refreshError: snapshot.refreshError } : {}),
+      ...(snapshot.cacheWarning ? { cacheWarning: snapshot.cacheWarning } : {})
+    }, distance, updatedAt: this.clock() });
     if (this.entryContexts.size > ENTRY_SAMPLE_LIMIT) {
       const ordered = [...this.entryContexts.values()].sort((a, b) => a.distance - b.distance || b.updatedAt - a.updatedAt);
       for (const item of ordered.slice(ENTRY_SAMPLE_LIMIT)) { this.entryContexts.delete(item.symbol); this.entryTracker.clear(item.symbol); }
@@ -105,54 +112,82 @@ class AgencyService {
     })().finally(() => { this.entrySampling = null; });
     return this.entrySampling;
   }
-  assertNotices(symbol, snapshot) { this.noticeGuard?.assertNoticeCurrent(symbol, snapshot?.notices); }
   quoteSymbols(symbols) { return [...new Set([...symbols, ...this.getEngine().s.lots.map(lot => lot.symbol)])]; }
-  entryConditions(symbol) { return this.getEngine().s.agency.groups.flatMap(g => g.members).find(m => m.symbol === symbol)?.entryConditions; }
-  needsFundamentals(symbol, strategyId) { return strategyId === 'long' || entryConditionNeedsFundamentals(this.entryConditions(symbol)); }
-  withSelectionEvidence(symbol, snapshot) {
-    if (!this.entryConditions(symbol)?.evidence || usesAutomaticEvidence(this.entryConditions(symbol))) return snapshot;
-    let selectionEvidence;
-    try { selectionEvidence = { records: this.getSelectionEvidence(symbol), checkedAt: this.clock() }; }
-    catch (error) { selectionEvidence = { records: [], checkedAt: this.clock(), error: error.message || '研究证据不可用' }; }
-    return { ...snapshot, selectionEvidence };
-  }
-  async withAutomaticEvidence(symbol, snapshot) {
-    const conditions = this.entryConditions(symbol);
-    const legacy = !!conditions?.evidence && usesAutomaticEvidence(conditions);
-    const productRequired = conditions?.research?.enabled && conditions.research.path === 'product';
-    if (!legacy && !productRequired) return this.withNoticeEvidence(symbol, snapshot);
-    const state = this.getEngine().s, member = state.agency.groups.flatMap(group => group.members).find(item => item.symbol === symbol);
-    if (poolQualificationPending(state.agency, member)) {
-      return { ...snapshot, automaticEvidenceLoad: { status: 'skipped', code: 'pool-qualification',
-        reason: '候选资格尚未通过，本轮未加载研究资料；请更新四策略候选池完成核验',
-        poolReasons: [...(member?.poolCheck?.reasons || [])], checkedAt: this.clock() } };
+  entryConditions(symbol) { return automaticEntryConditions(this.getEngine().s.agency.groups.flatMap(group => group.members).find(member => member.symbol === symbol)?.entryConditions, new Date(this.clock())); }
+  needsFundamentals() { return false; }
+  entryDataRequirements() { return false; }
+  needsPreparedEvidence() { return false; }
+  syncPreparation() {
+    const epoch = this.getEngine().s.agency.epoch;
+    if (this.preparationEpoch !== epoch) {
+      this.preparationEpoch = epoch; this.entryPreparations.clear(); this.preparingEntries.clear(); this.preparationAttempts.clear();
     }
-    // Existing positions keep their original exit logic; report downloads must
-    // not delay the management of a holding that cannot be added to anyway.
-    if (state.lots.some(lot => lot.symbol === symbol)) return snapshot;
-    try {
-      if (!this.getAutomaticEvidence) throw Error('公开研究资料服务未配置');
-      const automaticEvidence = await this.getAutomaticEvidence(symbol, { force: false, includeIndustry: legacy });
-      if (automaticEvidence?.symbol !== symbol) throw Error('公开研究资料股票代码不符');
-      return { ...snapshot, automaticEvidence,
-        ...(legacy ? { automaticEvidenceEvaluation: evaluateCompanyEvidence(automaticEvidence, conditions.evidence, new Date(this.clock())) } : {}) };
-    } catch (error) {
-      return { ...snapshot, automaticEvidence: { symbol, checkedAt: this.clock(), status: 'unavailable', documents: [], errors: [error.message] } };
-    }
+    return epoch;
   }
-  async withNoticeEvidence(symbol, snapshot) {
-    if (!this.getNoticeEvidence || this.getEngine().s.lots.some(lot => lot.symbol === symbol)) return snapshot;
-    const review = checkNoticeRisk(snapshot?.notices, symbol, new Date(this.clock()));
-    if (review.status !== 'unverified' || !review.coverageComplete || !review.notices.length) return snapshot;
-    try {
-      const automaticEvidence = await this.getNoticeEvidence(symbol, { noticeResponse: snapshot.notices });
-      if (automaticEvidence?.symbol !== symbol) throw Error('公告原文股票代码不符');
-      return { ...snapshot, automaticEvidence, automaticEvidenceScope: 'notices' };
-    } catch (error) {
-      return { ...snapshot, automaticEvidenceScope: 'notices', automaticEvidence: { symbol, fetchedAt: this.clock(),
-        status: 'unavailable', documents: [], errors: [error.message || '公告原文获取失败'] } };
-    }
+  // Automatic preparation acquires only market history and, where the account
+  // has held the stock, corporate-action evidence. Research is not an input.
+  prepareEntry(symbol) {
+    const epoch = this.syncPreparation();
+    if (this.preparingEntries.has(symbol)) return this.preparingEntries.get(symbol);
+    const generation = this.generation;
+    this.preparationAttempts.set(symbol, this.clock());
+    const task = (async () => {
+      await this.monitor.prepare(symbol, false, false);
+      if (this.getEngine().s.agency.epoch === epoch && this.generation === generation) this.onChange();
+    })().finally(() => { if (this.preparingEntries.get(symbol) === task) this.preparingEntries.delete(symbol); });
+    this.preparingEntries.set(symbol, task); return task;
   }
+  prepareEntries() {
+    const epoch = this.syncPreparation(), generation = this.generation;
+    if (this.storageError || this.runner.stopped) return Promise.resolve();
+    const state = this.getEngine().s, held = new Set(state.lots.map(lot => lot.symbol));
+    const members = state.agency.groups.filter(group => group.mode !== 'stopped').flatMap(group => group.members
+      .filter(member => member.mode === 'active' && !held.has(member.symbol) && !poolQualificationPending(state.agency, member))
+      .map(member => ({ symbol: member.symbol, strategyId: group.id })));
+    const keep = new Set(members.map(member => member.symbol));
+    for (const key of this.entryPreparations.keys()) if (!keep.has(key)) this.entryPreparations.delete(key);
+    for (const key of this.preparationAttempts.keys()) if (!keep.has(key)) this.preparationAttempts.delete(key);
+    const due = members.filter(member => !this.preparingEntries.has(member.symbol)
+      && this.clock() - (this.preparationAttempts.get(member.symbol) ?? -Infinity) >= 60000)
+      .sort((a, b) => (this.preparationAttempts.get(a.symbol) ?? -Infinity) - (this.preparationAttempts.get(b.symbol) ?? -Infinity));
+    // Refill a freed slot immediately. A slow data request occupies only its own slot;
+    // the timer remains the retry clock for already attempted members.
+    for (const member of due.slice(0, Math.max(0, 2 - this.preparingEntries.size))) {
+      let wasReady = false;
+      try { this.readEntrySnapshot(member.symbol, member.strategyId); wasReady = true; } catch {}
+      const finished = () => {
+        if (this.getEngine().s.agency.epoch !== epoch || this.generation !== generation || this.runner.stopped) return;
+        if (!wasReady) {
+          try {
+            this.readEntrySnapshot(member.symbol, member.strategyId);
+            // Wake the next ordinary rules tick; preparation never places an
+            // order or declares that market/entry/risk checks have passed.
+            this.runner.lastStarted.delete(member.strategyId);
+            this.runner.lastCompleted.delete(member.strategyId);
+          } catch {}
+        }
+        this.prepareEntries().catch(() => {});
+      };
+      this.prepareEntry(member.symbol, member.strategyId).then(finished, finished);
+    }
+    return Promise.allSettled([...this.preparingEntries.values()]);
+  }
+  readEntrySnapshot(symbol) {
+    const snapshot = this.monitor.readPrepared(symbol, false, false);
+    // A user may separately open research on the same stock. Its cached result
+    // must not become an automatic-trading requirement or an audited pass.
+    for (const key of ['finance', 'valuation', 'notices', 'financeReportSync', 'automaticEvidence',
+      'automaticEvidenceEvaluation', 'automaticEvidenceScope', 'automaticEvidenceLoad', 'selectionEvidence']) delete snapshot[key];
+    snapshot.entryPolicy = { ...TECHNICAL_ENTRY_POLICY };
+    return snapshot;
+  }
+  assertEntrySnapshot(symbol, strategyId, snapshot) {
+    this.monitor.assertPrepared(symbol, snapshot, false, false);
+  }
+  // Kept for existing callers; automatic research acquisition is disabled.
+  withSelectionEvidence(symbol, snapshot) { return snapshot; }
+  async withAutomaticEvidence(symbol, snapshot) { return snapshot; }
+  async withNoticeEvidence(symbol, snapshot) { return snapshot; }
   persist(fn) {
     let completed = false;
     try { return this.transaction(() => { const value = fn(); completed = true; return value; }); }
@@ -233,22 +268,21 @@ class AgencyService {
     if (cycle.cursor >= cycle.symbols.length) { cycle.cursor = 0; cycle.number++; cycle.startedAt = null; cycle.completedAt = null; }
     if (cycle.startedAt === null) cycle.startedAt = this.clock();
     const start = cycle.cursor, selected = cycle.symbols.slice(start, start + CHECK_BATCH_SIZE).map(symbol => ({ symbol }));
-    const snapshots = new Map(), queue = selected.slice();
-    await Promise.all(Array.from({ length: Math.min(3, queue.length) }, async () => {
-      while (queue.length) {
-        if (this.token() !== group.token) return;
-        const member = queue.shift();
-        let data;
-        try { data = await this.monitor.load(member.symbol, group.forceRefresh === true, this.needsFundamentals(member.symbol, group.id), true); }
-        catch (error) { data = { error: `股票资料获取失败：${error.message || '未知错误'}`, fetchedAt: this.clock() }; }
-        if (this.token() !== group.token) return;
-        snapshots.set(member.symbol, await this.withAutomaticEvidence(member.symbol, data));
+    const snapshots = new Map(), preparationErrors = new Map();
+    const positions = new Set(view.positions.map(position => position.symbol));
+    const pendingQualifications = new Set(view.members.filter(member => poolQualificationPending(this.getEngine().s.agency, member)).map(member => member.symbol));
+    for (const member of selected) {
+      if (positions.has(member.symbol) || pendingQualifications.has(member.symbol)) {
+        snapshots.set(member.symbol, this.monitor.snapshots?.[member.symbol] || {}); continue;
       }
-    }));
+      try { snapshots.set(member.symbol, this.readEntrySnapshot(member.symbol, group.id)); }
+      catch (error) { preparationErrors.set(member.symbol, error.message || '开仓资料尚未准备，本次跳过'); }
+    }
     if (this.token() !== group.token) return null;
     // Missing quotes become explicit blocked checks, so an unavailable first batch
     // cannot starve every later member in a large cycle.
-    const fresh = selected.length ? await this.market.quotes(this.quoteSymbols(selected.map(m => m.symbol))).catch(() => ({})) : {};
+    const readySymbols = selected.filter(member => !preparationErrors.has(member.symbol) && !pendingQualifications.has(member.symbol)).map(member => member.symbol);
+    const fresh = readySymbols.length ? await this.market.quotes(this.quoteSymbols(readySymbols)).catch(() => ({})) : {};
     this.acceptQuotes(fresh);
     if (this.token() !== group.token) return null;
     for (const member of selected) this.trackEntry(member.symbol, group.id, fresh[member.symbol], snapshots.get(member.symbol));
@@ -265,6 +299,16 @@ class AgencyService {
           engine.agencyLog(ruleRecord({ strategyId: group.id, symbol: member.symbol, action: position ? 'hold' : 'wait', status: 'blocked',
             message, reason: message, evidence: ruleEvidence(candidate), inputSources: candidate.sources }));
         };
+        if (!position && pendingQualifications.has(member.symbol)) {
+          const evaluation = engine.agencyEvaluate(group.id, member.symbol, q, snapshot, undefined, fresh);
+          this.recordMonitoring(member.symbol, evaluation, position);
+          candidates.push(candidateData(member.symbol, q, snapshot, evaluation, position, view)); continue;
+        }
+        if (!position && preparationErrors.has(member.symbol)) { blocked(preparationErrors.get(member.symbol)); continue; }
+        if (!position) {
+          try { this.assertEntrySnapshot(member.symbol, group.id, snapshot); }
+          catch (error) { blocked(error.message); continue; }
+        }
         const block = engine.agencyAutomaticBlock(member.symbol, q, snapshot);
         if (block) { blocked(block); continue; }
         try { engine.fresh(q); } catch (e) { blocked(e.message); continue; }
@@ -310,21 +354,18 @@ class AgencyService {
       if (['wait', 'hold'].includes(decision.action)) { waiting.push({ ...entry, status: 'waiting', message: decision.action === 'hold' ? '已有持仓，不加仓；固定退出规则和原风控计划持续生效' : '入场规则未全部满足，继续等待' }); continue; }
       this.pendingBuys.add(decision.symbol);
       try {
-        // Refresh outside the transaction; compare the authorization token again after every await.
-        let technical = await this.monitor.load(decision.symbol, true, this.needsFundamentals(decision.symbol, group.id), true);
-        if (!current()) { completed = false; this.log({ ...entry, status: 'stale', message: '刷新资料期间授权或账户已变化' }); break; }
-        this.assertNotices(decision.symbol, technical);
-        technical = await this.withAutomaticEvidence(decision.symbol, technical);
-        if (!current()) { completed = false; this.log({ ...entry, status: 'stale', message: '程序核验研究资料期间授权或账户已变化' }); break; }
-        this.assertNotices(decision.symbol, technical);
+        // All slow evidence work belongs to preparation. Only the current
+        // executable quotes are acquired here, then all checks run locally.
+        let technical = this.readEntrySnapshot(decision.symbol, group.id);
+        this.assertEntrySnapshot(decision.symbol, group.id, technical);
         const fresh = await this.market.quotes(this.quoteSymbols([decision.symbol])); this.acceptQuotes(fresh);
         if (!current()) { completed = false; this.log({ ...entry, status: 'stale', message: '刷新行情期间授权或账户已变化' }); break; }
-        this.assertNotices(decision.symbol, technical);
+        this.assertEntrySnapshot(decision.symbol, group.id, technical);
         const q = fresh[decision.symbol];
         this.persistCompletion(group, lastDecision, () => {
           const engine = this.getEngine();
           if (!current()) throw Error('旧决策已失效');
-          this.assertNotices(decision.symbol, technical);
+          this.assertEntrySnapshot(decision.symbol, group.id, technical);
           technical = this.withEntryEvidence(decision.symbol, group.id, q, this.withSelectionEvidence(decision.symbol, technical));
           // Persist a detected corporate-action block instead of rolling it back as an error.
           const block = engine.agencyAutomaticBlock(decision.symbol, q, technical);
@@ -389,7 +430,11 @@ function candidateData(symbol, q, snapshot, evaluation, position, group) {
   if (q) sources.push({ id: `quote:${symbol}:${q.timestamp}`, kind: 'quote', source: q.source, timestamp: q.timestamp,
     data: Object.fromEntries(['price', 'prevClose', 'open', 'high', 'low', 'volume', 'amount', 'turnover', 'bid', 'ask', 'bidSize', 'askSize', 'limitUp', 'limitDown', 'screeningMetrics'].map(k => [k, q[k]])) });
   if (snapshot?.technical) sources.push({ id: `daily:${symbol}:${snapshot.technical.asOf}`, kind: 'completed-unadjusted-daily', source: snapshot.source,
-    fetchedAt: snapshot.fetchedAt, data: snapshot.technical });
+    fetchedAt: snapshot.fetchedAt, data: snapshot.technical,
+    ...(Object.hasOwn(snapshot, 'dailyEvidence') ? { dailyEvidence: structuredClone(snapshot.dailyEvidence) } : {}),
+    ...(snapshot.historyStatus ? { status: snapshot.historyStatus } : {}),
+    ...(snapshot.refreshError ? { refreshError: snapshot.refreshError } : {}),
+    ...(snapshot.cacheWarning ? { cacheWarning: snapshot.cacheWarning } : {}) });
   for (const section of ['finance', 'valuation', 'notices', 'corporateActions']) {
     const response = snapshot?.[section];
     if (response) sources.push({ id: `${section}:${symbol}:${response.fetchedAt || 'unknown'}`, kind: section,

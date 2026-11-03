@@ -104,7 +104,7 @@ test('盘口缺失、非有限数量及时间倒退不得再次消耗一档', ()
   assert.deepEqual(engine.s, saved); assert.equal(engine.s.trades[0].quoteSource, '腾讯财经');
 });
 
-test('两路腾讯不可用后东财以明确 fqt 参数返回整段日线及来源', async () => {
+test('优先日线来源不可用后东财以明确 fqt 参数返回整段日线及来源', async () => {
   for (const adjustment of ['qfq', 'raw']) {
     const urls = [];
     const market = marketWith(async (url, options) => {
@@ -116,7 +116,7 @@ test('两路腾讯不可用后东财以明确 fqt 参数返回整段日线及来
       return jsonResponse(emDaily());
     });
     const data = adjustment === 'qfq' ? await market.history(symbol) : await market.strategyHistory(symbol, null, true);
-    assert.equal(data.source, '东方财富'); assert.equal(data.provider, 'eastmoney'); assert.equal(urls.length, 3);
+    assert.equal(data.source, '东方财富'); assert.equal(data.provider, 'eastmoney'); assert.equal(urls.length, adjustment === 'qfq' ? 3 : 4);
     assert.equal(data.bars[0].volume, 12300); assert.equal(data.bars[0].close, 10);
     assert.equal(data.adjustment, adjustment === 'qfq' ? '前复权' : '未复权');
   }
@@ -161,7 +161,7 @@ test('日线各入口超时后切换，取消会终止后续入口', async () =>
       options.signal.addEventListener('abort', () => { clearTimeout(timer); reject(options.signal.reason); }, { once: true });
     });
   }, { requestTimeoutMs: 5 });
-  assert.equal((await market.strategyHistory(symbol, null, true)).provider, 'eastmoney'); assert.equal(urls.length, 3);
+  assert.equal((await market.strategyHistory(symbol, null, true)).provider, 'eastmoney'); assert.equal(urls.length, 4);
   const controller = new AbortController(); let calls = 0;
   const cancel = marketWith(async () => { calls++; controller.abort(); return http(501); });
   await assert.rejects(cancel.strategyHistory(symbol, controller.signal), { name: 'AbortError' }); assert.equal(calls, 1);
@@ -185,14 +185,14 @@ test('重新核验策略日线绕过普通故障冷却，自动检查仍等待�
     return recovered ? jsonResponse(txDaily(raw, false)) : http(503);
   });
   await assert.rejects(market.strategyHistory(symbol), /HTTP 503/);
-  assert.equal(calls, 3);
+  assert.equal(calls, 4);
   recovered = true;
   const monitor = new StrategyMonitor(market, () => new Date(now));
   const automatic = await monitor.load(symbol);
-  assert.match(automatic.error, /暂缓重试/); assert.equal(calls, 3);
+  assert.match(automatic.error, /暂缓重试/); assert.equal(calls, 4);
   const explicit = await monitor.load(symbol, true);
   assert.equal(explicit.error, undefined); assert.equal(explicit.technical.asOf, '2026-09-29');
-  assert.equal(explicit.provider, 'tencent'); assert.equal(calls, 4);
+  assert.equal(explicit.provider, 'tencent'); assert.equal(calls, 5);
 });
 
 test('重新核验策略日线仍遵守服务端 Retry-After，到期后取得新日线', async () => {
@@ -202,13 +202,13 @@ test('重新核验策略日线仍遵守服务端 Retry-After，到期后取得�
     return recovered ? jsonResponse(txDaily(raw, false)) : { ...http(429), headers: { get: () => '60' } };
   }, { clock: () => time });
   const monitor = new StrategyMonitor(market, () => new Date(time));
-  assert.match((await monitor.load(symbol)).error, /HTTP 429/); assert.equal(calls, 3);
+  assert.match((await monitor.load(symbol)).error, /HTTP 429/); assert.equal(calls, 4);
   recovered = true; time += 30001;
-  assert.match((await monitor.load(symbol, true)).error, /暂缓重试/); assert.equal(calls, 3);
+  assert.match((await monitor.load(symbol, true)).error, /暂缓重试/); assert.equal(calls, 4);
   time += 30000;
   const retried = await monitor.load(symbol, true);
   assert.equal(retried.error, undefined); assert.equal(retried.technical.asOf, '2026-09-29');
-  assert.equal(retried.fetchedAt, time); assert.equal(calls, 4);
+  assert.equal(retried.fetchedAt, time); assert.equal(calls, 5);
 });
 
 test('东财分时每分钟手数转为累计股数，带独立日期、昨收及来源', async () => {

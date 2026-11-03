@@ -1,6 +1,7 @@
 'use strict';
 const { cnTime, symbolOf } = require('./common.cjs');
 const { MARKET_REGIME_POLICY } = require('./market-regime.cjs');
+const { sharedSourceJob } = require('./shared-source-job.cjs');
 
 const SINA_BATCH_SIZE = 80;
 const PRIMARY_LABEL = '腾讯财经';
@@ -96,6 +97,29 @@ class MarketBreadthSource {
       universeBudgetMs, universeLoader, primaryCooldownMs });
     this.pending = null; this.primaryFailure = null;
   }
+  prepareUniverse(options = {}) {
+    return sharedSourceJob(this, 'pendingUniverse', options, work => budgeted(async signal => {
+      const diagnostics = [], { onProgress, force } = work;
+      let universe, validator;
+      try {
+        // Refresh before expiry, so a 09:00 preparation cannot expire exactly
+        // at the opening bell after otherwise successful five-minute checks.
+        universe = await budgeted(universeSignal => this.primarySource.loadUniverse({ signal: universeSignal, onProgress, force, refreshBeforeMs: 300000 }),
+          signal, this.universeBudgetMs, '新浪证券名单获取预算已用完');
+        validUniverse(universe, this.clock());
+        validator = options => this.primarySource.validateUniverse(universe, options);
+      } catch (error) {
+        signal.throwIfAborted(); diagnostics.push({ provider: 'sina-universe', message: error.message, at: this.clock() });
+        if (!this.universeLoader) throw error;
+        universe = await this.universeLoader.load({ signal, onProgress, force, refreshBeforeMs: 300000 });
+        validUniverse(universe, this.clock());
+        validator = options => this.universeLoader.validate(universe, options);
+      }
+      signal.throwIfAborted();
+      this.preparedUniverse = { universe, validator, diagnostics };
+      return structuredClone({ ...universe, acquisitionDiagnostics: diagnostics });
+    }, work.signal, this.deadlineMs, '证券名单准备超时，未使用不完整股票池'));
+  }
   load({ signal, onProgress = () => {}, force = false } = {}) {
     if (signal?.aborted) return Promise.reject(abortError(signal));
     let job = this.pending;
@@ -153,20 +177,31 @@ class MarketBreadthSource {
       progress({ loading: true, stage: 'universe', completed: 0, total: 0 });
       let universe, validator;
       try {
-        universe = await budgeted(universeSignal => this.primarySource.loadUniverse({ signal: universeSignal, onProgress: progress }),
-          signal, this.universeBudgetMs, '新浪证券名单获取预算已用完');
-        validUniverse(universe, this.clock());
-        validator = options => this.primarySource.validateUniverse(universe, options);
-      } catch (error) {
-        signal.throwIfAborted(); record('sina-universe', error);
-        if (!this.universeLoader) throw Error(`市场广度全部来源获取失败：${diagnostics.map(item => item.message).join('；')}`);
+        if (this.preparedUniverse) {
+          universe = validUniverse(this.preparedUniverse.universe, this.clock());
+          validator = this.preparedUniverse.validator;
+          diagnostics.push(...this.preparedUniverse.diagnostics);
+          progress({ loading: true, stage: 'universe', completed: universe.symbols.length, total: universe.symbols.length,
+            cached: true, validatedAt: universe.validatedAt });
+        }
+      } catch { this.preparedUniverse = null; }
+      if (!universe) {
         try {
-          universe = await this.universeLoader.load({ signal, onProgress: progress });
+          universe = await budgeted(universeSignal => this.primarySource.loadUniverse({ signal: universeSignal, onProgress: progress }),
+            signal, this.universeBudgetMs, '新浪证券名单获取预算已用完');
           validUniverse(universe, this.clock());
-          validator = options => this.universeLoader.validate(universe, options);
+          validator = options => this.primarySource.validateUniverse(universe, options);
         } catch (error) {
-          signal.throwIfAborted(); record('fallback-universe', error);
-          throw Error(`市场广度全部来源获取失败：${diagnostics.map(item => item.message).join('；')}`);
+          signal.throwIfAborted(); record('sina-universe', error);
+          if (!this.universeLoader) throw Error(`市场广度全部来源获取失败：${diagnostics.map(item => item.message).join('；')}`);
+          try {
+            universe = await this.universeLoader.load({ signal, onProgress: progress });
+            validUniverse(universe, this.clock());
+            validator = options => this.universeLoader.validate(universe, options);
+          } catch (error) {
+            signal.throwIfAborted(); record('fallback-universe', error);
+            throw Error(`市场广度全部来源获取失败：${diagnostics.map(item => item.message).join('；')}`);
+          }
         }
       }
       try {
@@ -179,7 +214,9 @@ class MarketBreadthSource {
           rows.push(...parseSinaBreadth(body, batch));
           progress({ loading: true, stage: 'breadth-quotes', completed: rows.length, total: symbols.length });
         }
-        await validator({ signal }); signal.throwIfAborted();
+        try { await validator({ signal }); }
+        catch (error) { if (!signal.aborted && this.preparedUniverse?.universe === universe) this.preparedUniverse = null; throw error; }
+        signal.throwIfAborted();
         return validateBreadth({ rows, source: `${FALLBACK_LABEL}公开行情（${universe.source}）`, provider: 'sina', providerLabel: FALLBACK_LABEL,
           sourceCount: universe.sourceCount, excludedCount: universe.excludedCount, universeSource: universe.source,
           universeValidatedAt: universe.validatedAt, startedAt, fetchedAt: this.clock(), acquisitionDiagnostics: diagnostics }, this.clock());
@@ -191,4 +228,4 @@ class MarketBreadthSource {
   }
 }
 
-module.exports = { MarketBreadthSource, parseSinaBreadth, validateBreadth, SINA_BATCH_SIZE };
+module.exports = { MarketBreadthSource, parseSinaBreadth, validateBreadth, validUniverse, SINA_BATCH_SIZE };

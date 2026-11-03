@@ -43,12 +43,22 @@ const STRATEGY_PROFILES = [
     id: 'long', name: '长线', horizon: '数月跟踪；买入日后满 120 根完整日线触发期限退出',
     entryDescription: '先确认属于普通非金融企业；最近完整年度加权 ROE≥8%；最新报告期负债率为0%–60%，累计营收及扣非净利润同比≥0，累计扣非净利润与经营现金流净额均>0；动态 PE 为 0–30（不含 0）、PB 为 0–4（不含 0）。MA20≥MA60、MA60 不下降、收盘不低于 MA60，在 MA60 −0.25 至 +0.75 ATR 区域回踩确认。',
     exitDescription: '初始止损取 MA60 与近 20 日低点较低值再减 0.25 ATR，目标为近 60 日高点；MA20 低于 MA60、收盘跌破 MA60 −0.5 ATR，或买入日后满 120 根完整日线触发退出。持仓按趋势与价位跟踪，不把跨季累计财务数值直接比较为恶化。',
-    dataDescription: `东方财富财报获取不超过 6 小时，报告期也须满足有效性要求；估值获取及报价均不超过 90 秒。年度 ROE 独立取最近完整年报，不要求三个年度齐全；最新累计 ROE 仅作观察，未年化，PE 为动态口径。增长和实际盈利分别核验，金额使用人民币。${LONG_FINANCE_POLICY_NOTE}新建仓同样须通过公告检查，明确风险及资料缺失时暂停。自动交易会取证并处理资料完整的标准现金分红和免税整数转增，复杂事件附原文进入异常核验；未核实权益不可用于收益比较。手动账户仍须在除权除息前结束该轮模拟。`,
+    dataDescription: `东方财富财报获取不超过 6 小时，报告期也须满足有效性要求；估值获取及报价均不超过 90 秒。年度 ROE 独立取最近完整年报，不要求三个年度齐全；最新累计 ROE 仅作观察，未年化，PE 为动态口径。增长和实际盈利分别核验，金额使用人民币。${LONG_FINANCE_POLICY_NOTE}新建仓同样须通过公告检查，明确风险及资料缺失时暂停。自动交易会取证并处理资料完整的标准现金分红和免税整数转增，复杂事件附原文进入异常核验；未核实权益不可用于收益比较。旧版人工买入的历史持仓仍须在除权除息前结束该轮模拟。`,
     anchor: 'ma60', supportDays: 20, resistanceDays: 60, maxHeldBars: 120
   }
 ];
 for (const profile of STRATEGY_PROFILES) Object.freeze(profile);
 Object.freeze(STRATEGY_PROFILES);
+
+const TECHNICAL_ENTRY_POLICY = Object.freeze({ version: 1, mode: 'technical',
+  notices: 'disabled', research: 'disabled', finance: 'disabled',
+  description: '自动交易仅使用行情与完整日线；未执行公告风险、财报行业研究或财务估值筛查' });
+const TECHNICAL_STRATEGY_PROFILES = Object.freeze(STRATEGY_PROFILES.map(profile => Object.freeze({ ...profile,
+  ...(profile.id === 'long' ? { name: '长线趋势',
+    entryDescription: 'MA20≥MA60、MA60 不下降、收盘不低于 MA60，在 MA60 −0.25 至 +0.75 ATR 区域回踩确认；不附加财务质量或估值条件。' } : {}),
+  dataDescription: '使用完整未复权日线、当日有效报价及盘口；公告风险、财报行业研究与财务估值筛查已停用。首次无权益候选仅核对行情和日线价格基准；持仓与历史权益仍核验公司行为。成交继续遵守 T+1、涨跌停、盘口数量、费用与仓位风险预算。',
+  entryPolicy: TECHNICAL_ENTRY_POLICY
+})));
 
 function strategyProfile(id = 'swing') {
   const profile = STRATEGY_PROFILES.find(item => item.id === id);
@@ -56,4 +66,10 @@ function strategyProfile(id = 'swing') {
   return profile;
 }
 
-module.exports = { STRATEGY_PROFILES, strategyProfile, LONG_FINANCE_RULES, LONG_FINANCE_POLICY_NOTE, ADAPTIVE_ENTRY_TEMPLATE };
+function technicalStrategyProfile(id = 'swing') {
+  const profile = TECHNICAL_STRATEGY_PROFILES.find(item => item.id === id);
+  if (!profile) throw Error('所选自动交易策略不存在');
+  return profile;
+}
+
+module.exports = { STRATEGY_PROFILES, strategyProfile, TECHNICAL_STRATEGY_PROFILES, technicalStrategyProfile, TECHNICAL_ENTRY_POLICY, LONG_FINANCE_RULES, LONG_FINANCE_POLICY_NOTE, ADAPTIVE_ENTRY_TEMPLATE };

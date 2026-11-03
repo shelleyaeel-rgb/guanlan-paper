@@ -30,7 +30,7 @@ const STRATEGY_PRESETS = [
     name: '短线 · 动量跟踪',
     horizon: '约 3–10 个交易日观察',
     summary: '以短中期均线、动量与成交额筛选短线跟踪候选；指标可调整，当日行情与近期公告检查固定执行。',
-    entryNotes: '观察价格保持在短均线上方及中期均线上行，另行评估回撤空间、交易成本与仓位。',
+    entryNotes: '观察价格保持在短均线上方及中期均线上行，RSI 50–70，日量比不低于 1.2；另行评估回撤空间、交易成本与仓位。预筛比内置开仓技术条件更严格。',
     limitations: '技术指标使用完整未复权日线，不能代表当日走势。当日跌幅达到 5% 或行情无法核验时排除；近期敏感公告或公告获取不完整时列为待核验，不进入观察候选。5% 是产品风控阈值，并非交易所规则或收益保证。候选仍需在买卖计划中重新校验；历史快照不支持本检查。',
     riskPolicy: '当日跌幅达到 5% 排除；过去 14 天敏感公告及资料不完整待核验。风险检查不随指标删除而取消。',
     rules: [
@@ -38,9 +38,9 @@ const STRATEGY_PRESETS = [
       { field: 'ma5', op: 'gt', valueField: 'ma20' },
       { field: 'ma20', op: 'gt', valueField: 'previousMa20' },
       { field: 'macd', op: 'gt', value: 0 },
-      { field: 'rsi', op: 'gte', value: 45 },
-      { field: 'rsi', op: 'lte', value: 75 },
-      { field: 'dailyVolumeRatio', op: 'gte', value: 1 },
+      { field: 'rsi', op: 'gte', value: 50 },
+      { field: 'rsi', op: 'lte', value: 70 },
+      { field: 'dailyVolumeRatio', op: 'gte', value: 1.2 },
       { field: 'amount', op: 'gte', value: 1 }
     ]
   },
@@ -48,8 +48,8 @@ const STRATEGY_PRESETS = [
     id: 'swing',
     name: '波段 · 趋势预筛',
     horizon: '数日至数周观察',
-    summary: '沿用现有波段开仓判断中的日线趋势条件，快速缩小候选范围；指标可调整，近期公告检查固定执行。',
-    entryNotes: 'MA20 上行并高于 MA60，收盘不低于 MA20，MACD 柱为正，RSI 40–75，日量比不低于 0.6。',
+    summary: '在现有波段日线趋势条件上收紧动量与成交活跃度，缩小候选范围；指标可调整，近期公告检查固定执行。',
+    entryNotes: 'MA20 上行并高于 MA60，收盘不低于 MA20，MACD 柱为正，RSI 45–70，日量比不低于 0.8。预筛比内置开仓技术条件更严格。',
     limitations: '技术预筛另加近期公告检查；敏感公告或公告资料不完整时不进入观察候选，标题规则通过也不代表没有重大风险。未纳入回踩价区、盘中确认、盘口流动性、费用滑点、风险预算及盈亏比。筛选通过不等于波段开仓校验通过；历史快照不支持公告检查。',
     riskPolicy: '过去 14 天敏感公告及资料不完整待核验，不进入观察候选。公告检查不随指标删除而取消。',
     rules: [
@@ -57,20 +57,23 @@ const STRATEGY_PRESETS = [
       { field: 'ma20', op: 'gt', valueField: 'ma60' },
       { field: 'close', op: 'gte', valueField: 'ma20' },
       { field: 'macd', op: 'gt', value: 0 },
-      { field: 'rsi', op: 'gte', value: 40 },
-      { field: 'rsi', op: 'lte', value: 75 },
-      { field: 'dailyVolumeRatio', op: 'gte', value: 0.6 }
+      { field: 'rsi', op: 'gte', value: 45 },
+      { field: 'rsi', op: 'lte', value: 70 },
+      { field: 'dailyVolumeRatio', op: 'gte', value: 0.8 }
     ]
   },
   {
     id: 'long',
     name: '长线 · 质量估值',
     horizon: '数月至一年以上研究',
-    summary: '结合最近完整年度 ROE、最新累计盈利、负债、增长与现金流，以及正估值区间，筛选长期研究候选；预筛指标可调整，近期公告检查固定执行。',
-    entryNotes: '在财务筛选基础上继续研究商业模式、治理、行业差异与估值合理性；筛选条件本身不是持有期限或收益预测。',
+    summary: '结合完整日线趋势、最近完整年度 ROE、最新累计盈利、负债、增长与现金流，以及正估值区间，筛选长期研究候选；预筛指标可调整，近期公告检查固定执行。',
+    entryNotes: '完整日线要求 MA20 不低于 MA60、MA60 不下降、收盘不低于 MA60；在财务筛选基础上继续研究商业模式、治理、行业差异与估值合理性。筛选条件本身不是持有期限或收益预测。',
     limitations: `默认 ROE 门槛使用最近完整年度加权 ROE，季度累计 ROE 仅观察且不简单年化；扣非利润同比增长与实际金额盈利分别判断。PE 为动态口径而非 TTM，统一负债与估值阈值不适合所有行业。${LONG_FINANCE_POLICY_NOTE}历史财报不能抵消新事件风险；敏感公告或公告资料不完整时不进入观察候选，标题规则通过也不代表没有重大风险。建仓前仍需通过长线买卖计划校验；历史快照不支持公告检查。`,
     riskPolicy: '过去 14 天敏感公告及资料不完整待核验，不进入观察候选。公告检查不随指标删除而取消。',
     rules: [
+      { field: 'ma20', op: 'gte', valueField: 'ma60' },
+      { field: 'ma60', op: 'gte', valueField: 'previousMa60' },
+      { field: 'close', op: 'gte', valueField: 'ma60' },
       ...LONG_FINANCE_RULES.map(({ field, op, value }) => ({ field, op, value })),
       { field: 'pe', op: 'gt', value: 0 },
       { field: 'pe', op: 'lte', value: 30 },

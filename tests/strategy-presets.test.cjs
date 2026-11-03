@@ -7,7 +7,7 @@ const { evaluateEntry } = require('../core/strategy.cjs');
 
 const row = (overrides = {}) => ({
   symbol: 'sh600001', name: '测试股票', board: 'sh', isST: false, timestamp: Date.parse('2026-09-29T10:00:00+08:00'),
-  close: 10.05, ma5: 10.02, previousMa5: 10.01, ma20: 10, previousMa20: 9.99, ma60: 9.5,
+  close: 10.05, ma5: 10.02, previousMa5: 10.01, ma20: 10, previousMa20: 9.99, ma60: 9.5, previousMa60: 9.49,
   macd: 0.1, rsi: 55, dailyVolumeRatio: 1.5, amount: 3, turnover: 5,
   roe: 10, annualRoeLatest: 10, debtRatio: 40, revenueYoY: 10, profitYoY: 12, adjustedProfitYoY: 8, latestAdjustedProfit: 2, operatingCash: 5, pe: 20, pb: 2,
   ...overrides
@@ -37,13 +37,28 @@ test('所有模板独立公告检查，只有短线模板说明5%行情阈值，
 test('超短与短线同时要求日线动量及行情成交活跃，缺失指标不被视为命中', () => {
   const candidates = [row(), row({ amount: 1.5 }), row({ dailyVolumeRatio: 1.1 }), row({ close: 9.8 }), row({ amount: null }), row({ ma5: null }), row({ rsi: 80 })];
   assert.deepEqual(select('ultra-short', candidates), [candidates[0]]);
-  assert.deepEqual(select('short', candidates), candidates.slice(0, 3));
+  assert.deepEqual(select('short', candidates), candidates.slice(0, 2));
 });
 
-test('波段筛选与现有开仓技术门槛一致，但通过预筛不等于进入回踩价区', () => {
+test('短线预筛收紧RSI和日量比，边界允许且缺失指标不能入选，超短门槛保持', () => {
+  const accepted = [row({ rsi: 50, dailyVolumeRatio: 1.2 }), row({ rsi: 70 })];
+  const excluded = [row({ rsi: 49.99 }), row({ rsi: 70.01 }), row({ dailyVolumeRatio: 1.199 }), row({ rsi: null }), row({ dailyVolumeRatio: null })];
+  assert.deepEqual(select('short', [...accepted, ...excluded]), accepted);
+  assert.equal(select('ultra-short', [row({ rsi: 75, dailyVolumeRatio: 1.2 })]).length, 1);
+  assert.equal(select('ultra-short', [row({ dailyVolumeRatio: 3 })]).length, 1);
+  assert.equal(select('ultra-short', [row({ dailyVolumeRatio: 3.01 })]).length, 0);
+});
+
+test('波段预筛收紧RSI和日量比且不改变实际开仓门槛，通过预筛仍须等待回踩', () => {
   const now = new Date('2026-09-29T10:00:00+08:00'), engine = new Engine(initialState(100000), () => now);
-  const changes = [{}, { ma20: 9.99 }, { ma60: 10 }, { close: 9.99 }, { macd: 0 }, { rsi: 39.9 }, { rsi: 75.1 }, { dailyVolumeRatio: 0.59 }, { close: 10, rsi: 40, dailyVolumeRatio: 0.6 }, { rsi: 75 }];
-  for (const change of changes) {
+  const cases = [
+    [{}, true, true], [{ ma20: 9.99 }, false, false], [{ ma60: 10 }, false, false], [{ close: 9.99 }, false, false], [{ macd: 0 }, false, false],
+    [{ rsi: 39.9 }, false, false], [{ rsi: 75.1 }, false, false], [{ dailyVolumeRatio: 0.59 }, false, false],
+    [{ close: 10, rsi: 40, dailyVolumeRatio: 0.6 }, false, true], [{ rsi: 75 }, false, true],
+    [{ rsi: 44.99 }, false, true], [{ rsi: 70.01 }, false, true], [{ dailyVolumeRatio: 0.799 }, false, true],
+    [{ close: 10, rsi: 45, dailyVolumeRatio: 0.8 }, true, true], [{ rsi: 70 }, true, true]
+  ];
+  for (const [change, expectedSelection, expectedTechnical] of cases) {
     const candidate = row(change);
     const q = { symbol: candidate.symbol, price: 10.1, prevClose: candidate.close, open: 10, low: 10, high: 10.2, volume: 100000,
       bid: 10.09, ask: 10.8, bidSize: 20000, askSize: 20000, limitUp: 11.05, limitDown: 9.05, timestamp: now.getTime(), date: '2026-09-29' };
@@ -52,9 +67,11 @@ test('波段筛选与现有开仓技术门槛一致，但通过预筛不等于�
       volumeRatio: candidate.dailyVolumeRatio, trend: candidate.close >= candidate.ma20 && candidate.ma20 > candidate.ma60 && candidate.ma20 > candidate.previousMa20,
       entryLow: 9.9, entryHigh: 10.3, stop: 9.6, target: 11.5 } };
     const result = evaluateEntry(engine, candidate.symbol, q, snapshot);
-    assert.equal(select('swing', [candidate]).length === 1, result.status === '等待回踩', JSON.stringify(change));
+    assert.equal(select('swing', [candidate]).length === 1, expectedSelection, JSON.stringify(change));
+    assert.equal(result.status === '等待回踩', expectedTechnical, JSON.stringify(change));
     assert.equal(result.buyable, false);
   }
+  for (const field of ['rsi', 'dailyVolumeRatio']) assert.equal(select('swing', [row({ [field]: null })]).length, 0);
 });
 
 test('长线同时检查财务质量和正估值，负估值、负现金流、财务缺失不会入选', () => {
@@ -66,13 +83,20 @@ test('长线同时检查财务质量和正估值，负估值、负现金流、�
 test('长线默认年度ROE与盈利金额规则和执行模板一致，个人累计ROE条件仍独立叠加', () => {
   const { LONG_FINANCE_RULES } = require('../core/strategy-profiles.cjs');
   const preset = STRATEGY_PRESETS.find(item => item.id === 'long');
-  assert.deepEqual(preset.rules.filter(rule => !['pe', 'pb'].includes(rule.field)), LONG_FINANCE_RULES.map(({ field, op, value }) => ({ field, op, value })));
+  assert.deepEqual(preset.rules.filter(rule => LONG_FINANCE_RULES.some(finance => finance.field === rule.field)), LONG_FINANCE_RULES.map(({ field, op, value }) => ({ field, op, value })));
   assert.match(preset.limitations, /产品模板.*不是会计标准/); assert.match(preset.limitations, /预筛条件不会改写内置开仓门槛/);
   const personal = { ...defaults(), rules: [{ field: 'roe', op: 'gte', value: 8 }] };
   const composed = composeStrategyQuery('long', personal);
   assert.ok(composed.rules.some(rule => rule.field === 'annualRoeLatest')); assert.ok(composed.rules.some(rule => rule.field === 'roe'));
   const candidate = row({ annualRoeLatest: 12, roe: 2 });
   assert.equal(select('long', [candidate]).length, 1); assert.equal(select('long', [candidate], personal).length, 0);
+});
+
+test('长线财务通过仍须完整日线趋势通过，趋势边界允许、下行和缺失不入选', () => {
+  const eligible = row({ ma20: 9.5, ma60: 9.5, previousMa60: 9.5, close: 9.5, annualRoeLatest: 8 });
+  const rejected = [{ ma20: 9.49 }, { previousMa60: 9.51 }, { close: 9.49 }, ...['ma20', 'ma60', 'previousMa60', 'close'].map(field => ({ [field]: null }))]
+    .map(change => ({ ...eligible, ...change }));
+  assert.deepEqual(select('long', [eligible, ...rejected]), [eligible]);
 });
 
 test('个人基本面条件按 AND 叠加，同时保留范围、板块及 ST 排除', () => {
@@ -95,7 +119,7 @@ test('策略切换保留个人条件且不会夹带上一策略条件，取消�
 });
 
 test('合并相同规则会去重，矛盾的数值和指标比较会明确拒绝', () => {
-  const personal = { ...defaults(), rules: [{ field: 'rsi', op: 'gte', value: 45 }, { field: 'amount', op: 'gte', value: 1 }] };
+  const personal = { ...defaults(), rules: [{ field: 'rsi', op: 'gte', value: 50 }, { field: 'amount', op: 'gte', value: 1 }] };
   assert.equal(composeStrategyQuery('short', personal).rules.length, composeStrategyQuery('short').rules.length);
   assert.throws(() => composeStrategyQuery('short', { ...defaults(), rules: [{ field: 'rsi', op: 'lt', value: 45 }] }), /矛盾/);
   assert.throws(() => composeStrategyQuery('short', { ...defaults(), rules: [{ field: 'ma20', op: 'gte', valueField: 'ma5' }] }), /矛盾/);

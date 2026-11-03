@@ -46,6 +46,31 @@ function fixture(symbols = ['sh600001'], options = {}) {
 const byEndpoint = (f, endpoint) => f.calls.filter(call => call.url.pathname.endsWith(endpoint));
 const quoteCalls = f => f.calls.filter(call => call.url.hostname === 'qt.gtimg.cn');
 
+test('证券名单预热与选股共享在途分页，取消预热不影响开盘读取完整名单', async () => {
+  const f = fixture(mainSymbols(161)), gate = deferred(), controller = new AbortController(); let listSignal;
+  f.controls.intercept = async ({ url, request }) => {
+    if (url.pathname.endsWith('getHQNodeData') && url.searchParams.get('page') === '1') { listSignal = request.signal; await gate.promise; }
+  };
+  const preparing = f.source.loadUniverse({ signal: controller.signal });
+  while (!listSignal) await delay(1);
+  const screening = f.source.load(); await delay(1); controller.abort();
+  await assert.rejects(preparing); assert.equal(listSignal.aborted, false); gate.resolve();
+  assert.equal((await screening).rows.length, 161); assert.equal(byEndpoint(f, 'getHQNodeData').length, 3);
+});
+
+test('盘前名单在到期前五分钟重新完整获取，避免09:00准备恰好09:30失效', async () => {
+  let now = Date.parse('2026-10-16T09:00:00+08:00');
+  const f = fixture(mainSymbols(161), { clock: () => now });
+  const first = await f.source.loadUniverse({ refreshBeforeMs: 300000 }); assert.equal(first.validatedAt, now);
+  now += 24 * 60000; const warm = await f.source.loadUniverse({ refreshBeforeMs: 300000 });
+  assert.equal(warm.validatedAt, first.validatedAt); assert.equal(byEndpoint(f, 'getHQNodeData').length, 3);
+  now += 60000; const renewed = await f.source.loadUniverse({ refreshBeforeMs: 300000 });
+  assert.equal(renewed.validatedAt, now); assert.equal(byEndpoint(f, 'getHQNodeData').length, 6);
+  now += 5 * 60000; const opening = await f.source.loadUniverse();
+  assert.equal(opening.validatedAt, renewed.validatedAt); assert.equal(byEndpoint(f, 'getHQNodeData').length, 6);
+  assert.equal(quoteCalls(f).length, 0);
+});
+
 test('名单补证可显式获取UTF8原文，保留中文且不误当JSON或GB18030解码', async () => {
   const body = '<html>证券代码：001381；上市状态：待上市</html>';
   const source = new FreeScreenerSource(async () => new Response(body), { spacingMs: 0 });

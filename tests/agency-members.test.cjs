@@ -4,6 +4,7 @@ const fs = require('node:fs'), os = require('node:os'), path = require('node:pat
 const { Engine, initialState, validState } = require('../core/engine.cjs');
 const { Store } = require('../core/store.cjs');
 const { addAgencyMembers, MAX_BATCH_AGENCY_MEMBERS } = require('../core/agency-members.cjs');
+const { ACTIVE_CANDIDATE_LIMIT, STANDBY_CAPACITY_REASON } = require('../core/agency-capacity.cjs');
 const now = new Date('2026-09-29T10:00:00+08:00');
 const quote = symbol => ({ symbol, name: '批量加入隔离测试', price: 10, prevClose: 10, open: 10, low: 10, high: 10, volume: 100000,
   bid: 10, ask: 10, bidSize: 20000, askSize: 20000, limitUp: 11, limitDown: 9, timestamp: now.getTime(), date: '2026-09-29' });
@@ -36,6 +37,10 @@ test('全量批量加入超过旧 50 只限制，去重后仅一次查询和保�
   assert.equal(f.engine.s.cash, beforeCash); assert.equal(f.engine.s.trades.length, 0);
   const restored = new Engine(f.store.load(), () => now);
   assert.deepEqual(restored.s.agency.groups.find(group => group.id === 'swing').members.map(member => member.symbol), symbols);
+  const members = restored.s.agency.groups.find(group => group.id === 'swing').members;
+  assert.equal(members.filter(member => member.mode === 'active').length, ACTIVE_CANDIDATE_LIMIT);
+  assert.equal(members.filter(member => member.mode === 'standby').length, 125 - ACTIVE_CANDIDATE_LIMIT);
+  assert.ok(members.filter(member => member.mode === 'standby').every(member => member.standbyReason === STANDBY_CAPACITY_REASON));
   assert.equal(restored.s.agency.groups.find(group => group.id === 'swing').mode, 'paused');
   assert.deepEqual(restored.s.marks.sh600000, quote('sh600000'));
   assert.equal(Object.keys(restored.s.marks).length, 125);
@@ -43,6 +48,7 @@ test('全量批量加入超过旧 50 只限制，去重后仅一次查询和保�
   assert.throws(() => restored.fresh(restored.s.marks.sh600000), /报价过期/);
   const again = await f.add(symbols);
   assert.equal(again.added.length, 0); assert.equal(again.skipped.length, 125); assert.equal(f.transactions, 1); assert.equal(f.calls.length, 1);
+  assert.deepEqual(f.engine.s.agency.groups.find(group => group.id === 'swing').members, members);
 });
 
 test('逐项报告重复归属、手动持仓、委托及非法代码，不查询冲突股票且不重启退出中的成员', async t => {

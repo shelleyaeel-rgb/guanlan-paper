@@ -7,15 +7,19 @@ const { maxOrderQuantity } = require('./order-quantity.cjs');
 const { checkNoticeRisk } = require('./entry-risk.cjs');
 const { validateMarketRegimeSnapshot } = require('./market-regime.cjs');
 const { calendarSession } = require('./trading-calendar.cjs');
-const { createEntryConditions, validEntryConditions, evaluateEntryConditions, usesAutomaticEvidence } = require('./entry-conditions.cjs');
+const { preparedTechnicalValid, publicDailyHistory } = require('./daily-history.cjs');
+const { preopenPriceReference } = require('./preparation-state.cjs');
+const { createEntryConditions, validEntryConditions, evaluateEntryConditions, usesAutomaticEvidence, automaticEntryConditions } = require('./entry-conditions.cjs');
 const { validEntryEvidenceRef } = require('./entry-evidence-store.cjs');
-const { validPoolLedger, pendingPoolCheck } = require('./agency-pool.cjs');
-const { SELECTION_MODES, MONITORING_STATUSES, poolQualificationPending, migrateMonitoring } = require('./agency-monitoring.cjs');
+const { validPoolLedger, validPoolCheck, pendingPoolCheck } = require('./agency-pool.cjs');
+const { SELECTION_MODES, poolQualificationPending, migrateMonitoring, migrateTechnicalTrading,
+  validMonitoringCheck, migrateMonitoringChecks } = require('./agency-monitoring.cjs');
+const { ACTIVE_CANDIDATE_LIMIT, STANDBY_MIGRATION_REASON, activeCandidateCount, setStandby } = require('./agency-capacity.cjs');
 const { memberAffectsEquity, corporateBalances, availableCorporateCash, processCorporateActions, settleDividendTaxes,
   validCorporateLedger, corporateFromDate, groupHasUnresolvedCorporate, assertCorporatePurchase } = require('./corporate-ledger.cjs');
 
 const MODES = ['running', 'paused', 'stopped'];
-const MEMBER_MODES = ['active', 'removing', 'closing'];
+const MEMBER_MODES = ['active', 'standby', 'removing', 'closing'];
 const DEFAULT_LIMITS = Object.freeze({ maxPosition: 0.3, maxPositions: 5, riskPercent: 0.5, minRewardRisk: 2, maxTotalPosition: 0.8, maxPlannedRiskPercent: 2 });
 const cents = n => Number.isSafeInteger(n);
 const object = v => v && typeof v === 'object' && !Array.isArray(v);
@@ -24,6 +28,7 @@ const sameEvidenceRef = (left, right) => validEntryEvidenceRef(left) && validEnt
 const validDate = d => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d) && Number.isFinite(Date.parse(d)) && new Date(d).toISOString().slice(0, 10) === d;
 const validExitPriceBasis = basis => object(basis) && validDate(basis.date) && validDate(basis.dailyAsOf) && basis.dailyAsOf < basis.date
   && Number.isFinite(basis.prevClose) && basis.prevClose > 0 && Number.isFinite(basis.dailyClose) && basis.dailyClose > 0
+  && (basis.corporateVerified === undefined || typeof basis.corporateVerified === 'boolean')
   && Number.isFinite(basis.checkedAt) && Number.isFinite(basis.corporateCheckedAt) && typeof basis.corporateBasis === 'string';
 function limitsOf(input = {}, prior = DEFAULT_LIMITS) {
   const v = { ...prior, ...input };
@@ -38,13 +43,14 @@ function limitsOf(input = {}, prior = DEFAULT_LIMITS) {
   if (!Number.isInteger(limits.maxPositions)) throw Error('持仓数量上限须为整数');
   return limits;
 }
-function makeAgency(s) {
-  return { version: 5, monitoringVersion: 1, entryConditionsVersion: 1, poolVersion: 1, pool: null, poolAuthorizationRevision: 0, decisionMode: 'rules', rulesVersion: '1', epoch: id(), revision: 0, manualCash: s.cash, decisions: [], executionIntents: [], transfers: [], corporateEvents: [], corporateActions: [], corporateChecks: {},
+function makeAgency(s, now) {
+  return { version: 7, legacyManual: { watchlist: [], migratedAt: new Date(now).toISOString(), cancelledOrderIds: [] }, monitoringVersion: 1, entryConditionsVersion: 1, poolVersion: 1, pool: null, poolAuthorizationRevision: 0, decisionMode: 'rules', rulesVersion: '1', epoch: id(), revision: 0, manualCash: s.cash, decisions: [], executionIntents: [], transfers: [], corporateEvents: [], corporateActions: [], corporateChecks: {},
     groups: STRATEGY_PROFILES.map(p => ({ id: p.id, name: p.name, mode: 'paused', cash: 0, netFunding: 0,
       limits: { ...DEFAULT_LIMITS }, members: [], cycles: [], equity: [], unitPeak: 1, unitValue: 1, units: 0, drawdown: 0 })) };
 }
 function migrateAgency(s, now = new Date()) {
-  if (!s.agency) s.agency = makeAgency(s);
+  const newAgency = !s.agency;
+  if (newAgency) s.agency = makeAgency(s, now);
   else if (s.agency.decisionMode !== 'rules') {
     const pausedGroups = s.agency.groups.filter(group => group.mode === 'running').map(group => group.id);
     for (const group of s.agency.groups) if (group.mode === 'running') group.mode = 'paused';
@@ -66,12 +72,55 @@ function migrateAgency(s, now = new Date()) {
     s.agency.version = 4; s.agency.poolVersion = 1; s.agency.pool = null; s.agency.poolAuthorizationRevision = 0; s.agency.revision++;
   }
   if (s.agency.version === 4) migrateMonitoring(s.agency, now);
+  if (s.agency.version === 5) {
+    let changedMembers = 0;
+    for (const group of s.agency.groups) for (const member of group.members)
+      if (member.mode === 'active' && setStandby(s, member, STANDBY_MIGRATION_REASON)) changedMembers++;
+    s.agency.version = 6; s.agency.revision++; s.agency.poolAuthorizationRevision++;
+    s.agency.migrationNotice = { kind: 'candidate-capacity-upgrade', time: new Date(now).toISOString(), changedMembers,
+      message: `筛选规则已升级：${changedMembers} 只未持仓成员保留为候补，等待更新四策略候选池重新筛选；每组最多 ${ACTIVE_CANDIDATE_LIMIT} 只活跃候选。持仓和退出安排继续保留。` };
+  }
+  if (s.agency.version === 6 || newAgency && (s.watchlist.length || s.orders.some(order => order.status === 'pending'))) {
+    const time = new Date(now).toISOString(), pending = s.orders.filter(order => order.status === 'pending');
+    let changedMembers = 0;
+    for (const group of s.agency.groups) for (const member of group.members) {
+      const check = member.poolCheck;
+      const qualified = validPoolCheck(check) && check.policyVersion === 3 && check.status === 'pass'
+        && check.matchedStrategies.includes(group.id) && (member.selectionMode !== 'strict' || check.screeningMode === 'strict');
+      if (member.mode === 'active' && !qualified
+        && setStandby(s, member, '自动交易专用版仅采用策略筛选候选，等待自动策略筛选核验后再开仓')) changedMembers++;
+    }
+    if (changedMembers) s.agency.poolAuthorizationRevision++;
+    const reason = '升级自动交易专用版，撤销旧手动条件单；历史记录保留，不再自动触发';
+    s.agency.legacyManual = { watchlist: structuredClone(s.watchlist), migratedAt: time, cancelledOrderIds: pending.map(order => order.id) };
+    for (const order of pending) Object.assign(order, { status: 'cancelled', cancelledAt: time, cancelReason: reason, note: reason });
+    s.watchlist = [];
+    s.agency.version = 7; s.agency.revision++;
+    const message = `已升级自动交易专用版：归档 ${s.agency.legacyManual.watchlist.length} 只人工自选，撤销 ${pending.length} 条旧手动条件单；${changedMembers} 只未持仓成员缺少本策略有效筛选通过记录，转为候补等待自动策略筛选。历史手动持仓、成交、资金和风险设置保留；历史持仓可按可卖数量、申报上限和盘口分批退出，剩余持仓保留。`;
+    const previous = s.agency.migrationNotice;
+    const autoOnly = { time, cancelledOrders: pending.length, archivedWatchlist: s.agency.legacyManual.watchlist.length, changedMembers };
+    s.agency.migrationNotice = previous
+      ? { ...previous, message: `${previous.message}\n${message}`, autoOnly }
+      : { kind: 'auto-only-upgrade', time, message, autoOnly };
+  }
+  migrateTechnicalTrading(s, now);
+  migrateMonitoringChecks(s.agency);
 }
 function validAgency(s) {
   const a = s.agency;
-  if (!object(a) || ![1, 2, 3, 4, 5].includes(a.version) || typeof a.epoch !== 'string' || !a.epoch || !cents(a.revision) || a.revision < 0
+  if (!object(a) || ![1, 2, 3, 4, 5, 6, 7, 8].includes(a.version) || typeof a.epoch !== 'string' || !a.epoch || !cents(a.revision) || a.revision < 0
     || !cents(a.manualCash) || a.manualCash < 0 || !Array.isArray(a.groups) || a.groups.length !== STRATEGY_PROFILES.length
     || !['decisions', 'executionIntents', 'transfers', 'corporateEvents'].every(k => Array.isArray(a[k]))) return false;
+  if (a.version >= 7) {
+    const legacy = a.legacyManual;
+    if (!object(legacy) || !Array.isArray(legacy.watchlist) || !legacy.watchlist.every(symbol => typeof symbol === 'string')
+      || typeof legacy.migratedAt !== 'string' || !Number.isFinite(Date.parse(legacy.migratedAt))
+      || !Array.isArray(legacy.cancelledOrderIds) || !legacy.cancelledOrderIds.every(orderId => typeof orderId === 'string' && orderId)
+      || new Set(legacy.cancelledOrderIds).size !== legacy.cancelledOrderIds.length
+      || legacy.cancelledOrderIds.some(orderId => !s.orders.some(order => order.id === orderId && order.status === 'cancelled'
+        && order.cancelledAt === legacy.migratedAt && typeof order.cancelReason === 'string' && order.cancelReason.trim()))) return false;
+  } else if (a.legacyManual !== undefined) return false;
+  if (a.version >= 8 ? a.technicalTradingVersion !== 1 : a.technicalTradingVersion !== undefined) return false;
   if (a.marketPolicy !== undefined && (!object(a.marketPolicy) || a.marketPolicy.version !== 1 || typeof a.marketPolicy.enabled !== 'boolean')) return false;
   // Older executables must reject the new ledger instead of silently ignoring
   // tax reserves, receivables, or the listing date on bonus-share lots.
@@ -129,6 +178,7 @@ function validAgency(s) {
         || !Number.isFinite(g.units) || g.units < 0 || !Number.isFinite(g.unitValue) || g.unitValue < 0
         || !Number.isFinite(g.unitPeak) || g.unitPeak <= 0 || !Number.isFinite(g.drawdown) || g.drawdown < 0 || g.drawdown > 1) return false;
       limitsOf(g.limits);
+      if (a.version >= 6 && activeCandidateCount(s, g) > ACTIVE_CANDIDATE_LIMIT) return false;
       const funding = a.transfers.filter(t => t.strategyId === g.id).reduce((sum, t) => sum + t.amount, 0);
       const groupTrades = s.trades.filter(t => t.owner === g.id);
       const dividends = a.corporateEvents.filter(event => event.strategyId === g.id).reduce((sum, event) => sum + event.cash, 0);
@@ -137,12 +187,16 @@ function validAgency(s) {
       for (const m of g.members) {
         if (!object(m) || symbolOf(m.symbol) !== m.symbol || members.has(m.symbol) || !MEMBER_MODES.includes(m.mode)
           || !object(m.reconciliation) || !['clear', 'pending'].includes(m.reconciliation.status)) return false;
+        if (m.mode === 'standby' && (a.version < 6 || s.lots.some(lot => lot.symbol === m.symbol)
+          || typeof m.standbyReason !== 'string' || !m.standbyReason.trim())) return false;
+        if (m.standbyReason !== undefined && (a.version < 6 || m.mode !== 'standby' || typeof m.standbyReason !== 'string')) return false;
         if (m.entryConditions !== undefined && !validEntryConditions(m.entryConditions)) return false;
+        if (m.legacyResearchConditions !== undefined && !validEntryConditions(m.legacyResearchConditions)) return false;
         if (m.exitPriceBasis !== undefined && !validExitPriceBasis(m.exitPriceBasis)) return false;
         if (a.version >= 5 && !SELECTION_MODES.includes(m.selectionMode)) return false;
         if (m.legacyPoolConditions !== undefined && !validEntryConditions(m.legacyPoolConditions)) return false;
-        if (m.monitoringCheck !== undefined && (!object(m.monitoringCheck) || !MONITORING_STATUSES.includes(m.monitoringCheck.status)
-          || typeof m.monitoringCheck.reason !== 'string' || typeof m.monitoringCheck.checkedAt !== 'string' || !Number.isFinite(Date.parse(m.monitoringCheck.checkedAt)))) return false;
+        if (m.monitoringCheck !== undefined && !validMonitoringCheck(m.monitoringCheck)) return false;
+        if (m.legacyMonitoringCheck !== undefined && !validMonitoringCheck(m.legacyMonitoringCheck, { legacy: true })) return false;
         members.set(m.symbol, g.id);
       }
       if (g.cycles.some(c => !object(c) || !c.id || symbolOf(c.symbol) !== c.symbol || !['open', 'closed'].includes(c.status) || !cents(c.pnl) || !cents(c.fees))) return false;
@@ -240,11 +294,12 @@ function corporateBlock(engine, symbol, q, snapshot, allowVerifiedExit = false) 
   if (!found) return { status: 'clear', reason: '' };
   const blocked = reason => ({ status: 'blocked', reason });
   const waiting = reason => ({ status: 'waiting', reason });
-  const automatic = snapshot?.corporateActions ? engine.agencyProcessCorporateActions(symbol, q, snapshot) : null;
+  const needsCorporate = engine.agencyNeedsCorporateEvidence(symbol);
+  const automatic = needsCorporate && snapshot?.corporateActions ? engine.agencyProcessCorporateActions(symbol, q, snapshot) : null;
   found = membership(engine, symbol);
   const { member } = found;
   if (automatic?.status === 'blocked') return blocked(pending(engine, member, automatic.reason, automatic.evidence, automatic.affectsEquity));
-  if (member.reconciliation.status === 'pending' && automatic?.status !== 'clear') return blocked(`待对账：${member.reconciliation.reason}`);
+  if (needsCorporate && member.reconciliation.status === 'pending' && automatic?.status !== 'clear') return blocked(`待对账：${member.reconciliation.reason}`);
   // Current data availability is distinct from the persisted reconciliation
   // latch. Keep that latch until all price checks pass, but report today's
   // missing input instead of an already-resolved corporate-source failure.
@@ -253,14 +308,16 @@ function corporateBlock(engine, symbol, q, snapshot, allowVerifiedExit = false) 
   const now = engine.clock().getTime(), basis = member.exitPriceBasis;
   const dailyProblem = typeof snapshot?.error === 'string' && snapshot.error.trim() ? snapshot.error.trim()
     : !snapshot || snapshot.error || !snapshot.technical ? '策略日线尚未获取，价格基准尚未核验，等待新鲜日线'
-      : !Number.isFinite(snapshot.fetchedAt) || now - snapshot.fetchedAt > 180000 || snapshot.fetchedAt > now + 15000
-        ? '日线获取时间无效或已过期，价格基准尚未核验，等待新鲜日线' : null;
+      : (snapshot.dailyEvidence !== undefined ? !preparedTechnicalValid(snapshot, now, symbol)
+        : !Number.isFinite(snapshot.fetchedAt) || now - snapshot.fetchedAt > 180000 || snapshot.fetchedAt > now + 15000)
+        ? `${snapshot.dailyEvidence !== undefined ? '日线证据' : '日线获取时间'}无效或已过期，价格基准尚未核验，等待新鲜日线` : null;
   if (dailyProblem) {
     // An unavailable daily refresh must not disable an already verified exit.
     // This is same-day price evidence, never permission to recalculate a plan
     // or to clear an unresolved ledger/corporate-action latch.
     if (!allowVerifiedExit || member.reconciliation.status !== 'clear' || member.awaitingVerification
       || !validExitPriceBasis(basis) || basis.date !== q.date || q.symbol !== symbol
+      || needsCorporate && basis.corporateVerified === false
       || basis.checkedAt > now || basis.corporateBasis !== corporatePriceBasis(engine, symbol)) return waiting(dailyProblem);
     if (!Number.isFinite(q.prevClose) || Math.abs(basis.prevClose - q.prevClose) > 0.011)
       return blocked(pending(engine, member, '行情与当日已核验价格基准不一致，等待重新核验完整日线', [{ verifiedReference: basis.prevClose, marketReference: q.prevClose, quoteDate: q.date }]));
@@ -274,15 +331,15 @@ function corporateBlock(engine, symbol, q, snapshot, allowVerifiedExit = false) 
     || t.dates.some(date => date > previousDate && date < q.date))) {
     return blocked(pending(engine, member, '持仓跨越未核验交易日，需补核离线期间公司行为', [{ previousDate, quoteDate: q.date }]));
   }
-  const todayActions = (engine.s.agency.corporateActions || []).filter(action => action.symbol === symbol && action.status !== 'exception' && action.terms.exDate === q.date);
+  const todayActions = needsCorporate ? (engine.s.agency.corporateActions || []).filter(action => action.symbol === symbol && action.status !== 'exception' && action.terms.exDate === q.date) : [];
   const expectedReference = todayActions.reduce((price, action) => (price - action.terms.cashPerShare) / (1 + action.terms.bonusPerShare + action.terms.transferPerShare), t.close);
   if (!Number.isFinite(reference) || !Number.isFinite(expectedReference) || Math.abs(expectedReference - reference) > 0.011) {
     return blocked(pending(engine, member, '行情与完整日线价格基准不一致，需核实除权或缺失日线', [{ dailyClose: t.close, marketReference: reference, asOf: t.asOf, quoteDate: q.date }]));
   }
   const notices = snapshot?.notices, check = checkNoticeRisk(notices, symbol, engine.clock());
-  const cachedCorporate = dailyProblem && !notices && !snapshot?.corporateActions
+  const cachedCorporate = dailyProblem && basis.corporateVerified !== false && !notices && !snapshot?.corporateActions
     && now - basis.corporateCheckedAt <= 300000 && basis.corporateCheckedAt <= now;
-  if (automatic?.status !== 'clear' && !cachedCorporate && (!check.coverageComplete || !['clear', 'blocked', 'unverified'].includes(check.status) || !Array.isArray(notices?.data?.items)
+  if (needsCorporate && automatic?.status !== 'clear' && !cachedCorporate && (!check.coverageComplete || !['clear', 'blocked', 'unverified'].includes(check.status) || !Array.isArray(notices?.data?.items)
     || !Number.isFinite(notices.fetchedAt) || now - notices.fetchedAt > 300000)) return waiting('公司行为公告资料尚未核验，暂停自动交易');
   const today = cnTime(engine.clock()).date;
   // A reviewed announcement may describe a future distribution. Reviewing it
@@ -290,14 +347,19 @@ function corporateBlock(engine, symbol, q, snapshot, allowVerifiedExit = false) 
   const reconciledIds = new Set(engine.s.agency.corporateEvents.filter(e => e.symbol === symbol
     && (!e.confirmationOnly || cnTime(e.time).date === today)).flatMap(e => [e.eventId, ...(e.noticeIds || [])]));
   for (const notice of automatic?.coveredNoticeIds || []) reconciledIds.add(notice);
-  const items = (automatic?.status === 'clear' || cachedCorporate ? [] : notices.data.items).filter(item => /分红|派息|送股|送转|转增|除权|除息|权益分派|配股|利润分配实施/.test(item.title || '') && !reconciledIds.has(item.id));
+  const items = (!needsCorporate || automatic?.status === 'clear' || cachedCorporate ? [] : notices.data.items).filter(item => /分红|派息|送股|送转|转增|除权|除息|权益分派|配股|利润分配实施/.test(item.title || '') && !reconciledIds.has(item.id));
   if (items.length) return blocked(pending(engine, member, '发现分红送转等公司行为公告，核实生效日期及持仓权益后恢复', items.map(item => ({ id: item.id, title: item.title, date: item.date }))));
   if (dailyProblem) return { status: 'clear', reason: '', exitOnly: true, dailyReason: dailyProblem };
   member.lastVerifiedAt = engine.clock().toISOString();
   member.lastVerifiedDate = q.date;
   member.exitPriceBasis = { date: q.date, prevClose: q.prevClose, dailyAsOf: t.asOf, dailyClose: t.close, checkedAt: now,
-    corporateCheckedAt: automatic?.status === 'clear' ? snapshot.corporateActions.fetchedAt : notices.fetchedAt,
+    corporateCheckedAt: !needsCorporate ? now : automatic?.status === 'clear' ? snapshot.corporateActions.fetchedAt : notices.fetchedAt,
+    corporateVerified: needsCorporate,
     corporateBasis: corporatePriceBasis(engine, symbol) };
+  if (!needsCorporate) {
+    member.corporateVerification = { status: 'not-required', reason: '首次开仓不预先获取公司行为资料，成交后核验持仓权益', affectsEquity: false };
+    if (engine.s.agency.corporateChecks[symbol]?.affectsEquity === false) delete engine.s.agency.corporateChecks[symbol];
+  }
   if (member.reconciliation.status === 'pending') { member.reconciliation = { status: 'clear', reason: '' }; bump(engine); }
   member.awaitingVerification = false;
   return { status: 'clear', reason: '' };
@@ -336,9 +398,25 @@ function installAgency(Engine) {
       corporateActions: structuredClone(this.s.agency.corporateActions), corporateChecks: structuredClone(this.s.agency.corporateChecks) };
   };
   Engine.prototype.agencyCorporateFromDate = function(symbol) { return corporateFromDate(this.s, symbolOf(symbol), this.clock()); };
+  Engine.prototype.agencyNeedsCorporateEvidence = function(symbol) {
+    symbol = symbolOf(symbol);
+    // A zero current position may still have a dividend receivable or deferred
+    // tax. Retain all traded symbols conservatively, including closed cycles.
+    if (this.s.lots.some(lot => lot.symbol === symbol) || this.s.trades.some(trade => trade.symbol === symbol)) return true;
+    if (this.s.agency.corporateActions.some(action => action.symbol === symbol && (action.entitlements?.length || action.affectsEquity === true))
+      || this.s.agency.corporateEvents.some(event => event.symbol === symbol && !event.confirmationOnly)) return true;
+    const member = membership(this, symbol)?.member, check = this.s.agency.corporateChecks[symbol];
+    return Boolean(check?.status === 'blocked' && check.affectsEquity === true
+      || member?.reconciliation.status === 'pending' && member.reconciliation.affectsEquity === true);
+  };
   Engine.prototype.agencyCorporateSymbols = function() {
-    return [...new Set([...this.s.agency.groups.flatMap(group => group.members.map(member => member.symbol)),
-      ...this.s.trades.filter(trade => trade.owner && trade.owner !== 'manual').map(trade => trade.symbol), ...this.s.agency.corporateActions.map(action => action.symbol)])];
+    return [...new Set([...this.s.agency.groups.flatMap(group => group.members.filter(member => member.mode !== 'standby').map(member => member.symbol)),
+      ...this.s.lots.filter(lot => lot.owner && lot.owner !== 'manual').map(lot => lot.symbol),
+      ...this.s.trades.filter(trade => trade.owner && trade.owner !== 'manual').map(trade => trade.symbol),
+      ...this.s.agency.corporateActions.filter(action => action.entitlements?.length || action.affectsEquity === true).map(action => action.symbol),
+      ...this.s.agency.corporateEvents.filter(event => !event.confirmationOnly).map(event => event.symbol),
+      ...Object.entries(this.s.agency.corporateChecks).filter(([, check]) => check.status === 'blocked' && check.affectsEquity).map(([symbol]) => symbol)])]
+      .filter(symbol => this.agencyNeedsCorporateEvidence(symbol));
   };
   Engine.prototype.agencyProcessCorporateActions = function(symbol, quote, snapshot) {
     const result = processCorporateActions(this, symbol, quote, snapshot), found = membership(this, symbolOf(symbol));
@@ -393,7 +471,8 @@ function installAgency(Engine) {
       if (this.s.orders.some(o => o.symbol === symbol && o.status === 'pending')) throw Error('该股票有待执行手动委托，请先处理');
       if (found) { if (found.member.mode !== 'active' && position) throw Error('已有退出安排，平仓后才能重新加入'); return structuredClone(found.member); }
       const member = { symbol, mode: 'active', selectionMode: 'strategy', addedAt: this.clock().toISOString(), reconciliation: { status: 'clear', reason: '' } };
-      const savedConditions = createEntryConditions(entryConditions, this.clock());
+      if (activeCandidateCount(this.s, group) >= ACTIVE_CANDIDATE_LIMIT) setStandby(this.s, member);
+      const savedConditions = createEntryConditions(automaticEntryConditions(entryConditions, this.clock()), this.clock());
       if (savedConditions) member.entryConditions = savedConditions;
       group.members.push(member); this.s.agency.poolAuthorizationRevision++; bump(this); return structuredClone(member);
     }
@@ -424,7 +503,7 @@ function installAgency(Engine) {
       const current = membership(this, symbol);
       const diagnostic = result.exitOnly ? { ...result, status: 'waiting',
         reason: `${result.dailyReason}；日线复核暂停，已存价位和待完成退出目标继续监控` } : result;
-      if (current) current.member.automaticCheck = { ...diagnostic, checkedAt: this.clock().toISOString() };
+      if (current) current.member.automaticCheck = { ...diagnostic, dailyHistory: publicDailyHistory(snapshot, this.clock().getTime(), symbol), checkedAt: this.clock().toISOString() };
       return result;
     };
     if (found.group.mode === 'stopped') return record({ status: 'blocked', reason: '本策略全部自动操作已停止' });
@@ -448,7 +527,7 @@ function installAgency(Engine) {
     if (trading.open && trading.known) return this.agencyAutomaticBlock(symbol, q, snapshot);
     const record = result => {
       const current = membership(this, symbol);
-      if (current) current.member.automaticCheck = { ...result, checkedAt: this.clock().toISOString() };
+      if (current) current.member.automaticCheck = { ...result, dailyHistory: publicDailyHistory(snapshot, this.clock().getTime(), symbol), checkedAt: this.clock().toISOString() };
       return result.reason || null;
     };
     const waiting = reason => record({ status: 'waiting', reason });
@@ -458,26 +537,30 @@ function installAgency(Engine) {
     // yesterday's quote must never become today's price-reference evidence.
     // Registration-day holdings are captured only after that day's close by
     // the existing corporate ledger. Its idempotent date gates also apply here.
-    const automatic = this.agencyProcessCorporateActions(symbol, undefined, snapshot);
-    if (automatic.status === 'blocked') return record({ status: 'blocked', reason: automatic.reason });
-    if (automatic.status !== 'clear') return waiting(automatic.reason || '公司行为实施资料尚未核验');
+    const needsCorporate = this.agencyNeedsCorporateEvidence(symbol);
+    const automatic = needsCorporate ? this.agencyProcessCorporateActions(symbol, undefined, snapshot) : null;
+    if (automatic?.status === 'blocked') return record({ status: 'blocked', reason: automatic.reason });
+    if (needsCorporate && automatic?.status !== 'clear') return waiting(automatic?.reason || '公司行为实施资料尚未核验');
     if (typeof snapshot?.error === 'string' && snapshot.error.trim()) return waiting(snapshot.error.trim());
     const at = this.clock().getTime(), technical = snapshot?.technical;
     if (!technical) return waiting('策略日线尚未获取，等待最近完整交易日的日线');
     if (typeof snapshot.source !== 'string' || !snapshot.source.trim() || snapshot.source === '来源未标注'
-      || !Number.isFinite(snapshot.fetchedAt) || snapshot.fetchedAt <= 0 || at - snapshot.fetchedAt > 180000
-      || snapshot.fetchedAt > at + 15000) return waiting('日线来源或获取时间无效、已过期，等待新鲜日线');
+      || (snapshot.dailyEvidence !== undefined ? !preparedTechnicalValid(snapshot, at, symbol)
+        : !Number.isFinite(snapshot.fetchedAt) || snapshot.fetchedAt <= 0 || at - snapshot.fetchedAt > 180000
+          || snapshot.fetchedAt > at + 15000)) return waiting('日线来源或证据无效、已过期，等待新鲜日线');
     let expectedDate;
     try { expectedDate = preparationDailyDate(this.clock()); } catch (error) { return waiting(error.message); }
     if (!validDate(technical.asOf) || technical.asOf !== expectedDate || !Number.isFinite(technical.close) || technical.close <= 0)
       return waiting(`最近完整交易日 ${expectedDate} 的日线尚未核验，等待补齐日线`);
     const current = membership(this, symbol), latch = current.member.reconciliation;
-    const reason = `历史日线和公司行为资料已准备（截至 ${expectedDate}）；等待开盘后实时行情、价格基准和入场校验`
+    const reference = preopenPriceReference(symbol, q, technical, needsCorporate ? this.s.agency.corporateActions : [], at);
+    const reason = `${needsCorporate ? '历史日线和公司行为资料' : '历史日线'}已准备（截至 ${expectedDate}）；等待开盘后实时行情、价格基准和入场校验`
+      + (reference.status !== 'waiting' ? `；${reference.reason}` : '')
       + (latch.status === 'pending' ? `；原待对账状态保留：${latch.reason}` : '');
     // Prepared evidence grants no permission and clears no persisted latch.
     // In particular, lastVerifiedDate and awaitingVerification belong to the
     // complete in-session price check, never to an offline preparation pass.
-    return record({ status: 'waiting', phase: 'prepared', dailyAsOf: expectedDate, reason });
+    return record({ status: 'waiting', phase: 'prepared', dailyAsOf: expectedDate, reference, reason });
   };
   Engine.prototype.agencyPendingExit = function(symbol) {
     return this.s.agency.executionIntents.find(intent => intent.symbol === symbol && intent.status === 'pending') || null;
@@ -499,12 +582,13 @@ function installAgency(Engine) {
       ? { status: 'skipped', passed: false, skippedBy: 'pool-qualification',
         reason: '候选资格尚未通过，本轮未复核持续开仓条件；请更新四策略候选池完成核验',
         reasons: [...poolReasons], checks: [], checkedAt: this.clock().toISOString(), conditions: structuredClone(found.member.entryConditions) }
-      : evaluateEntryConditions(found.member.entryConditions, symbol, q, snapshot, this.clock());
+      : evaluateEntryConditions(automaticEntryConditions(found.member.entryConditions, this.clock()), symbol, q, snapshot, this.clock());
     const conditionReasons = entryConditionsCheck && entryConditionsCheck.status !== 'skipped' && !entryConditionsCheck.passed
       ? entryConditionsCheck.reasons.map(reason => `${holding ? '持仓提示（不触发卖出）' : '附加开仓条件'}：${reason}`) : [];
     const reject = reason => ({ symbol, strategyId, status: '自动交易规则拦截', buyable: false, quantity: 0,
       reasons: [reason, ...conditionReasons], ...(entryConditionsCheck ? { entryConditionsCheck } : {}), checkedAt: this.clock().getTime() });
     if (!found || found.group.id !== strategyId) return reject('股票不在授权自动交易组');
+    if (found.member.mode === 'standby') return reject(`当前为候补，不参与自动开仓：${found.member.standbyReason}`);
     if (group.mode !== 'running' || found.member.mode !== 'active') return reject('策略已暂停新开仓或股票正在退出');
     if (poolBlocked) {
       return reject(`候选池资格待核验，暂停新开仓：${poolReasons.join('；') || '请重新更新四策略候选池'}`);
@@ -537,7 +621,7 @@ function installAgency(Engine) {
       marketAdaptiveEntry: adaptive,
       strategySettings: { ...configureStrategy({ ...this.s.strategySettings, riskPercent: group.limits.riskPercent, minRewardRisk: group.limits.minRewardRisk }), riskPercent: group.limits.riskPercent * multiplier } };
     facade.stats = () => ({ ...stat, cash: stat.availableCash });
-    const result = { ...evaluateEntry(facade, symbol, q, snapshot, requestedQuantity, strategyId), valuationEvidence, ...(adaptive ? { marketRegime } : {}),
+    const result = { ...evaluateEntry(facade, symbol, q, snapshot, requestedQuantity, strategyId, { technicalOnly: true }), valuationEvidence, ...(adaptive ? { marketRegime } : {}),
       ...(entryConditionsCheck ? { entryConditionsCheck } : {}) };
     if (adaptive && result.plan) result.plan.marketRegime = structuredClone(marketRegime);
     if (entryConditionsCheck) {
@@ -569,7 +653,7 @@ function installAgency(Engine) {
     const permitted = low ? minimum + (low - 1) * step : 0;
     if (!permitted) return reject('策略总仓位或总计划风险预算不足；计划风险不代表最大实际损失');
     if (requestedQuantity != null && requestedQuantity > permitted) return reject(`策略总仓位或总计划风险最多允许 ${permitted} 股`);
-    const final = permitted < result.quantity ? evaluateEntry(facade, symbol, q, snapshot, permitted, strategyId) : result;
+    const final = permitted < result.quantity ? evaluateEntry(facade, symbol, q, snapshot, permitted, strategyId, { technicalOnly: true }) : result;
     if (adaptive && final.plan) final.plan.marketRegime = structuredClone(marketRegime);
     if (entryConditionsCheck && final.plan) final.plan.entryConditionsCheck = structuredClone(entryConditionsCheck);
     return { ...final, ...(adaptive ? { marketRegime } : {}), ...(entryConditionsCheck ? { entryConditionsCheck } : {}), valuationEvidence, aggregatePlannedRisk: existingRisk, aggregateRiskBudget: availableRisk, maxQuantity: Math.min(final.maxQuantity, permitted) };
@@ -593,7 +677,7 @@ function installAgency(Engine) {
       const targetQuantity = Math.floor(groupView(this, group, valuationQuotes).equity * target / 100 / money(ev.plan.entry));
       const quantity = symbol.startsWith('sh688') ? Math.min(ev.quantity, targetQuantity) : Math.floor(Math.min(ev.quantity, targetQuantity) / 100) * 100;
       if (quantity < (symbol.startsWith('sh688') ? 200 : 100)) throw Error('目标仓位不足以买入最小申报数量');
-      const archiveRequired = usesAutomaticEvidence(found.member.entryConditions);
+      const archiveRequired = usesAutomaticEvidence(automaticEntryConditions(found.member.entryConditions, this.clock()));
       if (archiveRequired || input.archiveEntryEvidence) {
         if (typeof input.archiveEntryEvidence !== 'function') throw Error('永久开仓依据归档服务未配置，本次未开仓');
         const finalEvaluation = this.agencyEvaluate(group.id, symbol, q, snapshot, quantity, valuationQuotes);
@@ -681,7 +765,10 @@ function installAgency(Engine) {
         if (!this.s.lots.some(l => l.symbol === symbol)) {
           cycle.status = 'closed'; cycle.closedAt = trade.time;
           if (found.member.mode !== 'active') group.members = group.members.filter(m => m.symbol !== symbol);
-          else if (found.member.selectionMode === 'strict') found.member.poolCheck = pendingPoolCheck(require('./agency-screening.cjs').poolPolicy('strict'), this.clock(), '原持仓已平仓，请重新进行严格研究筛选后再参与新开仓');
+          else {
+            if (found.member.selectionMode === 'strict') found.member.poolCheck = pendingPoolCheck(require('./agency-screening.cjs').poolPolicy('strict'), this.clock(), '原持仓已平仓，请重新进行严格研究筛选后再参与新开仓');
+            if (activeCandidateCount(this.s, group) > ACTIVE_CANDIDATE_LIMIT) setStandby(this.s, found.member);
+          }
         }
         const intent = this.agencyPendingExit(symbol);
         if (intent && input.side === 'sell') {

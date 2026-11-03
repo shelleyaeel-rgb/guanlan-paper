@@ -1,9 +1,11 @@
 const { contextBridge, ipcRenderer } = require('electron');
 // Read-only operating-metric inspection uses the same restricted IPC bridge.
-const allowed = new Set(['state', 'refresh', 'detail', 'research:get', 'research:open', 'watch:add', 'watch:remove', 'trade', 'order', 'cancel', 'risk', 'settings', 'strategy:buy', 'strategy:select', 'strategy:settings', 'screener:meta', 'screener:parse', 'screener:status', 'screener:cancel', 'screener:history', 'screener:run', 'screener:open', 'reset', 'backup', 'export', 'folder']);
-for (const name of ['agency:transfer', 'agency:configure', 'agency:mode', 'agency:member', 'agency:members:add', 'agency:reconcile', 'agency:verify', 'agency:run', 'agency:pool:run', 'agency:pool:retry', 'agency:pool:cancel', 'agency:pool:status']) allowed.add(name);
+const allowed = new Set(['state', 'refresh', 'detail', 'detail:close', 'research:get', 'research:open', 'legacy:exit', 'cancel', 'settings', 'strategy:settings', 'screener:meta', 'reset', 'backup', 'export', 'folder']);
+for (const name of ['agency:transfer', 'agency:configure', 'agency:mode', 'agency:member', 'agency:reconcile', 'agency:verify', 'agency:run', 'agency:pool:run', 'agency:pool:retry', 'agency:pool:cancel', 'agency:pool:status']) allowed.add(name);
 for (const name of ['evidence:list', 'evidence:save', 'evidence:remove', 'evidence:open']) allowed.add(name);
 allowed.add('research:inspect');
+allowed.add('market:search');
+allowed.add('market:indices');
 allowed.add('capital:add');
 allowed.add('operation:status');
 allowed.add('view:state'); allowed.add('view:refresh');

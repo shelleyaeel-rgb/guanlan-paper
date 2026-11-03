@@ -2,6 +2,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { CorporateService } = require('../core/corporate-service.cjs');
 const { createEntryConditions } = require('../core/entry-conditions.cjs');
+const { Engine, initialState, validState } = require('../core/engine.cjs');
+const { setStandby } = require('../core/agency-capacity.cjs');
 
 function fixture() {
   let time = Date.parse('2026-10-09T10:00:00+08:00');
@@ -281,15 +283,156 @@ test('账户切换后旧批次不再启动尚未取证的股票', async () => {
   f.monitor.load = async () => ({}); assert.equal((await f.service.poll()).clear, 3);
 });
 
-test('盘前也为短线附加财务条件预取财务资料，普通成员不多取', async () => {
+test('自动交易盘前不再为附加财务条件或长线组预取财务及风险公告', async () => {
   const f = fixture(), loads = []; f.advance(-3600000); addMembers(f, ['sh600000']);
   f.engine.s.agency.groups[0].members[0].entryConditions = createEntryConditions({ rules: [{ field: 'roe', op: 'gt', value: 10 }] });
   f.engine.s.agency.groups.push({ id: 'long', members: [{ symbol: 'sh600001', reconciliation: { status: 'clear' } }] });
   f.monitor.load = async (symbol, force, fundamentals, notices) => { loads.push({ symbol, force, fundamentals, notices }); return {}; };
   await f.service.poll();
   assert.deepEqual(loads, [
-    { symbol: 'sz000001', force: false, fundamentals: true, notices: true },
-    { symbol: 'sh600000', force: false, fundamentals: false, notices: true },
-    { symbol: 'sh600001', force: false, fundamentals: true, notices: true }
+    { symbol: 'sz000001', force: false, fundamentals: false, notices: false },
+    { symbol: 'sh600000', force: false, fundamentals: false, notices: false },
+    { symbol: 'sh600001', force: false, fundamentals: false, notices: false }
   ]);
+});
+
+test('两只冷资料等待不会占用已准备成员开盘核验通道', async () => {
+  const f = fixture(); addMembers(f, ['sh600000', 'sh600001']);
+  const releases = [], prepared = { corporateActions: { status: 'ready' } };
+  f.monitor.peekPrepared = symbol => symbol === 'sh600001' ? prepared : null;
+  f.monitor.load = () => new Promise(resolve => releases.push(resolve));
+  const pending = f.service.poll();
+  await settlePreparation();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(releases.length, 2);
+  assert.deepEqual(f.calls.checks.map(item => item.symbol), ['sh600001']);
+  assert.equal(f.calls.checks[0].snapshot, prepared);
+  releases.forEach(resolve => resolve({})); assert.equal((await pending).clear, 3);
+});
+
+test('前轮慢请求未完成时，新就绪成员可在下一次poll独立核验', async () => {
+  const f = fixture(); let release, coldCalls = 0;
+  const prepared = { corporateActions: { status: 'ready' } };
+  f.monitor.peekPrepared = symbol => symbol === 'sh600001' ? prepared : null;
+  f.monitor.load = () => { coldCalls++; return new Promise(resolve => { release = resolve; }); };
+  const old = f.service.poll();
+  addMembers(f, ['sh600001']);
+  const current = f.service.poll(); assert.notEqual(current, old);
+  assert.equal((await current).clear, 1); assert.deepEqual(f.calls.checks.map(item => item.symbol), ['sh600001']);
+  addMembers(f, ['sh600002']);
+  assert.equal(f.service.poll(), old); assert.equal(f.service.poll(), old); assert.equal(coldCalls, 1, '快批次完成不释放旧冷批次并发锁');
+  release({}); assert.equal((await old).clear, 1);
+});
+
+test('后台提前续验不阻塞尚在TTL内的开盘快速复用，账户重置丢弃旧准备队列', async () => {
+  const f = fixture(), prepared = { corporateActions: { status: 'ready' } }; let release, prepareCalls = 0;
+  f.monitor.snapshots = { sz000001: prepared };
+  f.monitor.peekPrepared = () => prepared;
+  f.monitor.prepare = () => { prepareCalls++; return new Promise(resolve => { release = resolve; }); };
+  f.monitor.load = () => assert.fail('已经准备的成员无需等待整体load');
+  assert.equal((await f.service.poll()).clear, 1);
+  assert.equal(prepareCalls, 1); assert.equal(f.service.preparing.size, 1);
+  f.engine.s.agency.epoch = 'new-preparation-account';
+  f.service.syncEpoch(); release(prepared); await settlePreparation();
+  assert.equal(f.service.preparing.size, 0); assert.equal(f.service.lastPreparation.size, 0);
+});
+
+test('等待报价期间已知公司行为更新或失败，提交使用最新证据而非旧快照', async () => {
+  for (const failed of [false, true]) {
+    const f = fixture(), prepared = { corporateActions: { status: 'ready', revision: 1 } }; let release;
+    f.monitor.peekPrepared = () => prepared;
+    f.service.market.quotes = () => new Promise(resolve => { release = resolve; });
+    f.engine.agencyAutomaticBlock = (_symbol, _quote, snapshot) => {
+      assert.notEqual(snapshot.corporateActions, prepared.corporateActions);
+      assert.equal(snapshot.corporateActions.status, failed ? 'unavailable' : 'ready');
+      return '等待新公司行为复核';
+    };
+    const pending = f.service.verifyOne('sz000001');
+    f.source.get = async () => { if (failed) throw Error('公司行为查新失败'); return { status: 'ready', revision: 2 }; };
+    await f.service.getSnapshot('sz000001', true); release({});
+    assert.equal((await pending).status, 'waiting');
+  }
+});
+
+function standbyFixture() {
+  const now = new Date('2026-10-21T10:00:00+08:00'), symbol = 'sz000001';
+  const engine = new Engine(initialState(100000), () => now), calls = { loads: 0, sources: 0, quotes: 0, saves: 0 };
+  engine.agencyMember({ strategyId: 'swing', symbol, action: 'add' });
+  engine.agencyMode({ strategyId: 'swing', mode: 'running' });
+  const group = engine.s.agency.groups.find(item => item.id === 'swing'), member = group.members[0];
+  setStandby(engine.s, member, '等待重新筛选');
+  member.reconciliation = { status: 'pending', reason: '等待公司行为资料重新核验' };
+  const source = { async get(input) {
+    calls.sources++; assert.equal(input.force, true);
+    return { symbol, status: 'ready', fetchedAt: now.getTime(), coverageStart: '2026-01-01',
+      coverageEnd: '2026-10-21', coverageComplete: true, events: [], notices: [] };
+  } };
+  const snapshot = { source: '隔离日线', fetchedAt: now.getTime(), technical: { asOf: '2026-10-20', close: 10 },
+    notices: { symbol, section: 'notices', source: '东方财富', status: 'empty', fetchedAt: now.getTime(), data: { items: [], total: 0 } },
+    corporateActions: { symbol, status: 'unavailable', fetchedAt: now.getTime() - 600000, coverageComplete: false, events: [] } };
+  const monitor = { snapshots: { [symbol]: snapshot }, async load() { calls.loads++; return snapshot; },
+    prepare() { assert.fail('候补不可进入常规提前续验'); } };
+  const service = new CorporateService({ source, getEngine: () => engine, getMonitor: () => monitor,
+    clock: () => now.getTime(), transaction: fn => { const result = fn(); calls.saves++; return result; },
+    market: { async quotes() { calls.quotes++; return { [symbol]: { symbol, price: 10.1, prevClose: 10,
+      timestamp: now.getTime(), date: '2026-10-21' } }; } } });
+  return { service, source, monitor, engine, calls, group, member, symbol, snapshot };
+}
+
+test('未持仓活跃候选仍自动准备日线，不进入公司行为下载队列', async () => {
+  const f = standbyFixture(), loads = [];
+  f.member.mode = 'active'; delete f.member.standbyReason;
+  f.monitor.prepare = async (...args) => { loads.push(['prepare', ...args]); return f.snapshot; };
+  f.monitor.load = async (...args) => { f.calls.loads++; loads.push(['load', ...args]); return f.snapshot; };
+  assert.deepEqual(f.service.symbols(), []);
+  assert.deepEqual(f.service.preparationSymbols(), [f.symbol]);
+  assert.equal(f.service.requiresEvidence(f.symbol), false);
+  const result = await f.service.poll();
+  assert.equal(result.clear, 1);
+  assert.deepEqual(loads, [['prepare', f.symbol, false, false], ['load', f.symbol, false, false, false]]);
+  assert.equal(f.calls.sources, 0); assert.equal(f.calls.quotes, 1); assert.equal(f.calls.saves, 1);
+  assert.equal(f.member.corporateVerification.status, 'not-required');
+  assert.equal(validState(f.engine.s), true);
+});
+
+test('纯候补不轮询，显式核验用行情和日线解除无权益阻断且不下载公告，仍需重新筛选激活', async () => {
+  const f = standbyFixture(), before = { cash: f.engine.s.cash, lots: structuredClone(f.engine.s.lots), trades: structuredClone(f.engine.s.trades) };
+  assert.deepEqual(f.service.symbols(), []); assert.equal((await f.service.poll()).checked, 0);
+  assert.equal(await f.service.getSnapshot(f.symbol, true), null);
+  assert.deepEqual(f.calls, { loads: 0, sources: 0, quotes: 0, saves: 0 });
+  const result = await f.service.verify({ strategyId: 'swing', symbol: f.symbol });
+  assert.equal(result.clear, 1); assert.equal(result.skipped, 0);
+  assert.deepEqual(f.calls, { loads: 1, sources: 0, quotes: 1, saves: 1 });
+  assert.equal(f.member.reconciliation.status, 'clear'); assert.equal(f.member.mode, 'standby');
+  assert.equal(f.snapshot.corporateActions.status, 'unavailable', '单次核验不改写旧监控快照');
+  assert.equal(f.engine.agencyEvaluate('swing', f.symbol, {}, {}).buyable, false);
+  assert.deepEqual({ cash: f.engine.s.cash, lots: f.engine.s.lots, trades: f.engine.s.trades }, before);
+  assert.equal(validState(f.engine.s), true); assert.equal((await f.service.poll()).checked, 0);
+});
+
+test('无权益候补不受公司行为来源失败阻断，但当日价格基准不匹配仍阻断', async () => {
+  const f = standbyFixture(); f.source.get = async () => { throw Error('隔离资料源离线'); };
+  f.snapshot.technical.close = 9;
+  const result = await f.service.verify({ strategyId: 'swing', symbol: f.symbol });
+  assert.equal(result.clear, 0); assert.equal(result.blocked, 1); assert.match(result.results[0].reason, /价格基准不一致/);
+  assert.equal(f.member.reconciliation.status, 'pending'); assert.equal(f.member.mode, 'standby');
+  assert.equal(f.engine.s.trades.length, 0); assert.equal(validState(f.engine.s), true);
+});
+
+test('候补显式核验在取证或等待提交期间失效，不写入已移除成员或新账户', async () => {
+  for (const phase of ['load', 'source', 'commit']) for (const reset of [false, true]) {
+    const f = standbyFixture(); let release, queue;
+    f.member.reconciliation.affectsEquity = true;
+    if (phase === 'load') f.monitor.load = () => new Promise(resolve => { release = () => resolve(f.snapshot); });
+    if (phase === 'source') { const get = f.source.get; f.source.get = input => new Promise(resolve => { release = async () => resolve(await get(input)); }); }
+    if (phase === 'commit') queue = scheduled(f);
+    const pending = f.service.verify({ strategyId: 'swing', symbol: f.symbol });
+    await settlePreparation();
+    if (reset) f.engine.s.agency.epoch = 'reset-standby-account';
+    else f.group.members = [];
+    if (queue) queue.flush(); else await release();
+    assert.equal((await pending).skipped, 1, `${phase}/${reset}`);
+    assert.equal(f.calls.saves, 0); assert.equal(f.engine.s.trades.length, 0);
+    assert.equal(f.service.latestEvidence.size, phase === 'commit' ? 1 : 0);
+  }
 });

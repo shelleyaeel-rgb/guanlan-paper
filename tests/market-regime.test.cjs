@@ -122,7 +122,9 @@ test('指数日线独立白名单入口保持未复权并缓存真实获取时�
   const raw = fixture().histories.sh000001.bars.map(bar => [bar.date, bar.open, bar.close, bar.high, bar.low, 100]);
   const market = new Market(async url => { calls++; assert.match(url, /param=sh000001,day,,,120,$/); return { ok: true, json: async () => ({ code: 0, data: { sh000001: { day: raw } } }) }; }, { clock: () => now });
   const first = await market.indexHistory('sh000001'); now += 30000;
-  assert.equal(await market.indexHistory('sh000001'), first); assert.equal(first.fetchedAt, START); assert.equal(calls, 1);
+  const cached = await market.indexHistory('sh000001');
+  assert.deepEqual(cached.bars, first.bars); assert.deepEqual(cached.dailyEvidence, first.dailyEvidence);
+  assert.equal(cached.historyStatus, 'cached'); assert.equal(cached.fetchedAt, START); assert.equal(calls, 1);
   assert.equal(first.adjustment, '未复权');
   await assert.rejects(market.strategyHistory('sh000001'), /请输入/);
   await assert.rejects(market.indexHistory('sh600000'), /仅支持/);
@@ -300,4 +302,67 @@ test('盘中取数跨越午休不能授予权限，午后自动重新累计实�
   now = Date.parse('2026-10-16T13:00:00+08:00');
   assert.equal((await service.poll()).allowEntry, false);
   now += 120000; assert.equal((await service.poll()).allowEntry, true);
+});
+
+const preparedUniverse = now => ({ symbols: Array.from({ length: 1200 }, (_, i) => `sh${600000 + i}`),
+  source: '测试完整证券名单', sourceCount: 1200, excludedCount: 0, validatedAt: now, date: '2026-10-16' });
+
+test('盘前并行准备指数和完整名单，状态按当前时间重新校验且五分钟维护不累计实时确认', async () => {
+  let now = Date.parse('2026-10-16T08:45:00+08:00'), universeCalls = 0, quoteCalls = 0, breadthCalls = 0;
+  const service = new MarketRegimeService({ clock: () => now,
+    indexHistory: async symbol => fixture(now).histories[symbol],
+    prepareUniverse: async options => { universeCalls++; assert.equal(options.force, false); return preparedUniverse(now); },
+    getQuotes: () => { quoteCalls++; return fixture(now).quotes; }, loadBreadth: async () => { breadthCalls++; return fixture(now).breadth; } });
+  const ready = await service.poll();
+  assert.equal(ready.preparation.ready, true); assert.equal(ready.preparation.status, 'ready');
+  assert.equal(ready.preparation.indices.ready, 3); assert.equal(ready.preparation.universe.count, 1200);
+  assert.deepEqual(ready.preparation.missing, []); assert.equal(ready.allowEntry, false); assert.equal(service.confirmation, null);
+  assert.equal(quoteCalls, 0); assert.equal(breadthCalls, 0);
+  now += 299999; await service.poll(); assert.equal(universeCalls, 1);
+  now++; await service.poll(); assert.equal(universeCalls, 2);
+  now += 1800000;
+  const expired = service.getSnapshot(); assert.equal(expired.preparation.ready, false); assert.equal(expired.preparation.universe.ready, false);
+  assert.deepEqual(expired.preparation.missing, ['完整证券名单']);
+  await service.poll(); assert.equal(service.getSnapshot().preparation.ready, true); assert.equal(universeCalls, 3);
+  now = Date.parse('2026-10-19T08:45:00+08:00');
+  assert.equal(service.getSnapshot().preparation.ready, false); assert.equal(service.getSnapshot().preparation.indices.ready, 0);
+});
+
+test('盘前证券名单失败仍保留各指数准备诊断，手动重试穿透完整名单获取', async () => {
+  const now = Date.parse('2026-10-16T09:00:00+08:00'); let fail = true, forced;
+  const service = new MarketRegimeService({ clock: () => now,
+    indexHistory: async symbol => fixture(now).histories[symbol], getQuotes: () => fixture(now).quotes, loadBreadth: async () => fixture(now).breadth,
+    prepareUniverse: async options => { forced = options.force; if (fail) throw Error('名单 HTTP 501'); return preparedUniverse(now); } });
+  const failed = await service.poll(); assert.equal(failed.preparation.status, 'partial'); assert.equal(failed.preparation.indices.ready, 3);
+  assert.equal(failed.preparation.universe.ready, false); assert.match(failed.preparation.universe.error, /501/);
+  assert.equal(failed.allowEntry, false); fail = false;
+  const recovered = await service.poll({ force: true }); assert.equal(forced, true); assert.equal(recovered.preparation.ready, true);
+  assert.equal(recovered.preparation.universe.error, '');
+});
+
+test('开盘不等盘前慢请求，取消旧订阅且迟到结果和进度不覆盖新时段任务', async () => {
+  let now = Date.parse('2026-10-16T09:29:59+08:00'), release, oldSignal, oldProgress, breadthCalls = 0;
+  const service = new MarketRegimeService({ clock: () => now,
+    indexHistory: async symbol => fixture(now).histories[symbol], getQuotes: () => fixture(now).quotes,
+    prepareUniverse: options => { oldSignal = options.signal; oldProgress = options.onProgress; return new Promise(resolve => { release = resolve; }); },
+    loadBreadth: async () => { breadthCalls++; return fixture(now).breadth; } });
+  const preopen = service.poll(); await Promise.resolve(); now += 1000;
+  const opening = service.poll(); assert.notEqual(opening, preopen);
+  const live = await opening; assert.equal(oldSignal.aborted, true); assert.equal(breadthCalls, 1);
+  assert.equal(live.acquisition.stage, 'complete'); assert.equal(live.allowEntry, false); assert.match(live.reason, /持续确认/);
+  const preparedAt = live.preparation.preparedAt;
+  release(preparedUniverse(now - 1000)); oldProgress({ stage: 'universe', completed: 999, total: 1200 }); await preopen;
+  assert.equal(service.getSnapshot().acquisition.stage, 'complete'); assert.equal(service.getSnapshot().preparation.preparedAt, preparedAt);
+  assert.equal(service.pending, null);
+});
+
+test('开盘接口返回竞价旧tick不能启动120秒持续确认，即使同日且未超过时效', async () => {
+  let now = Date.parse('2026-10-16T09:30:00+08:00'), old = true;
+  const data = () => fixture(old ? now - 60000 : now);
+  const service = new MarketRegimeService({ clock: () => now, indexHistory: async symbol => fixture(now).histories[symbol],
+    getQuotes: () => data().quotes, loadBreadth: async () => data().breadth });
+  const first = await service.poll(); assert.equal(first.allowEntry, false); assert.match(first.reason, /竞价报价/); assert.equal(service.confirmation, null);
+  old = false; now += 30000; await service.poll(); assert.equal(service.confirmation.firstQuoteTime, now);
+  now += 119999; assert.equal((await service.poll({ force: true })).allowEntry, false);
+  now++; assert.equal((await service.poll({ force: true })).allowEntry, true);
 });

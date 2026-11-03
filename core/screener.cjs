@@ -1,5 +1,6 @@
 const { symbolOf, cnTime } = require('./common.cjs');
 const { dailyIndicators } = require('./daily-indicators.cjs');
+const { preparedHistoryValid } = require('./daily-history.cjs');
 const { checkMarketRisk, checkNoticeRisk, NOTICE_RISK_POLICY } = require('./entry-risk.cjs');
 const { checkNoticeWithEvidence } = require('./company-notice-review.cjs');
 const { validateEvidenceQuery, describeEvidenceQuery, evaluateEvidence } = require('./selection-evidence.cjs');
@@ -33,6 +34,11 @@ const TECHNICAL_FIELDS = {
   previousMa5: dailyPrice('前一日 MA5', ['前一日MA5', '昨日MA5']),
   previousMa20: dailyPrice('前一日 MA20', ['前一日MA20', '昨日MA20']),
   previousMa60: dailyPrice('前一日 MA60', ['前一日MA60', '昨日MA60']),
+  atrPct14: { label: 'ATR(14)波动率', aliases: ['ATR(14)波动率', 'ATR14波动率', '14日ATR波动率', 'ATR波动率'], unit: '%', min: 0, source: 'daily', description: '最近 14 根完整日线真实波幅 TR 的简单均值 ÷ 最新完整日线收盘 × 100%；TR 包含与前收盘的跳空。' },
+  biasMa5Pct: { label: 'MA5乖离率', aliases: ['MA5乖离率', '5日均线乖离率', '5日乖离率'], unit: '%', source: 'daily', description: '（最新完整日线收盘 ÷ MA5 − 1）× 100%，保留正负号；负值表示收盘低于均线。' },
+  biasMa20Pct: { label: 'MA20乖离率', aliases: ['MA20乖离率', '20日均线乖离率', '20日乖离率'], unit: '%', source: 'daily', description: '（最新完整日线收盘 ÷ MA20 − 1）× 100%，保留正负号；负值表示收盘低于均线。' },
+  biasMa60Pct: { label: 'MA60乖离率', aliases: ['MA60乖离率', '60日均线乖离率', '60日乖离率'], unit: '%', source: 'daily', description: '（最新完整日线收盘 ÷ MA60 − 1）× 100%，保留正负号；负值表示收盘低于均线。' },
+  ma20Change5Pct: { label: 'MA20五日变化率', aliases: ['MA20五日变化率', 'MA20近5日变化率', '20日均线五日变化率'], unit: '%', source: 'daily', description: '（最新完整日线 MA20 ÷ 五根完整日线前的 MA20 − 1）× 100%，保留正负号；五日指五根完整日线。' },
   macd: { label: 'MACD 柱', aliases: ['MACD柱', 'MACD'], unit: '元', source: 'daily', description: 'MACD(12,26,9) 柱 = 2 × (DIF − DEA)，为正不等于 DIF、DEA 均在零轴上方。' },
   rsi: { label: 'RSI(14)', aliases: ['RSI(14)', 'RSI14', 'RSI'], unit: '', min: 0, max: 100, source: 'daily', description: 'Wilder RSI(14)，范围 0–100。' },
   dailyVolumeRatio: { label: '日量比', aliases: ['完整日线量比', '日量比'], unit: '倍', min: 0, source: 'daily', description: '完整日成交量 ÷ 此前 20 根日线平均成交量，与行情源量比分开。' }
@@ -771,7 +777,11 @@ class Screener {
             const data = await cancellable(this.dailyLoader(row.symbol, signal), signal), bars = Array.isArray(data) ? data : data?.bars;
             if (signal.aborted) return;
             const daily = dailyIndicators(bars, now);
-            entry = { cutoff, fetchedAt: this.clock().getTime(), data: { ...Object.fromEntries(Object.keys(TECHNICAL_FIELDS).map(field => [field, daily[field]])), technicalAsOf: daily.asOf, technicalSource: data.source || '来源未标注' } };
+            if (!Array.isArray(data) && Object.hasOwn(data, 'dailyEvidence')
+              && (!preparedHistoryValid(data, row.symbol, 'stock', this.clock().getTime()) || daily.asOf !== data.dailyEvidence?.asOf))
+              throw Object.assign(Error('日线证据无效或未覆盖最近完整交易日'), { code: 'invalid' });
+            const fetchedAt = !Array.isArray(data) && Number.isFinite(data.fetchedAt) ? data.fetchedAt : this.clock().getTime();
+            entry = { cutoff, fetchedAt, data: { ...Object.fromEntries(Object.keys(TECHNICAL_FIELDS).map(field => [field, daily[field]])), technicalAsOf: daily.asOf, technicalSource: data.source || '来源未标注' } };
             this.dailyCache.set(row.symbol, entry);
             cache.fetched++;
             if (candidateCache) {

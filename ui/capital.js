@@ -58,7 +58,7 @@ $('capital-form').addEventListener('submit', event => {
     try {
       if (!capitalPending) {
         const accountCreatedAt = state.account.createdAt;
-        if (!await confirmDialog('确认追加虚拟本金', `向当前模拟账户追加 <b>¥ ${num(amount)}</b>。<p>资金先计入手动可用余额，之后可划拨给策略。初始本金、持仓、委托和交易历史全部保留；追加金额不计入盈利。</p>`)) return;
+        if (!await confirmDialog('确认追加虚拟本金', `向当前模拟账户追加 <b>¥ ${num(amount)}</b>。<p>资金先计入未分配资金，之后可划拨给策略。初始本金、持仓、委托和交易历史全部保留；追加金额不计入盈利。</p>`)) return;
         if (state.account.createdAt !== accountCreatedAt) throw Error('模拟账户已变更，请重新确认追加本金');
         capitalPending = { amount, requestId: crypto.randomUUID(), accountCreatedAt };
       }

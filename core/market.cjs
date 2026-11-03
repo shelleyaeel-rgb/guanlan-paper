@@ -1,16 +1,18 @@
 const { cnTime, session, symbolOf } = require('./common.cjs');
-const { SOURCES, INDEX_SYMBOLS, numeric, scaled, invalid, parseQuotes, parseSinaQuotes, validateBars, validateMinute, parseEastmoneyBars, parseEastmoneyIntraday } = require('./market-parsers.cjs');
+const { SOURCES, INDEX_SYMBOLS, numeric, scaled, invalid, parseQuotes, parseSinaQuotes, validateBars, validateMinute, parseSinaBars, parseEastmoneyBars, parseEastmoneyIntraday } = require('./market-parsers.cjs');
+const { DailyHistoryCache } = require('./daily-history-cache.cjs');
 const TENCENT_ENDPOINTS = ['https://proxy.finance.qq.com/ifzqgtimg', 'https://web.ifzq.gtimg.cn'];
 const RETRYABLE_STATUS = new Set([429, 500, 501, 502, 503, 504]);
 const QUOTE_BATCH_SIZE = 80, QUOTE_CONCURRENCY = 3;
 class Market {
-  constructor(fetcher = fetch, { clock = Date.now, requestTimeoutMs = 3500, cooldownMs = 30000 } = {}) {
+  constructor(fetcher = fetch, { clock = Date.now, requestTimeoutMs = 3500, cooldownMs = 30000, dailyHistory = null } = {}) {
     this.fetcher = fetcher; this.clock = clock; this.requestTimeoutMs = requestTimeoutMs; this.cooldownMs = cooldownMs;
     this.cache = new Map(); this.failures = new Map(); this.quoteActive = 0; this.quoteWaiters = [];
+    this.dailyHistory = dailyHistory || new DailyHistoryCache({ clock });
   }
   async request(url, gbk = false, signal = null) {
     const host = new URL(url).hostname;
-    const referrer = host.endsWith('sinajs.cn') ? 'https://finance.sina.com.cn/' : host.endsWith('eastmoney.com') ? 'https://quote.eastmoney.com/' : 'https://gu.qq.com/';
+    const referrer = host.endsWith('sinajs.cn') || host === 'quotes.sina.cn' ? 'https://finance.sina.com.cn/' : host.endsWith('eastmoney.com') ? 'https://quote.eastmoney.com/' : 'https://gu.qq.com/';
     const timeout = AbortSignal.timeout(this.requestTimeoutMs), combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
     combined.throwIfAborted();
     const response = await this.fetcher(url, { headers: { 'User-Agent': 'Mozilla/5.0', Referer: referrer }, signal: combined, cache: 'no-store' });
@@ -108,16 +110,26 @@ class Market {
       if (!Array.isArray(raw)) throw invalid(`未收到${label}`);
       return entry(validateBars(raw, this.clock()), 'tencent');
     } }));
+    // Try an independent provider before another gateway to the same Tencent
+    // service. This also leaves time for it inside the shared 12s deadline.
+    // Sina's series is unadjusted only; never use it for the qfq chart.
+    if (!qfq) candidates.splice(1, 0, this.sinaDailyCandidate(symbol, count, entry));
     const params = new URLSearchParams({ secid: `${symbol.startsWith('sh') ? 1 : 0}.${symbol.slice(2)}`, klt: '101', fqt: qfq ? '1' : '0', beg: '0', end: '20500101', lmt: String(count + 1), ut: '7eea3edcaed734bea9cbfc24409ed989', fields1: 'f1,f2,f3,f4,f5,f6', fields2: 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61' });
     candidates.push({ key: `daily:${adjustment}:eastmoney`, name: SOURCES.eastmoney, load: async signal => entry(parseEastmoneyBars(await this.request(`https://push2his.eastmoney.com/api/qt/stock/kline/get?${params}`, false, signal), symbol, this.clock()).slice(-(count + 1)), 'eastmoney') });
     return this.route(label, candidates, signal, force);
+  }
+  sinaDailyCandidate(symbol, count, entry) {
+    const query = new URLSearchParams({ symbol, scale: '240', ma: 'no', datalen: String(count + 1) });
+    return { key: 'daily:raw:sina', name: SOURCES.sina, load: async signal => entry(
+      parseSinaBars(await this.request(`https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData?${query}`, false, signal), this.clock()).slice(-(count + 1)), 'sina') };
   }
   async history(symbol, force = false) {
     symbol = symbolOf(symbol);
     const hit = this.cache.get(symbol);
     if (!force && hit && this.clock() - hit.fetchedAt < 60000) return hit;
     const entry = await this.daily(symbol, 'qfq', 640, null, force);
-    if (entry.bars.length < 30) throw Error('前复权日线不足，暂时无法分析');
+    // A newly listed stock can still be charted. Analysis applies its own
+    // complete-bar requirements without blocking the available price history.
     this.cache.set(symbol, entry); return entry;
   }
   async intraday(symbol) {
@@ -134,12 +146,16 @@ class Market {
     return this.route('分时', candidates);
   }
   async strategyHistory(symbol, signal = null, withMetadata = false, force = false) {
-    const entry = await this.daily(symbol, 'raw', 120, signal, force);
+    symbol = symbolOf(symbol);
+    const entry = await this.dailyHistory.load(symbol, 'stock', sharedSignal => this.daily(symbol, 'raw', 120, sharedSignal, force), { signal, force });
     return withMetadata ? entry : entry.bars;
   }
   async indexHistory(symbol, signal = null, force = false) {
     signal?.throwIfAborted();
     if (!INDEX_SYMBOLS.has(symbol)) throw Error('市场环境仅支持上证指数、深证成指、创业板指');
+    return this.dailyHistory.load(symbol, 'index', sharedSignal => this.fetchIndexHistory(symbol, sharedSignal, force), { signal, force });
+  }
+  async fetchIndexHistory(symbol, signal = null, force = false) {
     const key = `index-history:${symbol}`, cached = this.cache.get(key);
     if (!force && cached && this.clock() - cached.fetchedAt < 60000) return cached;
     const entry = (bars, provider) => ({ symbol, bars, provider, source: SOURCES[provider], adjustment: '未复权', fetchedAt: this.clock() });
@@ -148,6 +164,7 @@ class Market {
       if (json?.code != null && json.code !== 0) throw invalid('腾讯指数日线返回错误');
       return entry(validateBars(json?.data?.[symbol]?.day, this.clock()), 'tencent');
     } }));
+    candidates.splice(1, 0, this.sinaDailyCandidate(symbol, 120, entry));
     const params = new URLSearchParams({ secid: `${symbol.startsWith('sh') ? 1 : 0}.${symbol.slice(2)}`, klt: '101', fqt: '0', beg: '0', end: '20500101', lmt: '121', ut: '7eea3edcaed734bea9cbfc24409ed989', fields1: 'f1,f2,f3,f4,f5,f6', fields2: 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61' });
     candidates.push({ key: 'index-daily:eastmoney', name: SOURCES.eastmoney, load: async signal => entry(parseEastmoneyBars(await this.request(`https://push2his.eastmoney.com/api/qt/stock/kline/get?${params}`, false, signal), symbol, this.clock()).slice(-121), 'eastmoney') });
     const result = await this.route('指数未复权日线', candidates, signal, force);

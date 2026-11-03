@@ -1,6 +1,7 @@
 const { setTimeout: delay } = require('node:timers/promises');
 const { symbolOf, cnTime } = require('./common.cjs');
 const { parseTencentScreenQuotes, TENCENT_SCREEN_SOURCE } = require('./screener-tencent.cjs');
+const { sharedSourceJob } = require('./shared-source-job.cjs');
 
 const LIST_BASE = 'https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.';
 const PAGE_SIZE = 80, QUOTE_BATCH = 50, LIST_CONCURRENCY = 3, UNIVERSE_MAX_AGE_MS = 30 * 60000;
@@ -114,7 +115,7 @@ class FreeScreenerSource {
       else if (job.progress) subscriber.progress(job.progress);
     });
   }
-  loadBreadth(options = {}) {
+  getBreadthSource() {
     if (!this.breadthSource) {
       const { MarketBreadthSource } = require('./market-breadth-source.cjs');
       const { EastmoneyStockUniverseSource } = require('./stock-universe-source.cjs');
@@ -123,8 +124,10 @@ class FreeScreenerSource {
         universeLoader: new EastmoneyStockUniverseSource(this.request.bind(this), { clock: this.clock })
       });
     }
-    return this.breadthSource.load(options);
+    return this.breadthSource;
   }
+  loadBreadth(options = {}) { return this.getBreadthSource().load(options); }
+  prepareUniverse(options = {}) { return this.getBreadthSource().prepareUniverse(options); }
   async universeCount(signal) {
     const value = await this.request(LIST_BASE + 'getHQNodeStockCount?node=hs_a', signal);
     if (!['number', 'string'].includes(typeof value) || !/^\d+$/.test(String(value)) || !Number.isSafeInteger(Number(value)) || Number(value) < 1 || Number(value) > 15000) throw invalid('新浪股票列表总数无效');
@@ -132,14 +135,18 @@ class FreeScreenerSource {
   }
   async validateUniverse(universe, { signal } = {}) {
     if (await this.universeCount(signal) !== universe.sourceCount) {
-      this.universe = null;
+      if (this.universe === universe) this.universe = null;
       throw invalid('股票池在报价获取期间发生变化，请重新选股');
     }
   }
-  async loadUniverse({ signal, onProgress = () => {} } = {}) {
+  loadUniverse(options = {}) {
+    return sharedSourceJob(this, 'pendingUniverse', options, work => this.loadUniverseShared(work));
+  }
+  async loadUniverseShared({ signal, onProgress = () => {}, force = false, refreshBeforeMs = 0 } = {}) {
     onProgress({ loading: true, stage: 'universe', completed: 0, total: 0 });
     const total = await this.universeCount(signal), now = this.clock(), cached = this.universe;
-    if (!cached || cached.sourceCount !== total || now < cached.validatedAt || now - cached.validatedAt >= UNIVERSE_MAX_AGE_MS || cached.date !== cnTime(now).date) {
+    const reuseAge = UNIVERSE_MAX_AGE_MS - Math.min(UNIVERSE_MAX_AGE_MS, Math.max(0, Number(refreshBeforeMs) || 0));
+    if (force || !cached || cached.sourceCount !== total || now < cached.validatedAt || now - cached.validatedAt >= reuseAge || cached.date !== cnTime(now).date) {
       this.universe = null;
       const lists = await this.listPages(total, signal, onProgress), symbols = [], seen = new Set();
       let prior = '', excludedCount = 0;

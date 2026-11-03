@@ -2,6 +2,9 @@
 const { _electron } = require(process.env.GUANLAN_PLAYWRIGHT_PATH || 'playwright');
 const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
+async function revealPoolControl(selector) {
+  await page.locator(selector).evaluate(element => { for (let parent = element.parentElement; parent; parent = parent.parentElement) if (parent.tagName === 'DETAILS') parent.open = true; });
+}
 fs.mkdirSync(path.join(root, 'work'), { recursive: true });
 const output = fs.mkdtempSync(path.join(root, 'work/agency-monitoring-ui-'));
 const accountPath = path.join(output, 'account'), controlPath = path.join(output, 'control.json');
@@ -44,7 +47,7 @@ async function run() { await page.locator('#agency-pool-run').click(); await pag
   checks.push('default scan creates strategy monitors without common research conditions or misleading missing-research counts');
 
   await call('agency:member', { strategyId: 'ultra-short', symbol: 'sh600006', action: 'remove' });
-  await refresh(); await page.locator('#agency-pool-mode').selectOption('strict');
+  await refresh(); await revealPoolControl('#agency-pool-legacy'); await page.locator('#agency-pool-legacy').check();
   current = await run();
   assert.equal(members(current).find(member => member.symbol === 'sh600006').selectionMode, 'strict');
   const retained = members(current).find(member => member.symbol === 'sh600003');
@@ -53,6 +56,7 @@ async function run() { await page.locator('#agency-pool-run').click(); await pag
   assert.match(await page.locator('#agency-members').innerText(), /历史筛选记录：待核验/);
   assert.doesNotMatch(await page.locator('#agency-members').innerText(), /暂停新开仓，重新更新并通过后才恢复候选资格/);
   assert.match(await page.locator('#agency-pool-evidence-summary').innerText(), /资料收集完整（仍需内容核验）/);
+  await revealPoolControl('#agency-pool-legacy'); await page.locator('#agency-pool-legacy').uncheck();
   await page.locator('#agency-pool-mode').selectOption('strategy');
   await page.locator('#agency-pool-retry').click();
   await page.waitForFunction(() => !state.agencyPool.running && !agencyUi.busy.has('pool-retry'));

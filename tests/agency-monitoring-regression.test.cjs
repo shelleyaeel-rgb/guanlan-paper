@@ -2,8 +2,19 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Engine, initialState, validState } = require('../core/engine.cjs');
 const { AgencyService } = require('../core/agency-service.cjs');
+const { StrategyMonitor } = require('../core/strategy-monitor.cjs');
 const { addAgencyMembers } = require('../core/agency-members.cjs');
+const { ACTIVE_CANDIDATE_LIMIT } = require('../core/agency-capacity.cjs');
+const { TECHNICAL_ENTRY_POLICY } = require('../core/strategy-profiles.cjs');
 const { cnTime } = require('../core/common.cjs');
+
+function preparedMonitor(clock, snapshots) {
+  const calls = [], monitor = new StrategyMonitor({ strategyHistory: async () => { throw Error('交易不可获取日线'); } }, () => new Date(clock()));
+  monitor.snapshots = snapshots;
+  const read = monitor.readPrepared.bind(monitor);
+  monitor.readPrepared = (symbol, financial, notices) => { calls.push({ symbol, financial, notices }); return read(symbol, financial, notices); };
+  return { monitor, calls };
+}
 
 // Isolated synthetic data only: this fixture never opens a stored account or
 // calls a market/research provider. Its successful setup is a real engine buy.
@@ -32,49 +43,47 @@ function fixture(strategyId = 'swing', funding = 50000) {
   return { engine, quote, snapshot, add, execute, now: () => now, advance: ms => { now += ms; } };
 }
 
-test('默认监控批量加入300只后全量轮检，缺资料和行情的首批不阻塞后续280只', async () => {
-  const f = fixture(), symbols = Array.from({ length: 300 }, (_, i) => `sh${600000 + i}`), quotes = {}, loads = [];
+test('批量加入300只仅刷新20只活跃候选，280只候补保留且缺资料不阻塞其他活跃成员', async () => {
+  const f = fixture(), symbols = Array.from({ length: 300 }, (_, i) => `sh${600000 + i}`), quotes = {};
   let adding = true, evidenceCalls = 0;
-  const market = { quotes: async selected => Object.fromEntries(selected.filter(symbol => adding || !symbols.slice(0, 20).includes(symbol))
+  const market = { quotes: async selected => Object.fromEntries(selected.filter(symbol => adding || !symbols.slice(0, 2).includes(symbol))
     .map(symbol => [symbol, f.quote(symbol, { price: 9.9, ask: 9.9, bid: 9.89 })])) };
   const transaction = fn => fn();
   const added = await addAgencyMembers({ strategyId: 'swing', symbols }, {
     getEngine: () => f.engine, transaction, market, acceptQuotes: batch => Object.assign(quotes, batch) });
   assert.equal(added.added.length, 300); assert.deepEqual(added.failed, []); assert.deepEqual(added.skipped, []);
   adding = false;
+  const { monitor, calls: reads } = preparedMonitor(f.now, Object.fromEntries(symbols.map(symbol => [symbol,
+    symbols.slice(0, 2).includes(symbol) ? { error: '隔离样本日线暂不可用', fetchedAt: f.now() } : f.snapshot(symbol)])));
   const service = new AgencyService({ getEngine: () => f.engine, transaction, market,
     getQuotes: () => quotes, acceptQuotes: batch => Object.assign(quotes, batch), clock: f.now,
     getAutomaticEvidence: async () => { evidenceCalls++; throw Error('默认监控不应请求研究资料'); },
-    monitor: { load: async (symbol, force, financial, notices) => {
-      loads.push({ symbol, financial, notices });
-      return symbols.slice(0, 20).includes(symbol) ? { error: '隔离样本日线暂不可用', fetchedAt: f.now() } : f.snapshot(symbol);
-    } } });
+    monitor });
   try {
-    for (let batch = 1; batch <= 15; batch++) {
-      await service.poll(); await service.runner.drain();
-      const progress = service.publicState().coverage.swing;
-      assert.equal(progress.total, 300); assert.equal(progress.processed, batch * 20);
-      assert.equal(progress.remaining, 300 - batch * 20);
-    }
-    assert.deepEqual(loads.map(load => load.symbol), symbols);
-    assert.ok(loads.every(load => load.financial === false && load.notices === true));
+    await service.poll(); await service.runner.drain();
+    const progress = service.publicState().coverage.swing;
+    assert.equal(progress.total, ACTIVE_CANDIDATE_LIMIT); assert.equal(progress.processed, ACTIVE_CANDIDATE_LIMIT); assert.equal(progress.remaining, 0);
+    assert.deepEqual(reads.map(read => read.symbol), symbols.slice(0, ACTIVE_CANDIDATE_LIMIT));
+    const members = f.engine.s.agency.groups.find(group => group.id === 'swing').members;
+    assert.equal(members.filter(member => member.mode === 'standby').length, symbols.length - ACTIVE_CANDIDATE_LIMIT);
+    assert.ok(members.slice(ACTIVE_CANDIDATE_LIMIT).every(member => member.monitoringCheck === undefined));
+    assert.ok(reads.every(read => read.financial === false && read.notices === false));
     assert.equal(evidenceCalls, 0); assert.equal(f.engine.s.trades.length, 0);
     const blocked = f.engine.s.agency.decisions.filter(item => item.status === 'blocked' && item.symbol);
-    assert.deepEqual(blocked.map(item => item.symbol), symbols.slice(0, 20));
+    assert.deepEqual(blocked.map(item => item.symbol), symbols.slice(0, 2));
     assert.ok(blocked.every(item => /日线暂不可用/.test(item.message)));
-    assert.equal(f.engine.s.agency.decisions.filter(item => item.status === 'waiting').length, 280);
+    assert.equal(f.engine.s.agency.decisions.filter(item => item.status === 'waiting').length, ACTIVE_CANDIDATE_LIMIT - 2);
     assert.equal(service.publicState().coverage.swing.status, 'complete');
-    await service.poll(); await service.runner.drain(); assert.equal(loads.length, 300);
+    await service.poll(); await service.runner.drain(); assert.equal(reads.length, ACTIVE_CANDIDATE_LIMIT);
     assert.equal(validState(f.engine.s), true);
   } finally { service.stop(); }
 });
 
-test('默认监控仅放宽研究准入，缺公告、明确风险、过期行情、资金和盘口限制继续阻止开仓', () => {
+test('技术监控停用公告财务准入，日线价格基准行情资金与盘口限制仍阻止开仓', () => {
   const baseline = fixture(); baseline.add(); assert.ok(baseline.execute().quantity >= 100);
   const cases = [
-    { label: '公告缺失', change: (_f, _q, data) => { delete data.notices; }, reason: /公告/ },
-    { label: '明确公告风险', change: (f, _q, data) => { data.notices.status = 'ready'; data.notices.data = {
-      total: 1, items: [{ id: 'AN202609290001', date: cnTime(f.now()).date, title: '公司被立案调查公告' }] }; }, reason: /风险|公告/ },
+    { label: '日线缺失', change: (_f, _q, data) => { delete data.technical; }, reason: /日线/ },
+    { label: '价格基准不符', change: (_f, q) => { q.prevClose = 20; }, reason: /价格基准|除权/ },
     { label: '行情过期', change: (_f, q) => { q.timestamp -= 90001; }, reason: /行情|过期/ },
     { label: '盘口不足', change: (_f, q) => { q.askSize = 1; }, reason: /盘口|一档|数量|预算/ },
     { label: '资金不足', funding: 100, change: () => {}, reason: /资金|数量|预算/ }
@@ -86,7 +95,15 @@ test('默认监控仅放宽研究准入，缺公告、明确风险、过期行�
   }
   const long = fixture('long'); long.add(); const data = long.snapshot();
   data.technical.levels = { long: { support: 9.7, resistance: 11.5, entryLow: 9.9, entryHigh: 10.3, stop: 9.6, target: 11.5 } };
-  assert.throws(() => long.execute(long.quote(), data), /财务|估值/); assert.equal(long.engine.s.trades.length, 0);
+  data.technical.previousMa60 = 9.4; delete data.notices;
+  assert.ok(long.execute(long.quote(), data).quantity >= 100); assert.equal(long.engine.s.trades.length, 1);
+  assert.equal(long.engine.s.trades[0].strategyPlan.financeEvidence, undefined);
+  assert.equal(long.engine.s.trades[0].strategyPlan.entryPolicy.finance, 'disabled');
+  for (const mutate of [snapshot => { delete snapshot.notices; }, snapshot => { snapshot.notices.status = 'ready'; snapshot.notices.data = { total: 1, items: [{ id: 'AN202609290001', date: '2026-09-29', title: '公司被立案调查公告' }] }; }]) {
+    const f = fixture(); f.add(); const snapshot = f.snapshot(); mutate(snapshot);
+    const trade = f.execute(f.quote(), snapshot); assert.ok(trade.quantity >= 100);
+    assert.equal(trade.strategyPlan.entryRiskEvidence.notices.status, 'disabled');
+  }
 });
 
 test('默认监控成功开仓后退出仍遵守T+1并保留原退出目标', () => {
@@ -102,22 +119,20 @@ test('默认监控成功开仓后退出仍遵守T+1并保留原退出目标', ()
   assert.equal(f.engine.s.lots.length, 0); assert.equal(validState(f.engine.s), true);
 });
 
-test('单只资料服务抛错仍完成当前批次并继续下一批监控', async () => {
-  const f = fixture(), symbols = Array.from({ length: 25 }, (_, i) => `sh${600000 + i}`), quotes = {}, loads = [];
+test('单只后台资料获取失败仍完成其余19只活跃候选检查，不启动5只候补', async () => {
+  const f = fixture(), symbols = Array.from({ length: 25 }, (_, i) => `sh${600000 + i}`), quotes = {};
   for (const symbol of symbols) f.add(symbol);
+  const { monitor, calls: reads } = preparedMonitor(f.now, Object.fromEntries(symbols.map(symbol => [symbol,
+    symbol === symbols[0] ? { error: '隔离样本资料获取失败', fetchedAt: f.now() } : f.snapshot(symbol)])));
   const service = new AgencyService({ getEngine: () => f.engine, transaction: fn => fn(), clock: f.now,
     getQuotes: () => quotes, acceptQuotes: batch => Object.assign(quotes, batch),
     market: { quotes: async selected => Object.fromEntries(selected.map(symbol => [symbol, f.quote(symbol, { price: 9.9, ask: 9.9, bid: 9.89 })])) },
-    monitor: { load: async symbol => {
-      loads.push(symbol);
-      if (symbol === symbols[0]) throw Error('隔离样本资料获取失败');
-      return f.snapshot(symbol);
-    } } });
+    monitor });
   try {
     await service.poll(); await service.runner.drain();
-    assert.equal(service.publicState().coverage.swing.processed, 20);
+    assert.equal(service.publicState().coverage.swing.processed, ACTIVE_CANDIDATE_LIMIT);
     await service.poll(); await service.runner.drain();
-    assert.deepEqual(loads, symbols);
+    assert.deepEqual(reads.map(read => read.symbol), symbols.slice(0, ACTIVE_CANDIDATE_LIMIT));
     assert.equal(service.publicState().coverage.swing.status, 'complete');
     const member = f.engine.s.agency.groups.find(group => group.id === 'swing').members[0];
     assert.equal(member.monitoringCheck.status, 'data');
@@ -126,25 +141,49 @@ test('单只资料服务抛错仍完成当前批次并继续下一批监控', as
   } finally { service.stop(); }
 });
 
-test('买点通过后执行前取数抛错，将条件通过状态更新为数据待补齐且不成交', async () => {
+test('买点通过后后台资料变为失败，将条件通过状态更新为数据待补齐且不成交', async () => {
   const f = fixture(), quotes = {}; f.add();
   const member = f.engine.s.agency.groups.find(group => group.id === 'swing').members[0];
-  let loads = 0, observedEligible = false;
+  let quoteCalls = 0, observedEligible = false;
+  const { monitor } = preparedMonitor(f.now, { sz000001: f.snapshot() });
   const service = new AgencyService({ getEngine: () => f.engine, transaction: fn => fn(), clock: f.now,
     getQuotes: () => quotes, acceptQuotes: batch => Object.assign(quotes, batch),
     onChange: () => { observedEligible ||= member.monitoringCheck?.status === 'eligible'; },
-    market: { quotes: async selected => Object.fromEntries(selected.map(symbol => [symbol, f.quote(symbol)])) },
-    monitor: { load: async symbol => {
-      if (++loads === 2) throw Error('执行前日线获取失败');
-      return f.snapshot(symbol);
-    } } });
+    market: { quotes: async selected => {
+      if (++quoteCalls === 2) monitor.snapshots.sz000001 = { error: '执行前日线获取失败', fetchedAt: f.now() };
+      return Object.fromEntries(selected.map(symbol => [symbol, f.quote(symbol)]));
+    } }, monitor });
   try {
     await service.poll(); await service.runner.drain();
-    assert.equal(loads, 2); assert.equal(observedEligible, true);
+    assert.equal(quoteCalls, 2); assert.equal(observedEligible, true);
     assert.equal(member.monitoringCheck.status, 'data');
-    assert.equal(member.monitoringCheck.reason, '执行前日线获取失败');
-    assert.ok(f.engine.s.agency.decisions.some(item => item.status === 'blocked' && item.message === '执行前日线获取失败'));
+    assert.equal(member.monitoringCheck.entryPolicyVersion, TECHNICAL_ENTRY_POLICY.version);
+    assert.match(member.monitoringCheck.reason, /执行前日线获取失败/);
+    assert.ok(f.engine.s.agency.decisions.some(item => item.status === 'blocked' && /执行前日线获取失败/.test(item.message)));
     assert.equal(f.engine.s.trades.length, 0); assert.equal(f.engine.s.lots.length, 0);
     assert.equal(service.publicState().coverage.swing.status, 'complete'); assert.equal(validState(f.engine.s), true);
+  } finally { service.stop(); }
+});
+
+test('v8旧eligible重启后重新检查资料，失败写入当前政策结果且不沿用旧通过成交', async () => {
+  const f = fixture(); f.add();
+  const oldCheck = { status: 'eligible', reason: '旧规则曾通过', checkedAt: new Date(f.now() - 86400000).toISOString() };
+  f.engine.s.agency.groups.find(group => group.id === 'swing').members[0].monitoringCheck = oldCheck;
+  const engine = new Engine(structuredClone(f.engine.s), f.engine.clock);
+  const member = engine.s.agency.groups.find(group => group.id === 'swing').members[0];
+  assert.equal(member.monitoringCheck, undefined); assert.deepEqual(member.legacyMonitoringCheck, oldCheck);
+  const { monitor, calls } = preparedMonitor(f.now, { sz000001: { error: '重新检查时日线获取失败', fetchedAt: f.now() } });
+  let quoteRequests = 0;
+  const service = new AgencyService({ getEngine: () => engine, transaction: fn => fn(), clock: f.now,
+    getQuotes: () => ({}), acceptQuotes: () => {}, monitor,
+    market: { quotes: async () => { quoteRequests++; return { sz000001: f.quote() }; } } });
+  try {
+    await service.poll(); await service.runner.drain();
+    assert.equal(calls.length, 1); assert.equal(quoteRequests, 0, '资料未就绪不进入提交行情获取');
+    assert.equal(member.monitoringCheck.status, 'data'); assert.match(member.monitoringCheck.reason, /重新检查时日线获取失败/);
+    assert.equal(member.monitoringCheck.entryPolicyVersion, TECHNICAL_ENTRY_POLICY.version);
+    assert.deepEqual(member.legacyMonitoringCheck, oldCheck);
+    assert.equal(engine.s.trades.length, 0); assert.equal(engine.s.lots.length, 0); assert.equal(validState(engine.s), true);
+    assert.deepEqual(new Engine(structuredClone(engine.s), f.engine.clock).s, engine.s);
   } finally { service.stop(); }
 });

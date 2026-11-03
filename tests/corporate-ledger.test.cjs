@@ -31,6 +31,30 @@ function fixture() {
   return { engine, quote, snapshot, buy, event, source, process, group, sell, day };
 }
 
+test('首次开仓无需公司行为取证，成交后立即纳入权益核验且登记日权益可后补', () => {
+  const f = fixture();
+  assert.equal(f.engine.agencyNeedsCorporateEvidence('sz000001'), false);
+  assert.deepEqual(f.engine.agencyCorporateSymbols(), []);
+  f.day('2026-09-29'); const trade = f.buy(), cash = f.engine.s.cash;
+  assert.equal(f.engine.agencyNeedsCorporateEvidence('sz000001'), true);
+  assert.deepEqual(f.engine.agencyCorporateSymbols(), ['sz000001']);
+  f.day('2026-10-08');
+  assert.equal(f.process().status, 'clear');
+  assert.equal(f.engine.s.agency.corporateActions[0].entitlements[0].quantity, trade.quantity);
+  assert.equal(f.engine.s.cash - cash, trade.quantity * 10);
+  assert.equal(validState(f.engine.s), true);
+});
+
+test('开仓前仅行情核验的价格缓存不能在持仓后冒充已完成公司行为核验', () => {
+  const f = fixture(); f.buy();
+  const member = f.engine.s.agency.groups.find(group => group.id === 'swing').members[0];
+  assert.equal(member.exitPriceBasis.corporateVerified, false);
+  const result = f.engine.agencyAutomaticCheck('sz000001', f.quote(), { error: '日线获取失败' }, { allowVerifiedExit: true });
+  assert.equal(result.status, 'waiting'); assert.match(result.reason, /日线/);
+  assert.notEqual(result.exitOnly, true);
+  assert.equal(validState(f.engine.s), true);
+});
+
 test('巨潮目录证据保留原来源和链接，缺失实施资料不改变账户权益', () => {
   const f = fixture(), source = f.source([]);
   const notice = { id: 'CN1225601360', title: '权益分派实施公告', date: '2026-09-28', corporateStage: 'implemented',
@@ -274,15 +298,15 @@ test('免税转增本身可自动处理，后续现金分红的新增股份税�
 
 test('干净旧v1账户迁移到当前版本，成交与资金保留，版本降级和未知版本拒绝', () => {
   const f = fixture(); f.buy(); const legacy = structuredClone(f.engine.s);
-  legacy.agency.version = 1; delete legacy.agency.corporateActions; delete legacy.agency.corporateChecks; delete legacy.agency.entryConditionsVersion; delete legacy.agency.monitoringVersion;
-  delete legacy.agency.poolVersion; delete legacy.agency.pool; delete legacy.agency.poolAuthorizationRevision;
+  legacy.agency.version = 1; delete legacy.agency.corporateActions; delete legacy.agency.corporateChecks; delete legacy.agency.entryConditionsVersion; delete legacy.agency.monitoringVersion; delete legacy.agency.legacyManual;
+  delete legacy.agency.poolVersion; delete legacy.agency.pool; delete legacy.agency.poolAuthorizationRevision; delete legacy.agency.technicalTradingVersion;
   const before = { cash: legacy.cash, trades: structuredClone(legacy.trades), lots: structuredClone(legacy.lots), revision: legacy.agency.revision };
   assert.equal(validState(legacy), true);
-  const migrated = new Engine(legacy, f.engine.clock); assert.equal(migrated.s.agency.version, 5); assert.equal(migrated.agencyState().version, 5);
+  const migrated = new Engine(legacy, f.engine.clock); assert.equal(migrated.s.agency.version, 8); assert.equal(migrated.agencyState().version, 8);
   assert.equal(migrated.s.cash, before.cash); assert.deepEqual(migrated.s.trades, before.trades); assert.deepEqual(migrated.s.lots, before.lots);
-  assert.equal(migrated.s.agency.revision, before.revision + 4);
+  assert.equal(migrated.s.agency.revision, before.revision + 7);
   const again = new Engine(structuredClone(migrated.s), f.engine.clock); assert.equal(again.s.agency.revision, migrated.s.agency.revision);
-  for (const version of [1, 2, 3, 4, 6]) { const bad = structuredClone(migrated.s); bad.agency.version = version; assert.equal(validState(bad), false); assert.throws(() => new Engine(bad), /格式/); }
+  for (const version of [1, 2, 3, 4, 5, 6, 7, 9]) { const bad = structuredClone(migrated.s); bad.agency.version = version; assert.equal(validState(bad), false); assert.throws(() => new Engine(bad), /格式/); }
   const incomplete = structuredClone(migrated.s); delete incomplete.agency.corporateActions; assert.equal(validState(incomplete), false);
 });
 

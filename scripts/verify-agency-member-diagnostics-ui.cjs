@@ -2,6 +2,9 @@
 const { _electron } = require(process.env.GUANLAN_PLAYWRIGHT_PATH || 'playwright');
 const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
+async function revealPoolControl(selector) {
+  await page.locator(selector).evaluate(element => { for (let parent = element.parentElement; parent; parent = parent.parentElement) if (parent.tagName === 'DETAILS') parent.open = true; });
+}
 fs.mkdirSync(path.join(root, 'work'), { recursive: true });
 const output = fs.mkdtempSync(path.join(root, 'work/agency-member-diagnostics-ui-'));
 const accountPath = path.join(output, 'account'), controlPath = path.join(output, 'control.json');
@@ -73,7 +76,7 @@ function unchanged(current, initial) {
 }
 (async () => {
   scenario({ retryResolves: true, poolOnlySwing: true, poolSymbols: [symbol] }); await launch(); const initial = await call('state');
-  await page.locator('#agency-pool-mode').selectOption('strict');
+  await revealPoolControl('#agency-pool-legacy'); await page.locator('#agency-pool-legacy').check();
   await page.locator('#agency-pool-run').click();
   await page.waitForFunction(() => state.agencyPool.lastResult && !state.agencyPool.running && !agencyUi.busy.has('pool-run'));
   assert.equal(member(await call('state')).selectionMode, 'strict');

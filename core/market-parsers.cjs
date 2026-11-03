@@ -64,10 +64,26 @@ function validateBars(raw, now = Date.now()) {
     if (!Array.isArray(a)) throw invalid('日线格式异常');
     return { date: a[0], open: numeric(a[1]), close: numeric(a[2]), high: numeric(a[3]), low: numeric(a[4]), volume: scaled(a[5], 100) };
   });
+  return validatePriceBars(bars, now);
+}
+function validatePriceBars(bars, now) {
   if (bars.some((b, i) => !validDate(b.date) || ![b.open, b.close, b.high, b.low, b.volume].every(Number.isFinite) || b.low <= 0 || b.high < Math.max(b.open, b.close) || b.low > Math.min(b.open, b.close) || b.volume < 0 || (i && b.date <= bars[i - 1].date))) throw invalid('日线价格、成交量或日期顺序异常');
   const filtered = bars.filter(b => b.date <= cnTime(now).date);
   if (!filtered.length) throw invalid('未收到截至当前日期的日线');
   return filtered;
+}
+function parseSinaBars(json, now = Date.now()) {
+  if (!Array.isArray(json) || !json.length) throw invalid('新浪未返回有效日线');
+  // The 240-minute endpoint returns daily unadjusted OHLC and volume in
+  // shares, including STAR stocks and indices. Do not apply Tencent's lot
+  // conversion or accept a minute timestamp as evidence of a completed day.
+  const bars = json.map(row => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)
+        || !['open', 'close', 'high', 'low', 'volume'].every(key => ['number', 'string'].includes(typeof row[key])))
+      throw invalid('新浪日线格式异常');
+    return { date: row.day, open: numeric(row.open), close: numeric(row.close), high: numeric(row.high), low: numeric(row.low), volume: numeric(row.volume) };
+  });
+  return validatePriceBars(bars, now);
 }
 function eastmoneyData(json, symbol) {
   const data = json?.data, market = symbol.startsWith('sh') ? 1 : 0;
@@ -99,4 +115,4 @@ function parseEastmoneyIntraday(json, symbol, now) {
   });
   return { ...validateMinute(date, points, now), prevClose: numeric(data.preClose) };
 }
-module.exports = { SOURCES, INDEX_SYMBOLS, numeric, scaled, invalid, parseQuotes, parseSinaQuotes, validateBars, validateMinute, parseEastmoneyBars, parseEastmoneyIntraday };
+module.exports = { SOURCES, INDEX_SYMBOLS, numeric, scaled, invalid, parseQuotes, parseSinaQuotes, validateBars, validateMinute, parseSinaBars, parseEastmoneyBars, parseEastmoneyIntraday };

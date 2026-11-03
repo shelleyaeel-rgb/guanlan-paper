@@ -4,6 +4,10 @@ const fs = require('node:fs');
 const { Engine, initialState } = require('./core/engine.cjs');
 const { Store } = require('./core/store.cjs');
 const { Market } = require('./core/market.cjs');
+const { StockSearch } = require('./core/stock-search.cjs');
+const { IndexMarket } = require('./core/index-market.cjs');
+const { DailyHistoryCache } = require('./core/daily-history-cache.cjs');
+const { DailyHistoryStore } = require('./core/daily-history-store.cjs');
 const { analyze } = require('./core/analysis.cjs');
 const { evaluateEntry, configureStrategy, STRATEGY_PROFILES, strategyProfile } = require('./core/strategy.cjs');
 const { StrategyMonitor } = require('./core/strategy-monitor.cjs');
@@ -18,19 +22,19 @@ const { CompanyDocumentPool } = require('./core/company-document-pool.cjs');
 const { CompanyIndustrySource } = require('./core/company-industry-source.cjs');
 const { EntryEvidenceStore } = require('./core/entry-evidence-store.cjs');
 const { FreeScreenerSource } = require('./core/screener-sources.cjs');
-const { STRATEGY_PRESETS, parseStrategyDescription } = require('./core/strategy-presets.cjs');
+const { STRATEGY_PRESETS } = require('./core/strategy-presets.cjs');
 const { ScreenerStore } = require('./core/screener-store.cjs');
 const { Research, externalUrl } = require('./core/research.cjs');
-const { NoticeMonitor } = require('./core/notice-monitor.cjs');
+const { TECHNICAL_STRATEGY_PROFILES } = require('./core/strategy-profiles.cjs');
 const { AgencyService } = require('./core/agency-service.cjs');
 const { MarketRegimeService } = require('./core/market-regime-service.cjs');
 const { enableMarketPolicy, cachedBreadthLoader } = require('./core/market-policy.cjs');
 const { AgencyPoolService } = require('./core/agency-pool.cjs');
+const { AgencyPoolScheduler } = require('./core/agency-pool-scheduler.cjs');
 const { CorporateSource } = require('./core/corporate-source.cjs');
 const { CninfoNoticeSource } = require('./core/cninfo-notice-source.cjs');
 const { CorporateService } = require('./core/corporate-service.cjs');
-const { addAgencyMembers } = require('./core/agency-members.cjs');
-const { createEntryConditions, entryConditionNeedsFundamentals } = require('./core/entry-conditions.cjs');
+const { preparationState } = require('./core/preparation-state.cjs');
 const { symbolOf, session, cnTime } = require('./core/common.cjs');
 const { decisionView, accountView } = require('./core/view-state.cjs');
 const { ViewStream } = require('./core/view-stream.cjs');
@@ -41,39 +45,44 @@ let viewSubscribed = false;
 const testDirArg = process.argv.find(a => a.startsWith('--test-data-dir='));
 if (testDirArg && !app.isPackaged) app.setPath('userData', testDirArg.split('=').slice(1).join('='));
 if (!app.requestSingleInstanceLock()) app.quit();
-let win, store, engine, market, research, monitor, noticeMonitor, screener, agency, agencyPool, corporate, companyEvidence, companyIndustry, entryEvidenceStore, entryEvidenceWarning = '', agencyError = '', timer, noticeTimer, publishTimer, refreshing, previewSymbol = null, fatal = '', quotes = {}, connection = { ok: false, message: '正在连接行情服务', at: null };
-let marketRegime;
+let win, store, engine, market, research, monitor, screener, agency, agencyPool, corporate, companyEvidence, companyIndustry, entryEvidenceStore, entryEvidenceWarning = '', agencyError = '', timer, preparationTimer, publishTimer, refreshing, previewSymbol = null, fatal = '', quotes = {}, connection = { ok: false, message: '正在连接行情服务', at: null };
+let marketRegime, poolScheduler;
 const indices = ['sh000001', 'sz399001', 'sz399006'];
 function agencySymbols() { return engine.s.agency.groups.flatMap(g => g.members.map(m => m.symbol)); }
 // Automatic candidates are refreshed by the bounded rule-check queue. Routine
 // polling remains small so holding exits are independent of the candidate count.
-function strategySymbols() { return [...new Set([...engine.s.lots.map(l => l.symbol), ...engine.s.watchlist, ...(previewSymbol ? [previewSymbol] : [])])]; }
-function needsFundamentals(symbol) { return engine.s.agency.groups.some(g => g.members.some(m => m.symbol === symbol && (g.id === 'long' || entryConditionNeedsFundamentals(m.entryConditions)))) || (engine.selectedStrategy(symbol) === 'long' && !engine.s.lots.some(l => l.symbol === symbol)); }
-function needsNotices(symbol) { return agencySymbols().includes(symbol) || !engine.s.lots.some(l => l.symbol === symbol); }
+function strategySymbols() {
+  return [...new Set([...engine.s.lots.map(l => l.symbol), ...(previewSymbol ? [previewSymbol] : [])])];
+}
+function poolState() { return agencyPool ? { ...agencyPool.publicState(), automation: poolScheduler?.publicState() || null } : undefined; }
+async function refreshPreviewQuote(symbol) {
+  const identity = accountOperations.capture(), fresh = await market.quotes([symbol]);
+  accountOperations.assertCurrent(identity);
+  if (previewSymbol !== symbol) return;
+  if (!fresh[symbol]) throw Error('未取得该股票的有效报价，请核对代码或稍后刷新');
+  if (fresh[symbol] && (!quotes[symbol] || fresh[symbol].timestamp >= quotes[symbol].timestamp)) quotes[symbol] = fresh[symbol];
+  publish();
+}
+function needsFundamentals() { return false; }
+function needsNotices() { return false; }
 function state({ view = false } = {}) {
   const signals = {}, owners = new Map(engine.s.agency.groups.flatMap(group => group.members.map(member => [member.symbol, group])));
   for (const symbol of strategySymbols()) {
-    signals[symbol] = evaluateEntry(engine, symbol, quotes[symbol], monitor?.snapshots[symbol], undefined, engine.selectedStrategy(symbol));
-    if (signals[symbol].buyable && research) {
-      try { research.assertNoticeCurrent(symbol, monitor?.snapshots[symbol]?.notices); }
-      catch (error) {
-        signals[symbol].buyable = false; signals[symbol].quantity = 0; signals[symbol].economics = null;
-        signals[symbol].status = '等待公告重新核验'; signals[symbol].reasons.unshift(error.message);
-      }
-    }
     const owner = owners.get(symbol);
+    signals[symbol] = evaluateEntry(engine, symbol, quotes[symbol], monitor?.snapshots[symbol], undefined, owner?.id || engine.selectedStrategy(symbol), { technicalOnly: true });
+    signals[symbol].buyable = false; signals[symbol].economics = null; signals[symbol].quantity = 0;
     if (owner) {
       signals[symbol].buyable = false; signals[symbol].economics = null; signals[symbol].quantity = 0;
       signals[symbol].status = '策略自动交易管理';
-      signals[symbol].reasons.unshift(`由${owner.name}自动交易组管理，请在策略自动交易自选页查看规则检查与执行记录`);
-    }
+      signals[symbol].reasons.unshift(`由${owner.name}自动交易组管理，请在自动交易页查看规则检查与执行记录`);
+    } else signals[symbol].status = '只读分析 · 不提供手动开仓';
     if (fatal || !connection.ok) {
       signals[symbol].buyable = false;
-      if (signals[symbol].status === '规则通过 · 可模拟') signals[symbol].status = fatal ? '交易已暂停' : '等待有效行情';
+      signals[symbol].status = fatal ? '交易已暂停' : '等待有效行情';
       signals[symbol].reasons.unshift(fatal || '行情连接不可用，等待恢复');
     }
   }
-  return { account: view ? accountView(engine.s) : engine.s, accountPaused: !!fatal, stats: engine.stats(quotes), agency: { ...engine.agencyState(quotes, view ? { decisionView } : {}), runtime: { ...(agency ? agency.publicState() : { decisionMode: 'rules', rulesVersion: '1', intervalSeconds: 300, runningGroups: [], online: false, lastError: agencyError }), notices: noticeMonitor?.publicState() } }, agencyPool: agencyPool?.publicState(), quotes: { ...engine.s.marks, ...quotes }, signals, strategyProfiles: STRATEGY_PROFILES, planSelections: { ...engine.s.planSelections }, connection, session: session(), date: cnTime().date, now: Date.now(), dataPath: app.getPath('userData'), warning: fatal || store.warning || entryEvidenceWarning || agencyError };
+  return { account: view ? accountView(engine.s) : engine.s, accountPaused: !!fatal, stats: engine.stats(quotes), agency: { ...engine.agencyState(quotes, view ? { decisionView } : {}), runtime: { ...(agency ? agency.publicState() : { decisionMode: 'rules', rulesVersion: '1', intervalSeconds: 300, runningGroups: [], online: false, lastError: agencyError }), preparation: preparationState(engine, monitor, quotes) } }, agencyPool: poolState(), quotes: { ...engine.s.marks, ...quotes }, signals, strategyProfiles: TECHNICAL_STRATEGY_PROFILES, planSelections: { ...engine.s.planSelections }, connection, session: session(), date: cnTime().date, now: Date.now(), dataPath: app.getPath('userData'), warning: fatal || store.warning || entryEvidenceWarning || agencyError };
 }
 function publish(snapshot) {
   clearTimeout(publishTimer); publishTimer = null;
@@ -100,7 +109,17 @@ function transaction(fn) {
   try { store.save(engine.s); return result; }
   catch (e) { engine.s = before; fatal = `账户保存失败，交易已暂停：${e.message}`; agency?.invalidate(); throw Error(fatal); }
 }
+function pollPreparation() {
+  if (fatal) return;
+  poolScheduler?.poll().catch(() => {});
+  // Data preparation has its own clock and never invokes the trading runner.
+  // A slow or unavailable routine quote request must not delay pre-open work.
+  marketRegime?.poll().catch(() => {});
+  corporate?.poll().catch(() => {});
+  agency?.prepareEntries().catch(() => {});
+}
 async function refresh() {
+  pollPreparation();
   if (refreshing) return refreshing;
   refreshing = (async () => {
     const identity = accountOperations.capture();
@@ -130,10 +149,8 @@ async function refresh() {
     // preparation. Rule scheduling never waits for the entire monitor queue.
     monitor.scan(holdings, holdings.filter(needsFundamentals), holdings.filter(needsNotices), 'holdings').catch(() => {});
     monitor.scan(symbolsToScan, symbolsToScan.filter(needsFundamentals), symbolsToScan.filter(needsNotices)).catch(() => {});
-    marketRegime?.poll().catch(() => {});
     agency?.sampleEntries().catch(() => {});
     agency?.poll().catch(() => {});
-    corporate?.poll().catch(() => {});
     const snapshot = state({ view: true }); publish(snapshot); return snapshot;
   })().finally(() => { refreshing = null; });
   return refreshing;
@@ -158,21 +175,32 @@ app.whenReady().then(() => {
       decode: value => value?.format === 'guanlan-account-with-entry-evidence' ? entryEvidenceStore.importAccount(value) : value
     });
     const loaded = store.load();
-    if (loaded && (!loaded.agency || loaded.agency.version !== 5 || loaded.agency.decisionMode !== 'rules' || !Array.isArray(loaded.agency.corporateActions))) store.backup(loaded);
+    if (loaded && (!loaded.agency || loaded.agency.version !== 8 || loaded.agency.decisionMode !== 'rules' || !Array.isArray(loaded.agency.corporateActions))) store.backup(loaded);
     engine = new Engine(loaded || initialState());
     enableMarketPolicy(engine.s);
     if (store.warning) for (const group of engine.s.agency.groups) engine.agencyMode({ strategyId: group.id, mode: 'stopped' });
     store.save(engine.s);
   }
   catch (e) { dialog.showErrorBox('观澜 · 账户无法载入', `${e.message}\n数据目录：${app.getPath('userData')}`); app.quit(); return; }
-  market = new Market((url, opts) => net.fetch(url, opts));
-  const entryMarket = new Market((url, opts) => net.fetch(url, opts));
+  const dailyHistory = new DailyHistoryCache({ store: new DailyHistoryStore(path.join(app.getPath('userData'), 'daily-history')),
+    onChange: ({ symbol, kind }) => {
+      if (kind === 'stock') {
+        if (monitor) delete monitor.snapshots[symbol];
+        agency?.entryContexts.delete(symbol); agency?.entryTracker.clear(symbol);
+      }
+      schedulePublish();
+    } });
+  market = new Market((url, opts) => net.fetch(url, opts), { dailyHistory });
+  const stockSearch = new StockSearch((url, opts) => net.fetch(url, opts));
+  const indexMarket = new IndexMarket((url, opts) => net.fetch(url, opts));
+  const entryMarket = new Market((url, opts) => net.fetch(url, opts), { dailyHistory });
   const noticeSource = new CninfoNoticeSource((url, opts) => net.fetch(url, opts));
   research = new Research((url, opts) => net.fetch(url, opts), { noticeSource });
   const screenSource = new FreeScreenerSource((url, opts) => net.fetch(url, opts));
   const loadBreadth = cachedBreadthLoader(screenSource);
   marketRegime = new MarketRegimeService({ indexHistory: (symbol, signal, force) => market.indexHistory(symbol, signal, force),
-    getQuotes: () => quotes, loadBreadth, onChange: schedulePublish });
+    getQuotes: async () => { const batch = await market.quotes(indices); Object.assign(quotes, batch); return batch; },
+    loadBreadth, prepareUniverse: options => screenSource.prepareUniverse(options), onChange: schedulePublish });
   const selectionEvidence = new SelectionEvidenceStore(app.getPath('userData'));
   companyEvidence = new CompanyEvidenceSource((url, opts) => net.fetch(url, opts), {
     directory: path.join(app.getPath('userData'), 'company-research'), parser: new CompanyDocumentPool({ maxBytes: 128 * 1024 * 1024 }), noticeSource });
@@ -202,25 +230,17 @@ app.whenReady().then(() => {
     acceptQuotes: batch => Object.assign(quotes, batch), onChange: schedulePublish, isAvailable: () => !fatal });
   monitor.corporate = corporate;
   try {
-    agency = new AgencyService({ getEngine: () => engine, transaction, market, entryMarket, monitor, noticeGuard: research,
+    agency = new AgencyService({ getEngine: () => engine, transaction, market, entryMarket, monitor,
       getMarketRegime: () => marketRegime.getSnapshot(),
       getQuotes: () => quotes, acceptQuotes: batch => Object.assign(quotes, batch),
-      getSelectionEvidence: symbol => selectionEvidence.list(symbol),
-      getAutomaticEvidence: automaticEvidence,
-      getNoticeEvidence: (symbol, options) => companyEvidence.getNotices(symbol, options),
       archiveEntryEvidence: payload => {
         if (entryEvidenceWarning) throw Error(entryEvidenceWarning);
         return entryEvidenceStore.archive(payload);
       },
       onChange: schedulePublish, isAvailable: () => !fatal && connection.ok });
   } catch (e) { agencyError = e.message; }
-  noticeMonitor = new NoticeMonitor({ research, getEngine: () => engine,
-    getPendingSymbols: () => agency?.pendingBuySymbols() || [],
-    isAvailable: () => !fatal && session().open && session().known !== false, onChange: schedulePublish });
-  // This timer does not wait for quote/history/report queues. Entry execution
-  // still forces a fresh check and validates its notice version before commit.
-  const pollNotices = () => noticeMonitor.poll().catch(() => {});
-  noticeTimer = setInterval(pollNotices, 5000); pollNotices();
+  // Event-risk announcement polling is disabled for technical automatic trading.
+  preparationTimer = setInterval(pollPreparation, 5000);
   win = new BrowserWindow({ width: 1536, height: 980, minWidth: 1120, minHeight: 760, backgroundColor: '#0b1220', title: '观澜 · A股模拟交易', icon: path.join(__dirname, 'assets/icon.png'), autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -240,31 +260,10 @@ app.whenReady().then(() => {
   });
   handler('agency:configure', input => { const result = transaction(() => engine.agencyConfigure(input)); publish(); return result; });
   handler('agency:mode', input => { const result = transaction(() => engine.agencyMode(input)); publish(); if (input.mode === 'running') agency?.poll({ force: true, groupIds: [input.strategyId] }).catch(() => {}); return result; });
-  handler('agency:member', async input => {
+  handler('agency:member', input => {
+    if (input?.action === 'add') throw Error('本版本只由策略筛选生成候选，不支持人工指定股票');
     const symbol = symbolOf(input?.symbol);
-    const epoch = engine.s.agency.epoch;
-    const request = { ...input, symbol, ...(input.action === 'add' ? { entryConditions: createEntryConditions(input.entryConditions, engine.clock()) } : {}) };
-    let memberQuote;
-    if (input.action === 'add') {
-      const fresh = await market.quotes([symbol]);
-      if (engine.s.agency.epoch !== epoch) throw Error('账户已重置，本次未加入，请重新选择股票');
-      if (!fresh[symbol]) throw Error('没有找到该股票的有效行情'); Object.assign(quotes, fresh);
-      memberQuote = fresh[symbol];
-    }
-    const result = transaction(() => {
-      if (engine.s.agency.epoch !== epoch) throw Error('账户已重置，本次未加入，请重新选择股票');
-      const member = engine.agencyMember(request);
-      if (memberQuote) engine.s.marks[symbol] = structuredClone(memberQuote);
-      return member;
-    }); publish();
-    if (input.action === 'add') monitor.load(symbol, true, needsFundamentals(symbol), true).then(() => agency?.poll({ force: true, groupIds: [input.strategyId] })).catch(() => {});
-    return result;
-  });
-  handler('agency:members:add', async input => {
-    const result = await addAgencyMembers(input, { getEngine: () => engine, transaction, market,
-      acceptQuotes: batch => Object.assign(quotes, batch) });
-    publish();
-    if (result.added.length) agency?.poll({ force: true, groupIds: [result.strategyId] }).catch(() => {});
+    const result = transaction(() => engine.agencyMember({ ...input, symbol })); publish();
     return result;
   });
   handler('agency:reconcile', input => { const result = transaction(() => engine.agencyReconcile(input)); publish(); return result; });
@@ -296,23 +295,24 @@ app.whenReady().then(() => {
     if (fatal || !connection.ok) throw Error(fatal || '行情连接不可用，等待恢复');
     return agency.poll({ force: true, ...(groupIds ? { groupIds } : {}) });
   });
-  handler('agency:pool:status', () => agencyPool.publicState());
-  handler('agency:pool:cancel', () => { agencyPool.cancel(); return true; });
-  const updateCandidatePool = async (retryEvidence, input = {}) => {
+  handler('agency:pool:status', poolState);
+  handler('agency:pool:cancel', () => { poolScheduler?.cancelToday(); agencyPool.cancel(); return true; });
+  const updateCandidatePool = async (retryEvidence, input = {}, automatic = false) => {
     if (fatal) throw Error(fatal);
     // Manual screening has no trading-session, daily-count or cooldown gate.
     // Keep progress visible while data requests run; execution retains its own gates.
     const progressTimer = setInterval(publishAgencyPoolProgress, 1000);
     try {
-      const result = await agencyPool.run({ retryEvidence, ...(input?.screeningMode !== undefined ? { screeningMode: input.screeningMode } : {}),
-        ...(input?.research !== undefined ? { research: input.research } : {}),
-        ...(input?.industry !== undefined ? { industry: input.industry } : {}),
-        ...(input?.performance !== undefined ? { performance: input.performance } : {}) });
+      // Old renderer drafts cannot restore retired automatic research gates.
+      const result = await agencyPool.run({ retryEvidence, automatic, screeningMode: 'strategy' });
       agency?.invalidate();
-      agency?.poll({ force: true }).catch(() => {});
+      agency?.prepareEntries().catch(() => {});
       return result;
     } finally { clearInterval(progressTimer); }
   };
+  poolScheduler = new AgencyPoolScheduler({ getEngine: () => engine, run: input => updateCandidatePool(false, input, true),
+    isBusy: () => !!agencyPool.active || !!screener.activeRun, isAvailable: () => !fatal,
+    onChange: schedulePublish });
   handler('agency:pool:run', input => updateCandidatePool(false, input));
   handler('agency:pool:retry', input => updateCandidatePool(true, input));
   handler('research:get', input => research.get(input));
@@ -360,74 +360,42 @@ app.whenReady().then(() => {
     if (!url) throw Error('证据记录不存在或来源链接不可用');
     await shell.openExternal(url); return true;
   });
-  handler('screener:parse', parseStrategyDescription);
-  handler('screener:status', () => screener.progress);
-  handler('screener:cancel', () => { screener.cancel(); return true; });
-  handler('screener:history', () => ({ snapshots: screener.history.list(), warning: screener.history.warning }));
-  handler('screener:run', input => screener.run(input?.query, engine.s.watchlist.slice(), input?.force === true, input?.snapshotId ?? null, input?.strategyId || null));
-  handler('screener:open', async input => {
-    const symbol = symbolOf(input);
-    previewSymbol = symbol;
-    // Company research remains accessible when quote services are unavailable.
-    try { const fresh = await market.quotes([symbol]); if (fresh[symbol]) quotes[symbol] = fresh[symbol]; } catch {}
-    monitor.load(symbol, false, needsFundamentals(symbol), needsNotices(symbol)).catch(() => {});
-    publish(); return symbol;
-  });
+  handler('market:search', input => stockSearch.search(input));
+  handler('market:indices', input => indexMarket.overview({ force: input?.force === true }));
   handler('detail', async input => {
-    const symbol = symbolOf(input.symbol); previewSymbol = symbol;
-    monitor.load(symbol, !!input.force, needsFundamentals(symbol), needsNotices(symbol)).catch(() => {});
-    const history = await market.history(symbol, !!input.force);
-    let minute = null, minuteError = null;
-    try { minute = await market.intraday(symbol); } catch (e) { minuteError = e.message; }
-    return { symbol, ...history, minute, minuteError, analysis: analyze(history.bars, quotes[symbol] || engine.s.marks[symbol]) };
-  });
-  handler('watch:add', async input => {
-    const symbol = symbolOf(input);
-    const identity = accountOperations.capture();
-    if (engine.s.watchlist.length >= 50) throw Error('自选股最多 50 只');
-    const found = await market.quotes([symbol]);
-    accountOperations.assertCurrent(identity);
-    if (!found[symbol]) throw Error('没有找到该股票的有效行情');
-    quotes[symbol] = found[symbol]; transaction(() => {
-      accountOperations.assertCurrent(identity);
-      if (!engine.s.watchlist.includes(symbol)) {
-        if (engine.s.watchlist.length >= 50) throw Error('自选股最多 50 只');
-        engine.s.watchlist.push(symbol);
-      }
-      engine.s.marks[symbol] = found[symbol];
-    }); publish(); return symbol;
-  });
-  handler('watch:remove', input => { const symbol = symbolOf(input); transaction(() => { engine.s.watchlist = engine.s.watchlist.filter(s => s !== symbol); }); publish(); });
-  operationHandler('trade', async (input, operation) => {
     const symbol = symbolOf(input.symbol);
-    const symbols = [...new Set([symbol, ...(input.side === 'buy' ? engine.s.lots.map(lot => lot.symbol) : [])])];
-    const fresh = await market.quotes(symbols); operation.assertCurrent(); Object.assign(quotes, fresh);
-    const trade = operation.commit(() => engine.execute({ ...input, symbol }, fresh[symbol], quotes)); publish(); return trade;
+    previewSymbol = symbol;
+    monitor.load(symbol, !!input.force, needsFundamentals(symbol), needsNotices(symbol)).catch(() => {});
+    // Each read can succeed independently: a daily-data outage must not hide
+    // a valid quote or intraday chart, and missing quotes must be visible.
+    const [dailyResult, minuteResult, quoteResult] = await Promise.allSettled([
+      market.history(symbol, !!input.force), market.intraday(symbol), refreshPreviewQuote(symbol)
+    ]);
+    const history = dailyResult.status === 'fulfilled' ? dailyResult.value : { bars: [], adjustment: '前复权' };
+    const minute = minuteResult.status === 'fulfilled' ? minuteResult.value : null;
+    const dailyError = dailyResult.status === 'rejected' ? dailyResult.reason.message : null;
+    const minuteError = minuteResult.status === 'rejected' ? minuteResult.reason.message : null;
+    const quoteError = quoteResult.status === 'rejected' ? quoteResult.reason.message : null;
+    return { symbol, ...history, minute, dailyError, minuteError, quoteError, analysis: analyze(history.bars, quotes[symbol] || engine.s.marks[symbol]) };
   });
-  operationHandler('order', (input, operation) => { const order = operation.commit(() => engine.place(input)); publish(); return order; });
-  operationHandler('strategy:buy', async (input, operation) => {
-    const symbol = symbolOf(input.symbol), strategyId = strategyProfile(input.strategyId).id;
-    if (strategyId !== engine.selectedStrategy(symbol)) throw Error('已选策略发生变化，请查看当前买卖计划后重新确认');
-    if (!input.expected || input.expected.strategyId !== strategyId) throw Error('请先查看并确认当前策略的买卖计划');
-    const snapshot = await monitor.load(symbol, true, needsFundamentals(symbol), needsNotices(symbol));
-    operation.assertCurrent();
-    const fresh = await market.quotes([...new Set([symbol, ...engine.s.lots.map(lot => lot.symbol)])]);
+  handler('detail:close', () => { previewSymbol = null; publish(); return true; });
+  // Retire write endpoints as well as their UI. An older renderer cannot
+  // silently create personal watchlists, orders or discretionary positions.
+  for (const channel of ['watch:add', 'watch:remove', 'trade', 'order', 'strategy:buy', 'strategy:select',
+    'agency:members:add', 'screener:parse', 'screener:run', 'screener:history', 'screener:status', 'screener:cancel', 'screener:open', 'risk'])
+    handler(channel, () => { throw Error('本版本仅提供自动模拟交易，此人工操作已移除'); });
+  operationHandler('legacy:exit', async (input, operation) => {
+    const symbol = symbolOf(input.symbol);
+    if (engine.s.agency.groups.some(group => group.members.some(member => member.symbol === symbol))
+      || !engine.s.lots.some(lot => lot.symbol === symbol && (!lot.owner || lot.owner === 'manual')))
+      throw Error('仅可退出历史手动持仓；策略持仓请使用策略退出安排');
+    const fresh = await market.quotes([symbol]);
     operation.assertCurrent(); Object.assign(quotes, fresh);
-    research.assertNoticeCurrent(symbol, snapshot?.notices);
-    const trade = operation.commit(() => {
-      research.assertNoticeCurrent(symbol, snapshot?.notices);
-      return engine.strategyEntry({ ...input, symbol }, fresh[symbol], snapshot, quotes);
-    });
+    const trade = operation.commit(() => engine.legacyExit({ ...input, symbol }, fresh[symbol], quotes));
     publish(); return trade;
-  });
-  handler('strategy:select', input => {
-    const symbol = symbolOf(input?.symbol), strategyId = strategyProfile(input?.strategyId).id;
-    transaction(() => engine.selectStrategy(symbol, strategyId)); previewSymbol = symbol;
-    monitor.load(symbol, false, needsFundamentals(symbol), needsNotices(symbol)).catch(() => {}); publish(); return strategyId;
   });
   handler('strategy:settings', input => { const next = configureStrategy(input); transaction(() => { engine.s.strategySettings = next; engine.s.agency.revision++; }); publish(); });
   handler('cancel', input => { transaction(() => engine.cancel(input)); publish(); });
-  handler('risk', input => { transaction(() => engine.setRisk(input.symbol, input)); publish(); });
   handler('settings', input => { transaction(() => engine.configure(input)); startTimer(); publish(); });
   handler('capital:add', input => {
     const flow = transaction(() => {
@@ -444,6 +412,7 @@ app.whenReady().then(() => {
     const next = new Engine(initialState(input.capital)).s;
     next.createdAt = new Date(Math.max(Date.now(), Date.parse(engine.s.createdAt) + 1)).toISOString();
     enableMarketPolicy(next); store.backup(engine.s); agency?.invalidate(); agencyPool?.cancel(); transaction(() => { engine.s = next; });
+    poolScheduler?.invalidate(); previewSymbol = null;
     quotes = {}; entryEvidenceWarning = ''; publish(); return true;
   });
   handler('backup', async () => {
@@ -463,4 +432,4 @@ app.whenReady().then(() => {
   win.loadFile(path.join(__dirname, 'ui/index.html'));
   win.webContents.once('did-finish-load', () => { refresh(); startTimer(); });
 });
-app.on('window-all-closed', () => { clearInterval(timer); clearInterval(noticeTimer); noticeMonitor?.stop(); agency?.stop(); agencyPool?.cancel(); void companyEvidence?.destroy?.(); app.quit(); });
+app.on('window-all-closed', () => { clearInterval(timer); clearInterval(preparationTimer); poolScheduler?.invalidate(); agency?.stop(); agencyPool?.cancel(); void companyEvidence?.destroy?.(); app.quit(); });

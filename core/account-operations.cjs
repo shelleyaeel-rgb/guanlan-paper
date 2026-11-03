@@ -1,6 +1,6 @@
 'use strict';
 const { createHash } = require('node:crypto');
-const CHANNELS = ['trade', 'order', 'strategy:buy', 'agency:transfer'];
+const CHANNELS = ['trade', 'order', 'strategy:buy', 'agency:transfer', 'legacy:exit'];
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().filter(key => value[key] !== undefined).map(key => [key, canonical(value[key])]));
@@ -13,7 +13,7 @@ function requestOf(channel, input, state) {
   return { id: requestId, channel, accountCreatedAt, digest: createHash('sha256').update(JSON.stringify(canonical(payload))).digest('hex') };
 }
 function entries(state) {
-  return [...(state.trades || []).map(record => [record, ['trade', 'strategy:buy']]),
+  return [...(state.trades || []).map(record => [record, ['trade', 'strategy:buy', 'legacy:exit']]),
     ...(state.orders || []).map(record => [record, ['order']]),
     ...(state.agency?.transfers || []).map(record => [record, ['agency:transfer']])];
 }

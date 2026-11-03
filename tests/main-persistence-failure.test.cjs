@@ -7,7 +7,7 @@ const { Engine, initialState } = require('../core/engine.cjs');
 function fixture({ saveError = null, tickError = null } = {}) {
   const mainPath = path.join(__dirname, '../main.cjs'), localRequire = createRequire(mainPath);
   const account = new Engine(initialState()).s;
-  account.watchlist = ['sh600519'];
+  account.watchlist = ['sh600519']; // Legacy field must not drive background work.
   const calls = { quotes: 0, ticks: 0, saves: 0, invalidations: 0 };
   const testing = {
     saveError, tickError, quoteError: null, quoteWait: null,
@@ -29,7 +29,7 @@ function fixture({ saveError = null, tickError = null } = {}) {
       return { sh600519: { symbol: 'sh600519', price: 100 + calls.quotes, source: 'isolated-test' } };
     } },
     monitor: { snapshots: {}, scan: async () => {} },
-    agency: { publicState: () => ({}), poll: async () => {}, sampleEntries: async () => {},
+    agency: { publicState: () => ({}), poll: async () => {}, sampleEntries: async () => {}, prepareEntries: async () => {},
       invalidate: () => { calls.invalidations++; } },
     store: { warning: '', save: () => { calls.saves++; if (testing.saveError) throw testing.saveError; } }
   };
@@ -37,7 +37,7 @@ function fixture({ saveError = null, tickError = null } = {}) {
     require: name => name === 'electron' ? { app: { requestSingleInstanceLock: () => true, on: () => {}, whenReady: () => ({ then: () => {} }), getPath: () => 'isolated-memory' } }
       : name === './core/strategy.cjs' ? { ...localRequire(name), evaluateEntry: () => ({ buyable: true, status: '规则通过 · 可模拟', reasons: [] }) } : localRequire(name) });
   vm.runInContext(fs.readFileSync(mainPath, 'utf8'), context, { filename: mainPath });
-  vm.runInContext('engine = testing.engine; market = testing.market; monitor = testing.monitor; agency = testing.agency; store = testing.store;', context);
+  vm.runInContext("engine = testing.engine; market = testing.market; monitor = testing.monitor; agency = testing.agency; store = testing.store; previewSymbol = 'sh600519';", context);
   return { testing, calls, refresh: () => vm.runInContext('refresh()', context),
     transaction: fn => { testing.transactionBody = fn; return vm.runInContext('transaction(testing.transactionBody)', context); } };
 }
@@ -49,7 +49,8 @@ test('正常行情刷新提交账户变化，继续执行后续刷新', async ()
     assert.equal(snapshot.warning, '');
     assert.equal(snapshot.connection.ok, true);
     assert.equal(snapshot.quotes.sh600519.price, 100 + index);
-    assert.equal(snapshot.signals.sh600519.buyable, true);
+    assert.equal(snapshot.signals.sh600519.buyable, false);
+    assert.match(snapshot.signals.sh600519.status, /只读分析/);
     assert.equal(f.testing.engine.s.cash, cash - 100 * index);
   }
   assert.deepEqual(f.calls, { quotes: 2, ticks: 2, saves: 2, invalidations: 0 });

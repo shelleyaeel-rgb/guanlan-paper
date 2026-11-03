@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { dailyIndicators } = require('../core/daily-indicators.cjs');
+const { prepareHistory } = require('../core/daily-history.cjs');
 const { technicals, evaluateEntry } = require('../core/strategy.cjs');
 const { analyze } = require('../core/analysis.cjs');
 const { parseDescription, validate, defaults, normalize, screen, Screener } = require('../core/screener.cjs');
@@ -119,6 +120,37 @@ test('技术扫描先过滤范围和快照条件，缓存复用与强制刷新�
   assert.equal(result.rows[0].volumeRatio, 9); assert.equal(result.rows[0].dailyVolumeRatio, 0.6); assert.equal(result.rows[0].technicalAsOf, '2026-09-29');
   assert.deepEqual(s.snapshot, before); await s.run(q, []); assert.equal(calls.length, 1);
   await s.run(q, [], true); assert.equal(calls.length, 2); assert.equal(s.progress.loading, false);
+});
+
+test('技术筛选复用有效日线缓存时保留原始获取时间，重新扫描不能把旧数据标成刚获取', async () => {
+  const fetchedAt = Date.parse('2026-09-30T09:00:00+08:00'), time = new Date(now);
+  const data = prepareHistory('sh600001', 'stock', { bars: bars(), source: '腾讯财经', provider: 'tencent', adjustment: '未复权', fetchedAt }, fetchedAt);
+  assert.ok(data);
+  const s = scanner(async () => ({ ...data, historyStatus: 'cached' }), [row()], () => time);
+  const query = parse(original), first = await s.run(query, []);
+  assert.equal(first.matched, 1); assert.equal(first.rows[0].technicalFetchedAt, fetchedAt);
+  assert.equal(first.rows[0].technicalAsOf, '2026-09-29'); assert.equal(first.rows[0].technicalSource, '腾讯财经');
+  assert.equal(s.dailyCache.get('sh600001').fetchedAt, fetchedAt);
+  time.setTime(time.getTime() + 300000);
+  const rechecked = await s.run(query, [], true);
+  assert.equal(rechecked.matched, 1); assert.equal(rechecked.rows[0].technicalFetchedAt, fetchedAt);
+  assert.equal(s.dailyCache.get('sh600001').fetchedAt, fetchedAt);
+});
+
+test('刚获取但滞后、串股或损坏的新日线证据不能进入有效技术筛选或缓存', async () => {
+  const entry = (symbol = 'sh600001', inputBars = bars(), at = now.getTime()) => prepareHistory(symbol, 'stock', {
+    bars: inputBars, source: '腾讯财经', provider: 'tencent', adjustment: '未复权', fetchedAt: at }, at);
+  const lagged = entry('sh600001', bars().slice(0, -1), Date.parse('2026-09-29T10:00:00+08:00'));
+  assert.ok(lagged); lagged.fetchedAt = now.getTime(); lagged.dailyEvidence.fetchedAt = now.getTime();
+  const foreign = entry('sh600002'), damaged = entry(), unverified = entry();
+  damaged.dailyEvidence.barsHash = '0'.repeat(64); unverified.dailyEvidence = null;
+  for (const [kind, data] of [['lagged', lagged], ['foreign', foreign], ['damaged', damaged], ['unverified', unverified]]) {
+    assert.equal(data.fetchedAt, now.getTime(), kind);
+    const s = scanner(async () => data), result = await s.run(parse('RSI大于0'), []);
+    assert.equal(result.status, 'unavailable', kind); assert.equal(result.matched, null, kind);
+    assert.equal(result.rows.length, 0, kind); assert.equal(result.technicalScan.failures.invalid, 1, kind);
+    assert.equal(result.technicalScan.failures.fetch, 0, kind); assert.equal(s.dailyCache.size, 0, kind);
+  }
 });
 
 test('所需快照指标缺失或无候选时不获取日线；无关快照字段不阻止技术筛选', async () => {
@@ -250,5 +282,9 @@ test('未复权日线接口传递取消信号，前复权字段不会被当成�
   const controller = new AbortController();
   await assert.rejects(market.strategyHistory('sh600001', controller.signal), /未收到未复权日线/);
   assert.ok(received[0].url.endsWith('120,')); assert.equal(new URL(received.at(-1).url).searchParams.get('fqt'), '0');
-  controller.abort(); assert.ok(received.every(r => r.signal.aborted));
+  controller.abort();
+  const completed = received.length;
+  await assert.rejects(market.strategyHistory('sh600001', controller.signal), { name: 'AbortError' });
+  assert.equal(received.length, completed, '已取消的调用不能启动新请求');
+  assert.equal(market.dailyHistory.pending.size, 0, '已结束的共享下载没有在途请求');
 });

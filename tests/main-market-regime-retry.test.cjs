@@ -79,7 +79,12 @@ test('公司行为与市场环境并行，返回前等待两者完成；一方�
 
 test('多个策略同时重试共用市场服务中的同一轮来源请求，失败仍暂停新开仓', async () => {
   const breadth = deferred(); let loads = 0;
-  const service = new MarketRegimeService({ clock: () => now, indexHistory: async () => ({}), getQuotes: () => ({}),
+  const bars = Array.from({ length: 70 }, (_, index) => ({
+    date: new Date(Date.parse('2026-10-16T00:00:00Z') - (69 - index) * 86400000).toISOString().slice(0, 10),
+    open: 100, close: 100, high: 101, low: 99, volume: 10000
+  }));
+  const service = new MarketRegimeService({ clock: () => now,
+    indexHistory: async symbol => ({ symbol, source: 'isolated index history', adjustment: '未复权', fetchedAt: now, bars }), getQuotes: () => ({}),
     loadBreadth: () => { loads++; return breadth.promise; } });
   const f = fixture({ marketService: service });
   const pending = STRATEGY_PROFILES.map(profile => f.handlers['agency:verify']({ strategyId: profile.id }));

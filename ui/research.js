@@ -6,13 +6,16 @@ const researchAmount = value => value == null ? '—' : num(value / 1e8);
 const researchPercent = value => value == null ? '—' : num(value) + '%';
 const researchPeriod = date => date ? date.slice(0, 4) + ({ '03-31': '一季报', '06-30': '中报', '09-30': '三季报', '12-31': '年报' }[date.slice(5)] || '') : '报告期未知';
 const researchCurrency = value => ({ CNY: '人民币', USD: '美元', HKD: '港元' }[value] || value || '币种未提供');
+function clearResearchSelection() { researchSymbol = null; researchGeneration++; researchData = {}; researchLoading = new Set(); researchEvidence = null; }
 function syncResearchStock() {
+  if (!selected || page !== 'market') return;
   $('research-stock').textContent = `${state?.quotes[selected]?.name || selected.slice(2)} · ${selected.toUpperCase()}`;
   if (researchSymbol === selected) return;
   researchSymbol = selected; researchGeneration++; researchData = {}; researchLoading = new Set();
   renderResearchEvidence(); loadResearch();
 }
 async function loadResearch(force = false, sections = researchSections()) {
+  if (!researchSymbol || page !== 'market') return;
   const symbol = researchSymbol, generation = researchGeneration;
   await Promise.all(sections.map(async section => {
     if (researchLoading.has(section)) return;
@@ -96,35 +99,7 @@ function setResearchTab(tab) {
   $('research-company').classList.toggle('hidden', tab !== 'company'); $('research-notices').classList.toggle('hidden', tab !== 'notices');
   loadResearch();
 }
-function rememberResearchEvidence(symbol, result = screenResult) {
-  const r = result, row = [...(r?.rows || []), ...(r?.riskExcluded || []), ...(r?.evidencePendingRows || []), ...(r?.evidenceFailedRows || [])].find(row => row.symbol === symbol);
-  if (!row) { researchEvidence = null; return; }
-  const excluded = !!r.riskExcluded?.some(item => item.symbol === symbol);
-  researchEvidence = { symbol, excluded, entryRisk: row.entryRisk, historical: r.dataMode === 'historical', fetchedAt: r.fetchedAt, source: r.source, quoteTime: row.timestamp, dailyDate: row.technicalAsOf, dailySource: row.technicalSource, dailyFetchedAt: row.technicalFetchedAt, financeReportDate: row.financeReportDate, financeNoticeDate: row.financeNoticeDate, financeSource: row.financeSource, financeFetchedAt: row.financeFetchedAt, labels: [...(r.strategyName ? [r.strategyName] : []), ...r.labels], checks: (excluded ? [] : r.query.rules).map(rule => {
-    const field = screenMeta.fields[rule.field], target = rule.valueField ? `${screenMeta.fields[rule.valueField].label} ${num(row[rule.valueField], 6)}` : `${rule.value} ${field.unit}`;
-    const personal = r.personalRules?.some(item => JSON.stringify(item) === JSON.stringify(rule));
-    return `${personal ? '我的附加条件 · ' : ''}${field.label} ${num(row[rule.field], 6)} ${field.unit} ${screenMeta.ops[rule.op]} ${target}`;
-  }), selectionEvidence: row.selectionEvidence ? structuredClone(row.selectionEvidence) : null, financeAnnualReports: structuredClone(row.financeAnnualReports || []) };
-  renderResearchEvidence();
-}
-function renderResearchEvidence() {
-  const r = researchEvidence, el = $('research-evidence'), visible = r?.symbol === selected;
-  el.classList.toggle('hidden', !visible);
-  el.innerHTML = visible ? `<details><summary>${r.excluded ? '查看风险排除依据' : '查看入选依据'} · ${r.historical ? '历史快照' : '当次筛选快照'}</summary><p>${r.labels.map(esc).join('；')}</p>${r.excluded ? '<p>本次风险检查未通过，未列为正常候选；技术与财务条件可能尚未评估。</p>' : ''}${r.checks.map(check => `<p>✓ ${esc(check)}</p>`).join('')}${entryRiskEvidence(r.entryRisk)}<p class="research-meta">${esc(r.source)} · 获取 ${esc(timeText(r.fetchedAt))}<br>报价 ${r.quoteTime ? esc(timeText(r.quoteTime)) : '时间未知'}${r.dailyDate ? `<br>${esc(r.dailySource || '日线来源未知')} · 完整日线 ${esc(r.dailyDate)} · 获取 ${esc(timeText(r.dailyFetchedAt))}` : ''}${r.financeReportDate ? `<br>${esc(r.financeSource || '财务来源未知')} · 财报 ${esc(r.financeReportDate)} · 公告 ${esc(r.financeNoticeDate)} · 获取 ${esc(timeText(r.financeFetchedAt))}` : ''}<br>这是最近一次从选股打开该股票时的依据。个人附加条件和修改后的筛选阈值仅用于当次选股，买卖计划按所选策略固定规则另行校验。下方资料单独获取，${r.historical ? '不属于该历史快照。' : '时间可能不同。'}</p></details>` : '';
-  if (visible && r.selectionEvidence) {
-    const details = el.querySelector('details');
-    const heading = details.querySelector('summary');
-    if (!r.excluded && r.selectionEvidence.status !== 'pass') heading.textContent = `${r.selectionEvidence.status === 'pending' ? '查看证据待核验依据' : '查看证据条件不符合依据'} · 当次筛选快照`;
-    const panel = document.createElement('section'); panel.className = 'research-selection-evidence';
-    panel.innerHTML = typeof renderSelectionEvidenceDetails === 'function' ? renderSelectionEvidenceDetails(r.selectionEvidence) : r.selectionEvidence.checks.map(check => `<p>${esc(check.label)}：${esc(check.reason)}</p>`).join('');
-    details.insertBefore(panel, details.querySelector('.research-meta'));
-  }
-  if (visible && r.financeAnnualReports?.length && r.checks.some(check => /三年|年度/.test(check))) {
-    const panel = document.createElement('section'); panel.className = 'research-table';
-    panel.innerHTML = `<h4>当次年度财务依据</h4>${table(['年报 / 币种', '公告 / 更新', '扣非归母净利润（亿原币）', '经营现金流（亿原币）', '年度加权 ROE'], r.financeAnnualReports.map(report => [`${esc(report.reportDate)}<br>${esc(researchCurrency(report.currency))}`, `${esc(report.noticeDate)}<br>${esc(report.updateDate || '未提供')}`, researchAmount(report.adjustedProfit), researchAmount(report.operatingCash), researchPercent(report.roe)]))}`;
-    el.querySelector('details').append(panel);
-  }
-}
+function renderResearchEvidence() { $('research-evidence').classList.add('hidden'); $('research-evidence').innerHTML = ''; }
 document.querySelectorAll('[data-research-tab]').forEach(button => button.addEventListener('click', () => setResearchTab(button.dataset.researchTab)));
 document.querySelector('.research-tabs').addEventListener('keydown', event => {
   if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;

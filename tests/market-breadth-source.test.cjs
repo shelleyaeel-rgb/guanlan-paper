@@ -223,3 +223,50 @@ test('广度预算到期切新浪不会取消仍有选股订阅的腾讯请求',
   gate.resolve(); assert.equal((await screen).rows.length, 1000);
   assert.equal(f.calls.filter(call => call.url.hostname === 'qt.gtimg.cn').length, 20);
 });
+
+test('盘前完整名单准备不抓报价，开盘主源复用全部分页名单并保留原校验时间', async () => {
+  const f = integratedFixture();
+  const prepared = await f.source.prepareUniverse();
+  assert.equal(prepared.symbols.length, 1000); assert.equal(prepared.validatedAt, NOW);
+  assert.equal(f.calls.filter(call => call.url.hostname === 'qt.gtimg.cn').length, 0);
+  assert.equal(f.calls.filter(call => call.url.hostname === 'hq.sinajs.cn').length, 0);
+  assert.equal(f.calls.filter(call => call.url.pathname.endsWith('getHQNodeData')).length, 13);
+  const breadth = await f.source.loadBreadth();
+  assert.equal(breadth.provider, 'tencent'); assert.equal(breadth.universeValidatedAt, NOW);
+  assert.equal(f.calls.filter(call => call.url.pathname.endsWith('getHQNodeData')).length, 13, 'opening reuses all prepared list pages');
+  assert.equal(f.calls.filter(call => call.url.hostname === 'qt.gtimg.cn').length, 20);
+});
+
+test('已预热的独立完整名单在备用报价阶段直接复用，仍在报价后复核身份边界', async () => {
+  const calls = [], fallback = { ...universe(), source: '备用完整名单' };
+  const f = fixture({ universeLoader: { load: async () => { calls.push('load'); return fallback; }, validate: async () => { calls.push('validate'); } } });
+  f.controls.universe = async () => { throw Error('新浪名单失败'); };
+  const prepared = await f.source.prepareUniverse(); assert.equal(prepared.source, fallback.source);
+  assert.deepEqual(f.calls.map(call => call.kind), ['universe']); assert.deepEqual(calls, ['load']);
+  f.controls.primary = unavailable;
+  const result = await f.source.load(); assert.equal(result.universeSource, fallback.source);
+  assert.deepEqual(calls, ['load', 'validate']); assert.equal(f.calls.filter(call => call.kind === 'universe').length, 1);
+});
+
+test('静态名单预热并发共享且只取消自己的订阅，最后取消后新调用重建', async () => {
+  const f = fixture(), pending = deferred(), controller = new AbortController(); let listSignal;
+  f.controls.universe = ({ signal }) => { listSignal = signal; return pending.promise; };
+  const first = f.source.prepareUniverse({ signal: controller.signal }), second = f.source.prepareUniverse();
+  await delay(1); controller.abort(); await assert.rejects(first); assert.equal(listSignal.aborted, false);
+  pending.resolve(universe()); assert.equal((await second).symbols.length, 1000);
+  assert.equal(f.calls.filter(call => call.kind === 'universe').length, 1);
+  const lastController = new AbortController();
+  f.controls.universe = ({ signal }) => { listSignal = signal; return new Promise(() => {}); };
+  const abandoned = f.source.prepareUniverse({ signal: lastController.signal }); await delay(1); lastController.abort();
+  await assert.rejects(abandoned); assert.equal(listSignal.aborted, true);
+  f.controls.universe = async () => universe(); assert.equal((await f.source.prepareUniverse()).symbols.length, 1000);
+});
+
+test('盘前名单强制重试仍尊重真实传输Retry-After，不在冷却期间发送请求', async () => {
+  let calls = 0;
+  const transport = new FreeScreenerSource(async () => { calls++; return new Response('busy', { status: 429, headers: { 'Retry-After': '60' } }); }, { spacingMs: 0 });
+  const f = fixture(); f.controls.universe = options => transport.loadUniverse(options);
+  await assert.rejects(f.source.prepareUniverse(), /HTTP 429/); assert.equal(calls, 1);
+  await assert.rejects(f.source.prepareUniverse({ force: true }), /本次未发送/); assert.equal(calls, 1);
+  assert.ok(!f.calls.some(call => call.kind === 'primary' || call.kind === 'quotes'));
+});

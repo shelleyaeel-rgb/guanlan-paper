@@ -1,4 +1,5 @@
 const { symbolOf, cnTime } = require('./common.cjs');
+const { sharedSourceJob } = require('./shared-source-job.cjs');
 
 const SOURCE = '东方财富沪深 A 股在市名单';
 const PAGE_SIZE = 100, MAX_AGE_MS = 30 * 60000, FAILURE_COOLDOWN_MS = 60000;
@@ -112,10 +113,14 @@ class EastmoneyStockUniverseSource {
       return true;
     } catch (error) { return this.failed(error, signal); }
   }
-  async load({ signal = new AbortController().signal, onProgress = () => {} } = {}) {
+  load(options = {}) {
+    return sharedSourceJob(this, 'pendingLoad', options, work => this.loadShared(work));
+  }
+  async loadShared({ signal, onProgress = () => {}, force = false, refreshBeforeMs = 0 } = {}) {
     this.checkCooldown(signal);
     try {
-      if (this.usable(this.cache)) {
+      const reuseAge = this.maxAgeMs - Math.min(this.maxAgeMs, Math.max(0, Number(refreshBeforeMs) || 0));
+      if (!force && this.usable(this.cache) && this.clock() - this.cache.validatedAt < reuseAge) {
         await this.validate(this.cache, { signal });
         onProgress({ loading: true, stage: 'universe', completed: this.cache.symbols.length, total: this.cache.symbols.length, cached: true, validatedAt: this.cache.validatedAt, source: SOURCE });
         return copyUniverse(this.cache);

@@ -3,6 +3,9 @@
 const { _electron } = require(process.env.GUANLAN_PLAYWRIGHT_PATH || 'playwright');
 const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
+async function revealPoolControl(selector) {
+  await page.locator(selector).evaluate(element => { for (let parent = element.parentElement; parent; parent = parent.parentElement) if (parent.tagName === 'DETAILS') parent.open = true; });
+}
 fs.mkdirSync(path.join(root, 'work'), { recursive: true });
 const output = fs.mkdtempSync(path.join(root, 'work/agency-pool-ui-'));
 const controlPath = path.join(output, 'control.json'), accountPath = path.join(output, 'account');
@@ -36,12 +39,12 @@ async function capture(name) {
   scenario({}); await launch();
   assert.equal(await page.locator('#agency-pool-retry').isVisible(), false);
   assert.equal(await page.locator('#agency-pool-mode').inputValue(), 'strategy');
-  await page.locator('#agency-pool-mode').selectOption('strict');
+  await revealPoolControl('#agency-pool-legacy'); await page.locator('#agency-pool-legacy').check();
   await page.locator('#agency-pool-policy summary').click();
   assert.match(await page.locator('#agency-pool-policy').innerText(), /近三年平均年度 ROE（%） ≥ 10/);
   assert.match(await page.locator('#agency-pool-policy').innerText(), /主行业前三或重要细分行业龙头/);
-  assert.match(await page.locator('.agency-pool-description').innerText(), /先对沪深全部 A 股进行财务与四策略数值筛选，再由程序/);
-  assert.match(await page.locator('#agency-pool-policy').innerText(), /严格研究筛选无需手工填写研究证据/);
+  assert.match(await page.locator('.agency-pool-description').innerText(), /使用稳健精选.*固定财务、产品证据和行业地位核验/);
+  assert.match(await page.locator('#agency-pool-legacy-settings').innerText(), /既有成员的严格资格和已保存条件继续生效/);
   await call('agency:transfer', { strategyId: 'swing', amount: 200000 });
   await call('agency:member', { strategyId: 'swing', symbol: 'sh600519', action: 'add' });
   await call('agency:mode', { strategyId: 'swing', mode: 'running' });
@@ -158,7 +161,7 @@ async function capture(name) {
   const diagnosticReason = '已找到2026年半年度报告公告，披露日期 2026-08-26，但全文尚未完整取得或未通过校验：PDF 下载超时；暂不能用作核验依据';
   const retrievalReason = '资料获取：2026年半年度报告全文读取失败：PDF 下载超时';
   const diagnosticBefore = await call('state');
-  await page.locator('#agency-pool-mode').selectOption('strict');
+  await revealPoolControl('#agency-pool-legacy'); await page.locator('#agency-pool-legacy').check();
   scenario({ diagnosticEvidenceReview: { mode: 'automatic', status: 'pending', checkedAt: Date.parse(settings.now),
     checks: [{ key: 'sourceIntegrity', label: '全文来源与时点核验', status: 'pending', reason: diagnosticReason, records: [] }],
     reasons: [retrievalReason] } });

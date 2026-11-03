@@ -2,6 +2,9 @@
 const { _electron } = require(process.env.GUANLAN_PLAYWRIGHT_PATH || 'playwright');
 const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict');
 const root = path.resolve(__dirname, '..');
+async function revealPoolControl(selector) {
+  await page.locator(selector).evaluate(element => { for (let parent = element.parentElement; parent; parent = parent.parentElement) if (parent.tagName === 'DETAILS') parent.open = true; });
+}
 fs.mkdirSync(path.join(root, 'work'), { recursive: true });
 const output = fs.mkdtempSync(path.join(root, 'work/research-metrics-ui-'));
 const accountPath = path.join(output, 'account'), controlPath = path.join(output, 'control.json'), networkLog = path.join(output, 'network.jsonl'), callsPath = path.join(output, 'calls.jsonl');
@@ -53,7 +56,7 @@ async function snapshot(name, selector) {
 (async () => {
   await launch(); const before = await call('state');
   assert.ok((await call('screener:meta')).research.fields.product.currentRevenue);
-  await page.locator('#agency-pool-mode').selectOption('product');
+  await revealPoolControl('#agency-pool-mode'); await page.locator('#agency-pool-mode').selectOption('product');
   assert.equal(await page.locator('#agency-research-controls [data-research-edit="enabled"]').inputValue(), 'observe');
   assert.equal(await page.locator('#agency-research-controls input').count(), 0);
   await page.locator('#agency-research-controls [data-research-edit="enabled"]').selectOption('filter');

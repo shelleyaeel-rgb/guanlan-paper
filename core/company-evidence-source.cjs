@@ -21,6 +21,21 @@ const copy = value => structuredClone(value);
 const plain = value => typeof value === 'string' ? value.trim() : '';
 const normalized = value => plain(value).normalize('NFKC').replace(/\s+/g, '');
 const validId = id => typeof id === 'string' && /^AN\d{10,30}$/.test(id) || isCninfoId(id);
+const ENTRY_METADATA = new Set(['fetchedAt', 'checkedAt', 'savedAt', 'downloadedAt', 'lastUsedAt', 'parsedAt', 'cached',
+  'cacheWarning', 'cacheWarnings', 'cacheKey', 'filePath', 'timings', 'progress', 'acquisition', 'entryEvidenceVersion', 'batchSize']);
+function entryFacts(value) {
+  if (Array.isArray(value)) return value.map(entryFacts);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().filter(key => !ENTRY_METADATA.has(key)).map(key => [key, entryFacts(value[key])]));
+}
+function entryFingerprint(bundle) {
+  // Keep source identity, body text/hashes, parser/page completeness, coverage
+  // and failures. Cache timing and acquisition progress are not new facts.
+  const failures = (bundle.acquisition?.issues || []).filter(issue => !issue.recovered)
+    .map(({ stage, code, documentId, message }) => ({ stage, code, documentId, message }));
+  return hash(JSON.stringify(entryFacts({ symbol: bundle.symbol, status: bundle.status, scope: bundle.scope,
+    documents: bundle.documents, coverage: bundle.coverage, errors: bundle.errors, noticeReview: bundle.noticeReview, failures })));
+}
 function dateOnly(value) {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}(?:$|[ T])/.test(value)) return null;
   const date = value.slice(0, 10), time = Date.parse(date);
@@ -126,6 +141,7 @@ class CompanyEvidenceSource {
     this.parser = parser || new CompanyDocumentParser({ maxBytes: maxPdfBytes });
     this.transport = transport || new CompanyEvidenceTransport((...args) => this.fetcher(...args), { clock, timeoutMs, ...transportOptions });
     this.bundles = new Map(); this.documents = new Map(); this.attachments = new Map(); this.pending = new Map(); this.pendingNotices = new Map(); this.requests = 0; this.waiters = [];
+    this.entryVersions = new Map();
     this.retainedSymbols = new Set(); this.batchSymbols = null; this.activeDocuments = new Map(); this.documentReferences = new Map();
     this.diskMetadata = new Map(); this.documentSizes = new WeakMap();
     if (this.directory) {
@@ -137,6 +153,20 @@ class CompanyEvidenceSource {
   destroy() {
     if (!this.destroying) this.destroying = Promise.resolve().then(() => { this._attachmentCache?.releaseRetention(); return this.parser.destroy?.(); }).catch(() => {});
     return this.destroying;
+  }
+  entryEvidenceVersion(inputSymbol) { return this.entryVersions.get(symbolOf(inputSymbol))?.version || 0; }
+  observeEntryEvidence(bundle, lane) {
+    const symbol = symbolOf(bundle.symbol), fingerprint = entryFingerprint(bundle);
+    const state = this.entryVersions.get(symbol) || { version: 0, fingerprints: {}, completedVersions: {} };
+    if (state.fingerprints[lane] !== fingerprint) {
+      state.fingerprints[lane] = fingerprint; state.version++;
+      this.entryVersions.set(symbol, state);
+    }
+    state.completedVersions[lane] = state.version;
+    // Capture the version before returning across an await; another finished
+    // response must not silently relabel this older result with its version.
+    bundle.entryEvidenceVersion = state.version;
+    return bundle;
   }
   beginBatch(options = {}) { const batch = this.transport.beginBatch(options); this.batchSymbols = new Set(); return batch; }
   endBatch() { this.batchSymbols = null; this.pruneMemory(); try { this.pruneDisk(); } catch {} }
@@ -669,10 +699,11 @@ class CompanyEvidenceSource {
     } catch { return null; }
   }
   saveBundle(bundle) {
+    this.observeEntryEvidence(bundle, 'research');
     bundle.cacheWarnings = [...new Set([...(bundle.cacheWarnings || []), ...(bundle.acquisition?.cacheWarnings || []),
       ...bundle.documents.flatMap(document => document.cacheWarnings || [document.cacheWarning]),
       ...(bundle.acquisition?.issues || []).flatMap(issue => issue.cacheWarnings || [])].filter(Boolean))];
-    const { documents, ...rest } = bundle;
+    const { documents, entryEvidenceVersion, ...rest } = bundle;
     const documentRefs = documents.map(document => ({ id: document.id, title: document.title, date: document.publishedAt, kind: document.kind, reportDate: document.reportDate,
       ...(isCninfoId(document.id) ? { source: '巨潮资讯', issuerSymbol: document.issuerSymbol, orgId: document.orgId, attachmentUrl: document.attachmentUrl } : {}) }));
     const saved = { version: 1, ...copy(rest), collectionVersion: COLLECTION_VERSION, documentRefs };
@@ -701,7 +732,7 @@ class CompanyEvidenceSource {
       bundle.acquisition.status = 'skipped';
       bundle.acquisition.code = clear ? 'no-sensitive-notices' : review.status === 'blocked' ? 'notice-title-blocked' : 'notice-index-unverified';
       if (!clear) bundle.errors = [...review.reasons];
-      return bundle;
+      return this.observeEntryEvidence(bundle, 'notices');
     }
     // Separate from full research collection. A new/corrected announcement or a
     // newly fetched index must not join an older set of requested documents.
@@ -754,7 +785,7 @@ class CompanyEvidenceSource {
       }
       bundle.status = coverage.complete ? 'ready' : bundle.documents.length ? 'partial' : 'unavailable';
       acquisition.status = acquisition.issues.length ? bundle.documents.length ? 'partial' : 'unavailable' : 'ready';
-      return bundle;
+      return this.observeEntryEvidence(bundle, 'notices');
     })().finally(() => this.pendingNotices.delete(key));
     this.pendingNotices.set(key, work);
     return copy(await work);
@@ -767,7 +798,15 @@ class CompanyEvidenceSource {
     // A forced index refresh still validates/reuses each selected body below.
     // Hydrating the entire old bundle here would duplicate those reads/hashes.
     const previous = force ? null : this.peek(symbol), now = this.clock();
-    if (!force && previous?.status === 'ready' && now >= previous.checkedAt && now - previous.checkedAt < this.cacheMs) return { ...previous, cached: true };
+    if (!force && previous?.status === 'ready' && now >= previous.checkedAt && now - previous.checkedAt < this.cacheMs) {
+      const known = this.entryVersions.get(symbol);
+      if (!known) return this.observeEntryEvidence({ ...previous, cached: true }, 'research');
+      if (known.completedVersions.research === known.version)
+        return { ...previous, cached: true, entryEvidenceVersion: known.completedVersions.research };
+      // Another completed lane may have corrected a body or observed failure.
+      // The old full cache cannot acquire that new version merely by being read;
+      // collect again using the existing directory/body cache and request policy.
+    }
     const task = this.collect(symbol, signal, onProgress, { retryFailed, force }).finally(() => this.pending.delete(symbol));
     this.pending.set(symbol, task); return copy(await task);
   }

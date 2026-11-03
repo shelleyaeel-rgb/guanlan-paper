@@ -14,8 +14,9 @@ const SYMBOL = 'sh600001';
 function bars(end = '2026-10-12') {
   const dates = []; let day = Date.parse(`${end}T10:00:00+08:00`);
   while (dates.length < 120) { const session = calendarSession(new Date(day)); if (session.open) dates.unshift(session.date); day -= 86400000; }
+  const level = i => i * 0.008 + Math.sin(i / 4 + 1.6) * 0.12 + (i % 2 === 0 ? 0.02 : -0.02);
   return dates.map((date, i) => {
-    const close = 10 + i * 0.008 + Math.sin(i / 4 + 1.6) * 0.12;
+    const close = 10.94 + level(i) - level(119);
     return { date, close, open: close, high: close + 0.1, low: close - 0.1, volume: i === 119 ? 150 : 100 };
   });
 }
@@ -56,7 +57,7 @@ function fixture(t, { persistent = false } = {}) {
   return { state, make, finance, daily, directory };
 }
 
-test('候选重试重新获取行情并重算四策略，成功财务与完整日线超过60秒仍复用', async t => {
+test('技术候选重试刷新行情并复用完整日线，财务公告与研究始终不请求', async t => {
   const f = fixture(t), s = f.make();
   const forceFlags = [], originalLoad = s.load.bind(s);
   s.load = force => { forceFlags.push(force); return originalLoad(force); };
@@ -65,30 +66,32 @@ test('候选重试重新获取行情并重算四策略，成功财务与完整�
   f.state.now += 120000; f.state.quote.pe = 100;
   const second = await runAgencyScreening(s, { force: false, retryEvidence: true });
   assert.deepEqual(forceFlags, [true, true]); assert.equal(f.state.calls.quotes.length, 2);
-  assert.equal(f.state.calls.finance.length, 1); assert.equal(f.state.calls.daily, 1);
-  assert.equal(f.state.calls.notices, 2); assert.equal(f.state.calls.evidence, 2);
-  assert.equal(second.strategies.long.failed.length, 1); assert.equal(second.strategies.swing.pass.length, 1);
-  assert.equal(second.coverage.cache.finance.hits, 1); assert.equal(second.coverage.cache.daily.hits, 1);
-  assert.equal(second.strategies.swing.pass[0].financeFetchedAt, INITIAL);
+  assert.equal(f.state.calls.finance.length, 0); assert.equal(f.state.calls.daily, 1);
+  assert.equal(f.state.calls.notices, 0); assert.equal(f.state.calls.evidence, 0);
+  assert.equal(second.strategies.long.pass.length, 1); assert.equal(second.strategies.swing.pass.length, 1);
+  assert.equal(second.coverage.cache.finance, null); assert.equal(second.coverage.cache.daily.hits, 1);
+  assert.equal(second.strategies.swing.pass[0].financeFetchedAt, undefined);
   assert.equal(second.strategies.swing.pass[0].technicalFetchedAt, INITIAL);
-  assert.equal(second.coverage.quantitativeStages.long.quotePossible, 0);
+  assert.equal(second.coverage.quantitativeStages.long.quotePossible, 1);
   assert.equal(second.coverage.quantitativeStages.swing.dailyRequired, 1);
-  assert.deepEqual(Object.keys(second.coverage.timings), ['quotes', 'finance', 'daily', 'notices', 'evidence', 'noticeRecheck']);
+  assert.deepEqual(Object.keys(second.coverage.timings), ['quotes', 'daily']);
+  assert.equal(second.coverage.researchChecks.status, 'disabled');
 });
 
-test('磁盘重启复用成功数值，namespace变化与强刷会重取更新后的披露版本', async t => {
+test('技术候选磁盘重启复用日线，namespace变化与强刷重取日线而不取财报', async t => {
   const f = fixture(t, { persistent: true });
   await runAgencyScreening(f.make()); f.state.now += 120000;
   const restored = f.make(), reused = await runAgencyScreening(restored);
-  assert.equal(f.state.calls.finance.length, 1); assert.equal(f.state.calls.daily, 1);
-  assert.equal(reused.coverage.cache.finance.hits, 1); assert.equal(reused.coverage.cache.daily.hits, 1);
+  assert.equal(f.state.calls.finance.length, 0); assert.equal(f.state.calls.daily, 1);
+  assert.equal(reused.coverage.cache.finance, null); assert.equal(reused.coverage.cache.daily.hits, 1);
   f.state.report = { updateDate: '2026-10-13', debtRatio: 80 };
   const refreshed = await runAgencyScreening(restored, { refreshQuantitative: true });
-  assert.equal(refreshed.strategies.long.failed.length, 1); assert.equal(refreshed.coverage.commonFailed, 1);
-  assert.equal(f.state.calls.finance.length, 2);
-  assert.equal(restored.screeningDataCache.get('finance', SYMBOL).reportVersion, '2026-06-30/2026-08-15/2026-10-13');
-  await runAgencyScreening(f.make()); assert.equal(f.state.calls.finance.length, 2, '更新后的有效披露也应复用');
-  await runAgencyScreening(f.make('provider-v2')); assert.equal(f.state.calls.finance.length, 3);
+  assert.equal(refreshed.strategies.long.pass.length, 1); assert.equal(refreshed.coverage.commonFailed, 0);
+  assert.equal(f.state.calls.finance.length, 0); assert.equal(f.state.calls.daily, 2);
+  assert.equal(restored.screeningDataCache.get('finance', SYMBOL), undefined);
+  await runAgencyScreening(f.make()); assert.equal(f.state.calls.daily, 2, '更新后的有效日线继续复用');
+  await runAgencyScreening(f.make('provider-v2')); assert.equal(f.state.calls.daily, 3);
+  assert.equal(f.state.calls.finance.length, 0); assert.equal(f.state.calls.notices, 0); assert.equal(f.state.calls.evidence, 0);
 });
 
 test('财务按源获取时点6小时及观察日期失效，不因本轮加载时间延长旧资料寿命', async t => {
@@ -129,11 +132,11 @@ test('错配日线重取失败保持待核验，不用旧缓存作通过或明�
   const f = fixture(t), s = f.make(); await runAgencyScreening(s);
   f.state.now += 120000; f.state.quote.prevClose = 11; f.state.dailyError = true;
   const result = await runAgencyScreening(s);
-  for (const id of ['ultra-short', 'short', 'swing']) {
+  for (const id of ['ultra-short', 'short', 'swing', 'long']) {
     assert.equal(result.strategies[id].pending.length, 1); assert.equal(result.strategies[id].failed.length, 0);
     assert.equal(result.strategies[id].pending[0].technicalError, 'fetch');
   }
-  assert.equal(result.strategies.long.pass.length, 1); assert.equal(s.screeningDataCache.get('daily', SYMBOL), undefined);
+  assert.equal(result.strategies.long.pass.length, 0); assert.equal(s.screeningDataCache.get('daily', SYMBOL), undefined);
 });
 
 test('缓存元数据版本损坏、未来观察时点及文件损坏回退获取，不中断候选扫描', async t => {
@@ -147,14 +150,15 @@ test('缓存元数据版本损坏、未来观察时点及文件损坏回退获�
   const result = await runAgencyScreening(f.make()); assert.equal(result.status, 'ready');
 });
 
-test('从默认切换严格筛选重用数值但不重用资格，缺失研究仍阻断严格结果', async t => {
+test('旧严格筛选参数不再启用研究；复用有效日线且研究失败不能影响技术筛选', async t => {
   const f = fixture(t), s = f.make();
   const first = await screenAgency(s);
   assert.equal(first.screeningMode, 'strategy'); assert.equal(first.strategies.swing.pass.length, 1); assert.equal(f.state.calls.evidence, 0);
   f.state.now += 120000;
   s.automaticEvidenceLoader = async symbol => { f.state.calls.evidence++; return { symbol, status: 'unavailable', documents: [], errors: ['研究资料待补齐'] }; };
   const strict = await screenAgency(s, { screeningMode: 'strict' });
-  assert.equal(strict.screeningMode, 'strict'); assert.equal(strict.strategies.swing.pass.length, 0); assert.equal(strict.strategies.swing.pending.length, 1);
-  assert.equal(f.state.calls.evidence, 1); assert.equal(f.state.calls.finance.length, 1); assert.equal(f.state.calls.daily, 1);
-  assert.equal(strict.coverage.cache.finance.hits, 1); assert.equal(strict.coverage.cache.daily.hits, 1);
+  assert.equal(strict.screeningMode, 'strategy'); assert.equal(strict.strategies.swing.pass.length, 1); assert.equal(strict.strategies.swing.pending.length, 0);
+  assert.equal(f.state.calls.evidence, 0); assert.equal(f.state.calls.finance.length, 0); assert.equal(f.state.calls.daily, 1);
+  assert.equal(strict.coverage.cache.finance, null); assert.equal(strict.coverage.cache.daily.hits, 1);
+  assert.equal(strict.coverage.researchChecks.status, 'disabled');
 });

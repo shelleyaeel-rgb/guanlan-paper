@@ -36,8 +36,8 @@ function fixture() {
     restart: () => { engine = new Engine(JSON.parse(JSON.stringify(engine.s)), () => new Date(now)); } };
 }
 
-test('公司行为恢复后显示当前日线不足，完整价格核验通过前保留交易阻断', () => {
-  const f = fixture(), failed = f.missingDaily();
+test('持仓公司行为恢复后显示当前日线不足，完整价格核验通过前保留交易阻断', () => {
+  const f = fixture(); f.buy(); const failed = f.missingDaily();
   failed.corporateActions.status = 'unavailable'; failed.corporateActions.coverageComplete = false;
   assert.match(f.check(failed), /公司行为实施资料/);
   const previous = structuredClone(f.member().reconciliation);
@@ -48,18 +48,18 @@ test('公司行为恢复后显示当前日线不足，完整价格核验通过�
   assert.deepEqual(f.member().reconciliation, previous, '诊断更新不能提前解除价格基准核验');
   assert.equal(f.member().automaticCheck.status, 'waiting');
   assert.equal(f.member().automaticCheck.reason, INSUFFICIENT);
-  assert.equal(f.group().comparable, true);
-  assert.equal(f.engine.stats().comparable, true);
+  assert.equal(f.group().comparable, false);
+  assert.equal(f.engine.stats().comparable, false);
   const evaluation = f.engine.agencyEvaluate('swing', SYMBOL, f.quote(), f.missingDaily());
   assert.equal(evaluation.buyable, false);
   assert.ok(evaluation.reasons.includes(INSUFFICIENT));
-  assert.equal(f.engine.s.trades.length, 0);
+  assert.equal(f.engine.s.trades.length, 1);
 
   assert.equal(f.check(), null);
   assert.deepEqual(f.member().reconciliation, { status: 'clear', reason: '' });
   assert.equal(f.member().automaticCheck.status, 'clear');
   assert.equal(f.member().automaticCheck.reason, '');
-  assert.equal(f.engine.agencyEvaluate('swing', SYMBOL, f.quote(), f.snapshot()).buyable, true);
+  assert.equal(f.group().comparable, true);
   assert.equal(validState(f.engine.s), true);
 });
 
@@ -115,7 +115,7 @@ test('公司行为真实异常优先于日线缺失，诊断不会清除有持�
 });
 
 test('当前诊断跨重启保留，重复核验更新时间但不反复改变授权版本', () => {
-  const f = fixture(), failed = f.missingDaily();
+  const f = fixture(); f.buy(); const failed = f.missingDaily();
   failed.corporateActions.status = 'unavailable'; f.check(failed); f.check(f.missingDaily());
   const revision = f.engine.s.agency.revision, diagnostic = structuredClone(f.member().automaticCheck);
   f.advance(1000); assert.equal(f.check(f.missingDaily()), INSUFFICIENT);
@@ -152,7 +152,7 @@ test('缺少报价、日线时间过期及日期无效时分别保留当前原�
 });
 
 test('公司行为核验汇总按本次诊断区分真实异常、日线等待与完整恢复', async () => {
-  const f = fixture();
+  const f = fixture(); f.buy();
   let snapshot = f.missingDaily(); snapshot.corporateActions.coverageComplete = false;
   const service = new CorporateService({ getEngine: () => f.engine,
     transaction: fn => fn(), getMonitor: () => ({ load: async () => snapshot }),
@@ -175,5 +175,5 @@ test('公司行为核验汇总按本次诊断区分真实异常、日线等待�
   const recovered = await verify();
   assert.equal(recovered.clear, 1); assert.equal(recovered.waiting, 0); assert.equal(recovered.blocked, 0);
   assert.equal(f.member().reconciliation.status, 'clear');
-  assert.equal(f.engine.s.trades.length, 0);
+  assert.equal(f.engine.s.trades.length, 1);
 });

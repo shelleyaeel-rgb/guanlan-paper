@@ -7,6 +7,13 @@ const { trustedIndustryUrl, issuerSearchName, hasCurrentIndustryPdfParsing } = r
 const { CompanyDocumentParser, PARSER_VERSION } = require('./company-document-parser.cjs');
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const active = signal => { if (signal?.aborted) throw Object.assign(Error('已取消行业资料核验'), { name: 'AbortError' }); };
+function entryEvidenceContents(value) {
+  if (Array.isArray(value)) return value.map(entryEvidenceContents);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort()
+    .filter(key => !['fetchedAt', 'checkedAt', 'cached', 'timings', 'acquisition', 'cacheWarning', 'cacheWarnings', 'industryEvidenceVersion'].includes(key))
+    .map(key => [key, entryEvidenceContents(value[key])]));
+}
 function textFromHtml(html) {
   return html.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, '').replace(/<\/?(?:p|div|tr|li|h[1-6]|br)\b[^>]*>/gi, '\n')
     .replace(/<[^>]*>/g, ' ').replace(/&#(x[0-9a-f]+|\d+);/gi, (_, value) => { const n = /^x/i.test(value) ? parseInt(value.slice(1), 16) : +value; return n <= 0x10ffff ? String.fromCodePoint(n) : ''; })
@@ -43,6 +50,7 @@ class CompanyIndustrySource {
     if (typeof fetcher !== 'function' || !Number.isInteger(maxDocuments) || maxDocuments < 1 || maxDocuments > 3 || !Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 30000) throw Error('行业源参数无效');
     Object.assign(this, { fetcher, clock, timeoutMs, maxDocuments }); this.parser = parser || new CompanyDocumentParser(); this.ownParser = !parser;
     this.directory = directory && path.resolve(directory); this.cache = new Map(); this.queue = Promise.resolve(); this.cooldownUntil = 0;
+    this.entryEvidenceVersions = new Map();
     if (this.directory) { fs.mkdirSync(this.directory, { recursive: true }); if (fs.lstatSync(this.directory).isSymbolicLink()) throw Error('行业缓存目录无效'); }
   }
   async request(url, { signal, maxBytes = 4 * 1024 * 1024 } = {}) {
@@ -68,15 +76,30 @@ class CompanyIndustrySource {
     }
   }
   cachePath(symbol) { return path.join(this.directory, `${symbolOf(symbol)}.json`); }
+  // Only completed background observations publish versions. Trading reads the
+  // small counter without loading a cache file or hashing report bodies.
+  entryEvidenceVersion(symbol) { return this.entryEvidenceVersions.get(symbolOf(symbol))?.version || 0; }
+  observeEntryEvidence(item) {
+    const symbol = symbolOf(item.symbol), fingerprint = hash(JSON.stringify(entryEvidenceContents(item)));
+    const previous = this.entryEvidenceVersions.get(symbol);
+    if (!previous || previous.fingerprint !== fingerprint)
+      this.entryEvidenceVersions.set(symbol, { fingerprint, version: (previous?.version || 0) + 1 });
+    return this.entryEvidenceVersion(symbol);
+  }
   cached(symbol, fingerprint) {
     let item = this.cache.get(symbol);
     if (!item && this.directory) try { const file = this.cachePath(symbol); if (!fs.lstatSync(file).isSymbolicLink() && fs.statSync(file).size <= 36 * 1024 * 1024) item = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
     if (item?.version !== 1 || item.fingerprint !== fingerprint || item.symbol !== symbol || !item.industryCoverage || !Array.isArray(item.industryDocuments)
       || item.industryDocuments.some(document => !hasCurrentIndustryPdfParsing(document))
       || !Number.isFinite(item.fetchedAt) || item.fetchedAt <= 0 || item.fetchedAt > this.clock() || this.clock() - item.fetchedAt > (item.industryCoverage.status === 'error' ? 300000 : 21600000)) return null;
-    return structuredClone(item);
+    // Memory entries were observed by save(). A first disk hit has no local
+    // version yet; register it before exposing the corresponding evidence.
+    if (!this.cache.has(symbol) || !this.entryEvidenceVersions.has(symbol)) this.observeEntryEvidence(item);
+    return { ...structuredClone(item), industryEvidenceVersion: this.entryEvidenceVersion(symbol) };
   }
   save(item) {
+    const { industryEvidenceVersion, ...stored } = item; item = stored;
+    this.observeEntryEvidence(item);
     this.cache.set(item.symbol, structuredClone(item)); let memoryBytes = 0;
     for (const [key, value] of [...this.cache].reverse()) { memoryBytes += Buffer.byteLength(JSON.stringify(value)); if (memoryBytes > 64 * 1024 * 1024) this.cache.delete(key); }
     while (this.cache.size > 128) this.cache.delete(this.cache.keys().next().value);
@@ -93,7 +116,8 @@ class CompanyIndustrySource {
     const symbol = symbolOf(bundle.symbol), terms = discoveryTerms(bundle), fingerprint = hash(JSON.stringify(terms));
     const run = async () => {
       active(options.signal); const existing = this.cached(symbol, fingerprint);
-      if (existing && !(existing.industryCoverage.status !== 'ready' && (options.force || options.retryFailed))) return { ...bundle, industryDocuments: existing.industryDocuments, industryCoverage: existing.industryCoverage };
+      if (existing && !(existing.industryCoverage.status !== 'ready' && (options.force || options.retryFailed))) return { ...bundle, industryDocuments: existing.industryDocuments,
+        industryCoverage: existing.industryCoverage, industryEvidenceVersion: existing.industryEvidenceVersion };
       const started = this.clock(), issues = [], documents = [], seen = new Set(), today = cnTime(new Date(started)).date; let failed = false;
       const deadline = AbortSignal.timeout(60000), signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
       try {
@@ -133,8 +157,11 @@ class CompanyIndustrySource {
       const industryCoverage = { source: '弗若斯特沙利文公开目录及原文', status: failed ? 'error' : issues.length ? 'partial' : 'ready', terms, fetchedAt: started, issues,
         scope: '每家公司最多2个关键词、每词首页5项、3份公开原文；尚未覆盖全部行业协会和研究机构，搜索结果本身不作证据' };
       const item = { version: 1, symbol, fingerprint, fetchedAt: started, industryDocuments: documents, industryCoverage };
-      try { this.save(item); } catch (error) { industryCoverage.issues.push(`本次原文已取得，行业缓存保存失败：${error.message}`); }
-      return { ...bundle, industryDocuments: documents, industryCoverage };
+      try { this.save(item); } catch (error) {
+        this.observeEntryEvidence(item);
+        industryCoverage.issues.push(`本次原文已取得，行业缓存保存失败：${error.message}`);
+      }
+      return { ...bundle, industryDocuments: documents, industryCoverage, industryEvidenceVersion: this.entryEvidenceVersion(symbol) };
     };
     const operation = this.queue.then(run); this.queue = operation.catch(() => {}); return operation;
   }

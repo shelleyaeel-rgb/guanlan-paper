@@ -7,6 +7,7 @@ const { evaluateOperatingResearch } = require('./company-research.cjs');
 const { pendingFinanceReport, reportSyncReason } = require('./financial-report-status.cjs');
 const { evaluatePerformanceRules } = require('./performance-rules.cjs');
 const { checkNoticeWithEvidence } = require('./company-notice-review.cjs');
+const { preparedTechnicalValid } = require('./daily-history.cjs');
 
 const own = (value, key) => Object.hasOwn(value, key);
 const plain = value => value && typeof value === 'object' && !Array.isArray(value) && [Object.prototype, null].includes(Object.getPrototypeOf(value));
@@ -59,9 +60,28 @@ function validEntryConditions(saved) {
       && JSON.stringify(normalized.labels) === JSON.stringify(saved.labels);
   } catch { return false; }
 }
+// Automatic trading uses market and complete daily-bar predicates only. Keep
+// the generic research predicates available to the separate research tools.
+function automaticEntryConditions(input, now = new Date()) {
+  const saved = createEntryConditions(input, now);
+  if (!saved) return null;
+  const { technicalEntryQuery } = require('./agency-selection.cjs');
+  return createEntryConditions(technicalEntryQuery({ rules: saved.rules, excludeST: saved.excludeST,
+    ...(saved.source === undefined ? {} : { source: saved.source }) }), new Date(saved.savedAt));
+}
+function entryConditionDataRequirements(saved) {
+  const requirements = { finance: false, valuation: false, industry: false };
+  if (saved == null || !validEntryConditions(saved)) return requirements;
+  requirements.finance = !!(saved.research?.enabled && saved.research.path === 'company');
+  for (const rule of saved.rules) for (const field of fieldsOf(rule)) {
+    if (FIELDS[field].source === 'finance') requirements.finance = true;
+    if (['pe', 'pb', 'marketCap', 'floatCap'].includes(field)) requirements.valuation = true;
+  }
+  return requirements;
+}
 function entryConditionNeedsFundamentals(saved) {
-  return saved != null && validEntryConditions(saved) && (saved.research?.enabled && saved.research.path === 'company'
-    || saved.rules.some(rule => fieldsOf(rule).some(field => FIELDS[field].source === 'finance' || ['pe', 'pb', 'marketCap', 'floatCap'].includes(field))));
+  const requirements = entryConditionDataRequirements(saved);
+  return requirements.finance || requirements.valuation;
 }
 
 function quoteIssue(q, symbol, now) {
@@ -71,7 +91,9 @@ function quoteIssue(q, symbol, now) {
 }
 function technicalRow(snapshot, q, symbol, now) {
   if (!snapshot || snapshot.error) throw Error(snapshot?.error || '完整日线尚未获取');
-  if (!validAge(snapshot.fetchedAt, now.getTime(), 180000)) throw Error('完整日线缓存超过 3 分钟或时间无效');
+  const prepared = snapshot.dailyEvidence !== undefined;
+  if (prepared ? !preparedTechnicalValid(snapshot, now.getTime(), symbol) : !validAge(snapshot.fetchedAt, now.getTime(), 180000))
+    throw Error(prepared ? '完整日线证据已失效，等待重新核验最近完整交易日' : '完整日线缓存超过 3 分钟或时间无效');
   const issue = quoteIssue(q, symbol, now); if (issue) throw Error(issue);
   const t = snapshot.technical, today = cnTime(now);
   if (!t || !validDate(t.asOf) || t.asOf > today.date || t.asOf > q.date || (t.asOf === today.date && today.minutes < 900)) throw Error('技术指标包含未完成日线或日线日期无效');
@@ -198,4 +220,4 @@ function evaluateEntryConditions(saved, inputSymbol, q, snapshot, inputNow = new
   return finish();
 }
 
-module.exports = { createEntryConditions, validEntryConditions, entryConditionNeedsFundamentals, evaluateEntryConditions, usesAutomaticEvidence };
+module.exports = { createEntryConditions, automaticEntryConditions, validEntryConditions, entryConditionDataRequirements, entryConditionNeedsFundamentals, evaluateEntryConditions, usesAutomaticEvidence };

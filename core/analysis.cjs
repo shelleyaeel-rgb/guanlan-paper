@@ -25,15 +25,30 @@ function forecastAt(c, t, horizon = 5) {
   if (returns.length < 20) return null;
   return { n: returns.length, median: quantile(returns, 0.5), low: quantile(returns, 0.1), high: quantile(returns, 0.9), upRate: returns.filter(r => r > 0).length / returns.length, horizon };
 }
+function basicIndicators(bars) {
+  const count = bars.length, c = bars.map(b => b.close);
+  const ma = period => count >= period ? mean(c.slice(-period)) : null;
+  const tr = bars.slice(1).map((b, i) => Math.max(b.high - b.low, Math.abs(b.high - bars[i].close), Math.abs(b.low - bars[i].close)));
+  let dif = null, dea = null, macd = null;
+  if (count >= 26) {
+    const e12 = ema(c, 12), e26 = ema(c, 26), difference = c.map((_, i) => e12[i] - e26[i]);
+    dif = last(difference);
+    // Wait for nine observations from the first full 26-bar EMA window.
+    if (count >= 34) { dea = last(ema(difference, 9)); macd = (dif - dea) * 2; }
+  }
+  return { asOf: last(bars)?.date || null, count, close: last(c) ?? null,
+    ma5: ma(5), ma20: ma(20), ma60: ma(60),
+    rsi: count >= 15 ? rsi(c) : null, atr: count >= 15 ? mean(tr.slice(-14)) : null,
+    dif, dea, macd,
+    volRatio: count >= 21 ? last(bars).volume / Math.max(1, mean(bars.slice(-21, -1).map(b => b.volume))) : null };
+}
 function analyze(rawBars, quote, now = new Date()) {
   const cn = cnTime(now);
   // Exclude today's unfinished daily bar, so the five-day model uses closed observations.
   const bars = rawBars.filter(b => b.date < cn.date || (b.date === cn.date && cn.minutes >= 900));
-  if (bars.length < 60) return { error: '完整日线不足 60 根，暂不生成信号和预测。' };
-  const c = bars.map(b => b.close), close = last(c), ma5 = mean(c.slice(-5)), ma20 = mean(c.slice(-20)), ma60 = mean(c.slice(-60));
-  const e12 = ema(c, 12), e26 = ema(c, 26), dif = c.map((_, i) => e12[i] - e26[i]), dea = ema(dif, 9), hist = (last(dif) - last(dea)) * 2;
-  const tr = bars.slice(1).map((b, i) => Math.max(b.high - b.low, Math.abs(b.high - bars[i].close), Math.abs(b.low - bars[i].close))), atr = mean(tr.slice(-14));
-  const r = rsi(c), volRatio = last(bars).volume / Math.max(1, mean(bars.slice(-21, -1).map(b => b.volume)));
+  const indicators = basicIndicators(bars);
+  if (bars.length < 60) return { ...indicators, error: '完整日线不足 60 根，暂不生成信号和预测。' };
+  const c = bars.map(b => b.close), { close, ma5, ma20, ma60, rsi: r, atr, macd: hist, volRatio } = indicators;
   let score = 50; const reasons = [];
   if (close > ma20) { score += 15; reasons.push('收盘价位于 MA20 上方，短期趋势偏强'); } else { score -= 15; reasons.push('收盘价低于 MA20，等待趋势修复'); }
   if (ma20 > ma60) { score += 10; reasons.push('MA20 高于 MA60，中期趋势向上'); } else { score -= 10; reasons.push('MA20 低于 MA60，中期趋势偏弱'); }
@@ -52,7 +67,7 @@ function analyze(rawBars, quote, now = new Date()) {
     tests.push({ date: bars[i].date, predicted: p.median, actual, correct: Math.sign(p.median) === Math.sign(actual), covered: actual >= p.low && actual <= p.high });
   }
   const base = quote?.price || close, risk = Math.max(base * 0.025, atr * 1.5);
-  return { asOf: last(bars).date, count: bars.length, close, ma5, ma20, ma60, rsi: r, dif: last(dif), dea: last(dea), macd: hist, atr, volRatio,
+  return { ...indicators,
     score, signal: score >= 70 ? '关注回踩买点' : score <= 30 ? '减仓 / 观望' : '等待确认', reasons,
     plan: { entryLow: Math.min(base, ma20), entryHigh: Math.max(Math.min(base, ma20), Math.min(base, ma20 + atr * 0.35)), stop: Math.max(0.01, base - risk), target: base + risk * 2, ratio: 2 },
     forecast: forecast && { ...forecast, base: close, price: close * (1 + forecast.median), lowPrice: close * (1 + forecast.low), highPrice: close * (1 + forecast.high) },

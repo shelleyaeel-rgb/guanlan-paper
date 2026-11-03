@@ -25,7 +25,7 @@ test('旧账户迁移全部现金和持仓归手动，四个策略没有复制�
   const engine = new Engine(state); const agency = engine.agencyState();
   assert.equal(agency.manualCash, state.cash); assert.equal(agency.groups.length, 4);
   assert.ok(agency.groups.every(g => g.cash === 0 && g.mode === 'paused')); assert.equal(engine.s.lots[0].owner, 'manual'); assert.equal(validState(engine.s), true);
-  assert.equal(agency.decisionMode, 'rules'); assert.equal(agency.rulesVersion, '1'); assert.equal(agency.migrationNotice, null);
+  assert.equal(agency.decisionMode, 'rules'); assert.equal(agency.rulesVersion, '1'); assert.equal(agency.migrationNotice.kind, 'technical-trading-upgrade');
 });
 
 test('单策略视图保持完整视图的实时估值和成员快照，不携带其他策略及历史日志', () => {
@@ -122,8 +122,8 @@ test('划拨以分守恒且资金流不产生策略收益、手动不能借用�
   g = f.engine.agencyState().groups.find(g => g.id === 'swing'); assert.equal(g.pnl, 0); assert.equal(g.units, 0); assert.equal(validState(f.engine.s), true);
 });
 
-test('单股代理归属互斥；普通自选可以重叠；手动持仓和待单不能接管', () => {
-  const f = fixture(); f.authorize(); assert.ok(f.engine.s.watchlist.includes('sz000001'));
+test('单股代理归属互斥；自动成员不添加人工自选；历史手动持仓和待单不能接管', () => {
+  const f = fixture(); f.authorize(); assert.deepEqual(f.engine.s.watchlist, []);
   assert.throws(() => f.engine.agencyMember({ strategyId: 'short', symbol: '000001', action: 'add' }), /一个自动交易/);
   assert.throws(() => f.engine.place({ symbol: '000001', side: 'buy', quantity: 100, limit: 10 }), /手动委托/);
   assert.throws(() => f.engine.execute({ symbol: '000001', side: 'buy', quantity: 100 }, f.quote()), /已授权/);

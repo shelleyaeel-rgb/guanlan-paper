@@ -3,7 +3,9 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Engine, initialState, validState } = require('../core/engine.cjs');
 const { AgencyService } = require('../core/agency-service.cjs');
+const { StrategyMonitor } = require('../core/strategy-monitor.cjs');
 const { enableMarketPolicy } = require('../core/market-policy.cjs');
+const { ACTIVE_CANDIDATE_LIMIT } = require('../core/agency-capacity.cjs');
 const { cnTime } = require('../core/common.cjs');
 
 const SYMBOL = 'sz000001';
@@ -41,15 +43,17 @@ function fixture() {
     expiresAt: now + 90000, date: cnTime(now).date, reasons: ['隔离行情'],
     metrics: { highVolatility: false }, evidence: { quoteTime: now,
       indexQuoteTimes: { sh000001: now, sz399001: now, sz399006: now }, breadthQuoteTime: now, breadthFetchedAt: now } });
+  const monitor = new StrategyMonitor({ strategyHistory: async () => { throw Error('交易不可获取日线'); } }, () => new Date(now));
+  monitor.snapshots[SYMBOL] = snapshot();
   const service = new AgencyService({ getEngine: () => engine, transaction, getQuotes: () => quotes,
     acceptQuotes: batch => { accepted.push(structuredClone(batch)); Object.assign(quotes, batch); },
     market: { quotes: async symbols => { mainCalls.push([...symbols]); if (mainHook) await mainHook(symbols, mainCalls.length); return Object.fromEntries(symbols.map(symbol => [symbol, quote(symbol)])); } },
     entryMarket: { quotes: async symbols => { sampleCalls.push([...symbols]); return sampleHook ? sampleHook(symbols) : Object.fromEntries(symbols.map(symbol => [symbol, quote(symbol)])); } },
-    monitor: { load: async symbol => snapshot(symbol) }, getMarketRegime: regime, clock: () => now });
+    monitor, getMarketRegime: regime, clock: () => now });
   const evaluate = service.runner.evaluateRules;
   service.runner.evaluateRules = input => { const result = evaluate(input); decisions.push(...result.decisions); return result; };
   return { engine, service, quotes, mainCalls, sampleCalls, accepted, decisions, quote, snapshot, regime,
-    add: symbol => engine.agencyMember({ strategyId: 'swing', symbol, action: 'add' }),
+    add: symbol => { monitor.snapshots[symbol] = snapshot(symbol); return engine.agencyMember({ strategyId: 'swing', symbol, action: 'add' }); },
     track: (symbol = SYMBOL, snap = snapshot(symbol), q = quote(symbol)) => service.trackEntry(symbol, 'swing', q, snap),
     advance: ms => { now += ms; }, setPrice: value => { price = value; }, setRegime: value => { status = value; },
     samples: fn => { sampleHook = fn; }, main: fn => { mainHook = fn; },
@@ -71,7 +75,7 @@ test('候选采样使用独立行情通道，慢采样不阻塞主轮询，也�
   } finally { wait.resolve({}); await pending; }
 });
 
-test('仅保留80个临近候选的轻量日线快照，不在采样内复制公告及研究正文', async () => {
+test('仅采样20只活跃候选，65只候补不采样，轻量快照不复制公告及研究正文', async () => {
   const f = fixture(), symbols = [SYMBOL, ...Array.from({ length: 84 }, (_, index) => `sh${600001 + index}`)];
   for (const [index, symbol] of symbols.entries()) {
     if (symbol !== SYMBOL) f.add(symbol);
@@ -85,11 +89,35 @@ test('仅保留80个临近候选的轻量日线快照，不在采样内复制公
     assert.equal(context.snapshot.technical.asOf, '2026-10-15');
   }
   await f.service.sampleEntries();
-  assert.equal(f.sampleCalls.length, 1); assert.equal(f.sampleCalls[0].length, 80);
-  assert.deepEqual(new Set(f.sampleCalls[0]), new Set(symbols.slice(0, 80)));
+  assert.equal(f.service.entryContexts.size, ACTIVE_CANDIDATE_LIMIT, '采样前清除候补上下文');
+  assert.equal(f.engine.s.agency.groups.find(group => group.id === 'swing').members.filter(member => member.mode === 'standby').length, symbols.length - ACTIVE_CANDIDATE_LIMIT);
+  assert.equal(f.sampleCalls.length, 1); assert.equal(f.sampleCalls[0].length, ACTIVE_CANDIDATE_LIMIT);
+  assert.deepEqual(new Set(f.sampleCalls[0]), new Set(symbols.slice(0, ACTIVE_CANDIDATE_LIMIT)));
   assert.equal(f.mainCalls.length, 0);
   f.track(SYMBOL, f.snapshot(), f.quote(SYMBOL, { price: 15 }));
   assert.equal(f.service.entryContexts.has(SYMBOL), false);
+});
+
+test('四组80只活跃候选均进入独立采样通道，第21只候补不采样且采样不下单', async () => {
+  const f = fixture(), activeSymbols = [], standbySymbols = [];
+  for (const [groupIndex, group] of f.engine.s.agency.groups.entries()) {
+    f.engine.agencyMode({ strategyId: group.id, mode: 'running' });
+    for (let index = group.members.length; index <= ACTIVE_CANDIDATE_LIMIT; index++)
+      f.engine.agencyMember({ strategyId: group.id, symbol: `sh${601000 + groupIndex * 100 + index}`, action: 'add' });
+    for (const member of group.members) {
+      if (member.mode === 'standby') { standbySymbols.push(member.symbol); continue; }
+      activeSymbols.push(member.symbol);
+      f.service.trackEntry(member.symbol, group.id, f.quote(member.symbol), f.snapshot(member.symbol));
+    }
+  }
+  assert.equal(activeSymbols.length, 80); assert.equal(standbySymbols.length, f.engine.s.agency.groups.length);
+  assert.equal(f.service.entryContexts.size, activeSymbols.length);
+  await f.service.sampleEntries();
+  assert.equal(f.sampleCalls.length, 1);
+  assert.deepEqual(new Set(f.sampleCalls[0]), new Set(activeSymbols));
+  assert.ok(standbySymbols.every(symbol => !f.sampleCalls[0].includes(symbol)));
+  assert.equal(f.service.entryContexts.size, activeSymbols.length);
+  assert.equal(f.mainCalls.length, 0); assert.equal(f.engine.s.trades.length, 0); assert.equal(validState(f.engine.s), true);
 });
 
 test('慢采样返回时身份、持仓或权限已变化，不能写回行情或重建旧确认', async () => {

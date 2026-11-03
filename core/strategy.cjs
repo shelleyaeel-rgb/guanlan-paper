@@ -1,8 +1,9 @@
 const { cnTime, money, yuan, numberIn } = require('./common.cjs');
 const { dailyIndicators } = require('./daily-indicators.cjs');
+const { preparedTechnicalValid, publicDailyHistory } = require('./daily-history.cjs');
 const { fees } = require('./fees.cjs');
 const { maxOrderQuantity } = require('./order-quantity.cjs');
-const { STRATEGY_PROFILES, strategyProfile, LONG_FINANCE_RULES, LONG_FINANCE_POLICY_NOTE } = require('./strategy-profiles.cjs');
+const { STRATEGY_PROFILES, strategyProfile, technicalStrategyProfile, TECHNICAL_ENTRY_POLICY, LONG_FINANCE_RULES, LONG_FINANCE_POLICY_NOTE } = require('./strategy-profiles.cjs');
 const { checkMarketRisk } = require('./entry-risk.cjs');
 const { checkNoticeWithEvidence } = require('./company-notice-review.cjs');
 const { buildFinanceSnapshot } = require('./finance-validity.cjs');
@@ -37,6 +38,8 @@ function technicals(rawBars, now = new Date()) {
     asOf: last.date, close: last.close, previousClose: c.at(-2), dates: bars.map(b => b.date), ma5, ma20, ma60, atr,
     previousMa5: daily.previousMa5, previousMa20: daily.previousMa20, previousMa60: daily.previousMa60, levels,
     rsi: daily.rsi, macd: daily.macd, volumeRatio: daily.dailyVolumeRatio,
+    atrPct14: daily.atrPct14, biasMa5Pct: daily.biasMa5Pct, biasMa20Pct: daily.biasMa20Pct,
+    biasMa60Pct: daily.biasMa60Pct, ma20Change5Pct: daily.ma20Change5Pct,
     trend: last.close >= ma20 && ma20 > ma60 && ma20 > daily.previousMa20,
     breakout: last.close > Math.max(...bars.slice(-6, -1).map(b => b.high)), support, resistance,
     entryLow: round(ma20 - atr * 0.25), entryHigh: round(ma20 + atr * 0.75),
@@ -175,7 +178,10 @@ function longValuationCheck(snapshot, symbol, now) {
 
 function usableTechnical(snapshot, q, now = new Date()) {
   if (!snapshot || snapshot.error) throw Error(snapshot?.error || '正在获取策略日线');
-  if (!Number.isFinite(snapshot.fetchedAt) || now.getTime() - snapshot.fetchedAt > 180000 || snapshot.fetchedAt > now.getTime() + 15000) throw Error('策略日线缓存已过期，等待重新获取');
+  const prepared = snapshot.dailyEvidence !== undefined;
+  if (prepared ? !preparedTechnicalValid(snapshot, now.getTime(), q?.symbol)
+    : !Number.isFinite(snapshot.fetchedAt) || now.getTime() - snapshot.fetchedAt > 180000 || snapshot.fetchedAt > now.getTime() + 15000)
+    throw Error(prepared ? '策略日线证据已失效，等待重新核验最近完整交易日' : '策略日线缓存已过期，等待重新获取');
   const t = snapshot.technical, date = cnTime(now).date;
   if (!t || !q || t.asOf > q.date || t.asOf > date) throw Error('日线与报价日期不一致');
   // Catch missed sessions and ex-rights reference changes instead of mixing price bases.
@@ -194,17 +200,19 @@ function economics(price, stop, target, quantity, settings) {
   return { cost: cost + buyFee, loss, reward, rewardRisk: loss > 0 ? reward / loss : 0 };
 }
 
-function evaluateEntry(engine, symbol, q, snapshot, requestedQuantity, strategyId = 'swing') {
-  let profile = strategyProfile(strategyId);
+function evaluateEntry(engine, symbol, q, snapshot, requestedQuantity, strategyId = 'swing', { technicalOnly = false } = {}) {
+  const getProfile = technicalOnly ? technicalStrategyProfile : strategyProfile;
+  let profile = getProfile(strategyId);
   const now = engine.clock(), settings = engine.s.settings, config = engine.s.strategySettings;
-  const result = { symbol, strategyId: profile.id, strategyName: profile.name, status: '等待数据', buyable: false, reasons: [], quoteTime: q?.timestamp, quoteSource: q?.source, dailySource: snapshot?.source, checkedAt: now.getTime(), quantity: 0 };
+  const result = { symbol, strategyId: profile.id, strategyName: profile.name, status: '等待数据', buyable: false, reasons: [], quoteTime: q?.timestamp, quoteSource: q?.source, dailySource: snapshot?.source, dailyHistory: publicDailyHistory(snapshot, now.getTime(), symbol), checkedAt: now.getTime(), quantity: 0 };
   const position = engine.positions().find(p => p.symbol === symbol);
   // The selected page does not change which rules manage an existing strategy holding.
   if (position?.risk?.strategy) {
-    profile = strategyProfile(position.risk.strategyId);
+    profile = getProfile(position.risk.strategyId);
     result.strategyId = profile.id; result.strategyName = profile.name;
   }
-  if (profile.id === 'long') {
+  if (technicalOnly) result.entryPolicy = { ...TECHNICAL_ENTRY_POLICY };
+  if (!technicalOnly && profile.id === 'long') {
     result.financeCheck = longFinanceCheck(snapshot, symbol, now);
     result.valuationCheck = longValuationCheck(snapshot, symbol, now);
     if (result.financeCheck.status === 'pass') result.financeEvidence = structuredClone(result.financeCheck.evidence);
@@ -214,8 +222,10 @@ function evaluateEntry(engine, symbol, q, snapshot, requestedQuantity, strategyI
     return { ...result, status: position.risk?.pendingExit ? '卖出触发' : '持仓跟踪', reasons: [position.risk?.note || '已有持仓，本策略暂不加仓'], risk: position.risk };
   }
   const shortEntry = ['ultra-short', 'short'].includes(profile.id);
-  const market = shortEntry ? checkMarketRisk(q, now) : null, notices = checkNoticeWithEvidence(snapshot?.notices, symbol, snapshot?.automaticEvidence, now);
-  const checks = [market, notices].filter(Boolean);
+  const market = shortEntry ? checkMarketRisk(q, now) : null;
+  const notices = technicalOnly ? { status: 'disabled', notices: [], reasons: ['自动交易未启用公告风险筛查'], checkedAt: now.getTime() }
+    : checkNoticeWithEvidence(snapshot?.notices, symbol, snapshot?.automaticEvidence, now);
+  const checks = [market, technicalOnly ? null : notices].filter(Boolean);
   const status = checks.some(item => item.status === 'blocked') ? 'blocked'
     : checks.some(item => item.status !== 'clear') ? 'unverified' : 'clear';
   result.entryRisk = { market, notices, status, reasons: checks.filter(item => item.status !== 'clear').flatMap(item => item.reasons), checkedAt: now.getTime() };
@@ -237,9 +247,10 @@ function evaluateEntry(engine, symbol, q, snapshot, requestedQuantity, strategyI
   if (result.financeCheck?.status === 'pass' && result.valuationCheck?.status === 'pass') result.plan.financeEvidence = {
     ...structuredClone(result.financeCheck.evidence), ...structuredClone(result.valuationCheck.evidence) };
   if (result.entryRisk) result.plan.entryRiskEvidence = structuredClone(result.entryRisk);
+  if (technicalOnly) result.plan.entryPolicy = { ...TECHNICAL_ENTRY_POLICY };
   if (result.entryRisk && result.entryRisk.status !== 'clear') return rejectEntryRisk();
   try { engine.fresh(q); } catch (e) { return reject('等待有效行情', e.message); }
-  if (profile.id === 'long') {
+  if (!technicalOnly && profile.id === 'long') {
     const failed = [result.financeCheck, result.valuationCheck].filter(check => check.status !== 'pass');
     if (result.financeCheck.reasonCode === 'template-inapplicable') return reject('财务模板不适用', result.financeCheck.reasons.join('；'));
     if (result.financeCheck.applicability?.status === 'pending' && result.financeCheck.reasonCode !== 'finance-source-unavailable') return reject('等待行业核验', result.financeCheck.reasons.join('；'));
@@ -284,7 +295,9 @@ function evaluateEntry(engine, symbol, q, snapshot, requestedQuantity, strategyI
   if (quantity > recommended) return reject('超过计划上限', `当前最多允许 ${recommended} 股，请重新确认计划`);
   result.quantity = quantity; result.economics = economics(price, t.stop, t.target, quantity, settings);
   if (result.economics.rewardRisk < config.minRewardRisk) return reject('空间不足', `含双边费用及滑点的盈亏比低于 ${config.minRewardRisk}`);
-  return { ...result, buyable: true, status: '规则通过 · 可模拟', reasons: [`当前${shortEntry ? '当日行情、' : ''}${notices.mode === 'automatic-fulltext' ? '公告原文核验' : '公告标题检查'}及策略规则通过，含费盈亏比、资金、仓位与计划风险预算符合设置；提交时重新校验。规则通过不代表上涨概率或实际亏损上限`] };
+  return { ...result, buyable: true, status: '规则通过 · 可模拟', reasons: [technicalOnly
+    ? '行情与技术策略规则通过，含费盈亏比、资金、仓位与计划风险预算符合设置；未执行公告、研究或财务估值筛查。提交时重新校验，规则通过不代表上涨概率或实际亏损上限'
+    : `当前${shortEntry ? '当日行情、' : ''}${notices.mode === 'automatic-fulltext' ? '公告原文核验' : '公告标题检查'}及策略规则通过，含费盈亏比、资金、仓位与计划风险预算符合设置；提交时重新校验。规则通过不代表上涨概率或实际亏损上限`] };
 }
 
 function updateDynamicRisk(risk, snapshot, q, now) {

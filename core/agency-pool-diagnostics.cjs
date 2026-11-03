@@ -181,7 +181,7 @@ function listedDiagnostics(rows) {
   return result;
 }
 
-function poolDiagnostics(strategies) {
+function poolDiagnostics(strategies, { researchEnabled = true } = {}) {
   const companies = new Map();
   for (const strategy of Object.values(strategies)) for (const status of ['pass', 'failed', 'pending']) for (const row of strategy[status]) {
     const item = companies.get(row.symbol) || { statuses: new Set(), diagnostics: [] };
@@ -197,10 +197,10 @@ function poolDiagnostics(strategies) {
     if (!item.statuses.has('pending')) { summary.failedCompanies++; continue; }
     summary.pendingCompanies++;
     const stages = diagnostic.stages.filter(stage => stage.code !== 'conditions-failed');
-    if (!diagnostic.researchAttempted) { summary.researchNotStarted++; stages.push({ code: 'research-not-started', label: '尚未进入研究核验' }); }
+    if (researchEnabled && !diagnostic.researchAttempted) { summary.researchNotStarted++; stages.push({ code: 'research-not-started', label: '尚未进入研究核验' }); }
     for (const stage of stages) { const count = summary.stages[stage.code] ||= { label: stage.label, count: 0 }; count.count++; }
   }
-  return summary;
+  return { ...summary, ...(!researchEnabled ? { researchStatus: 'disabled' } : {}) };
 }
 
 module.exports = { collectionSummary, rowDiagnostics, combineDiagnostics, poolDiagnostics, noticeDiagnostics, listedDiagnostics, NOTICE_DIAGNOSTICS };

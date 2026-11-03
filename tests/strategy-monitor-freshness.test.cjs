@@ -35,7 +35,7 @@ test('正式新财报触发一次强制同步，同一公告五分钟内自动�
 
 test('自动成员附带公司行为证据，普通自选不额外取证；新授权不会沿用缺少公司行为的缓存', async () => {
   const members = [], calls = [];
-  const corporate = { symbols: () => members, getSnapshot: async (stock, force) => { calls.push({ stock, force }); return { symbol: stock, fetchedAt: START, coverageComplete: true, status: 'ready', events: [] }; } };
+  const corporate = { symbols: () => members, getSnapshot: async (stock, force) => { calls.push({ stock, force }); return { symbol: stock, fetchedAt: START, coverageComplete: true, coverageEnd: '2026-09-30', status: 'ready', events: [] }; } };
   const research = { get: async () => ({ symbol, status: 'empty', fetchedAt: START, data: { items: [], total: 0 } }) };
   const monitor = new StrategyMonitor({ strategyHistory: async () => bars }, () => new Date(START), () => {}, research, corporate);
   const ordinary = await monitor.load(symbol, false, false, true);
@@ -94,7 +94,7 @@ test('Research与监控两层缓存叠加时，估值自身满90秒后立即重�
   f.advance(1);
   const second = await f.load();
   assert.notEqual(second, first); assert.equal(second.valuation.fetchedAt, f.time());
-  assert.deepEqual(f.calls, { finance: 1, valuation: 2, profile: 1, history: 2 });
+  assert.deepEqual(f.calls, { finance: 1, valuation: 2, profile: 1, history: 1 });
 });
 
 test('行业原获取时间超过24小时即刷新，不能借刚完成的财务扫描续期', async () => {
@@ -119,7 +119,7 @@ test('财报自身跨越6小时时刷新，监控尝试时间不会延长Researc
   f.advance(50001);
   const second = await f.load();
   assert.notEqual(second, first); assert.equal(second.finance.fetchedAt, f.time());
-  assert.deepEqual(f.calls, { finance: 2, valuation: 1, profile: 1, history: 2 });
+  assert.deepEqual(f.calls, { finance: 2, valuation: 1, profile: 1, history: 1 });
 });
 
 test('ready响应中获取时间或估值报价未知、未来及过期，均不命中监控缓存', async () => {
@@ -139,7 +139,7 @@ test('ready响应中获取时间或估值报价未知、未来及过期，均不
     const cached = structuredClone(first); change(cached); f.monitor.snapshots[symbol] = cached;
     const next = await f.load();
     assert.notEqual(next, cached, change.toString());
-    assert.equal(f.calls.history, 2); assert.equal(f.requests.length, 6);
+    assert.equal(f.calls.history, 1); assert.ok(f.requests.length < 6, '仅刷新无效模块，不重载全部资料');
     assert.equal(next.finance.fetchedAt, START); assert.equal(next.valuation.data.quoteTime, START);
   }
 });
@@ -161,7 +161,8 @@ test('一节ready但报价过期不导致另一节失败接口每次重试，也
   const first = await f.load();
   assert.equal(first.finance.status, 'unavailable'); assert.equal(first.valuation.status, 'ready');
   f.advance(10000); const second = await f.load();
-  assert.notEqual(second, first, '过期ready不能复用整个计划缓存');
+  assert.equal(second, first, '旧行情仅保留失败重试冷却，不能因此成为可执行证据');
+  assert.equal(f.monitor.peekPrepared(symbol, true, false), null);
   assert.equal(f.calls.finance, 1, '失败财报仍保留其一分钟限速');
   assert.equal(second.fundamentalsAttempts.finance, START);
   f.advance(50000); await f.load();
@@ -202,7 +203,7 @@ test('公告自身超过5分钟时刷新，两层缓存不能因监控刚加载�
     f.advance(50000); assert.equal(await f.load(), first);
     f.advance(1); const next = await f.load();
     assert.notEqual(next, first); assert.equal(next.notices.fetchedAt, f.time());
-    assert.equal(f.calls.notices, 2); assert.equal(f.calls.history, 2);
+    assert.equal(f.calls.notices, 2); assert.equal(f.calls.history, 1);
   }
 });
 
@@ -222,7 +223,7 @@ test('公告获取时间缺失、未来或过期不复用监控缓存，未配�
     const f = noticeFixture(), first = await f.load();
     const cached = structuredClone(first); cached.notices.fetchedAt = fetchedAt;
     f.monitor.snapshots[symbol] = cached;
-    assert.notEqual(await f.load(), cached); assert.equal(f.calls.history, 2);
+    assert.notEqual(await f.load(), cached); assert.equal(f.calls.history, 1);
   }
   const monitor = new StrategyMonitor({ strategyHistory: async () => bars }, () => new Date(START));
   const snapshot = await monitor.load(symbol, false, false, true);
@@ -255,7 +256,7 @@ test('只有日线的在途请求也能升级普通公告请求，已有公告�
   const first = monitor.load(symbol), notice = monitor.load(symbol, false, false, true), duplicate = monitor.load(symbol, false, false, true);
   release();
   const [plain, updated, shared] = await Promise.all([first, notice, duplicate]);
-  assert.notEqual(plain, updated); assert.equal(updated, shared); assert.equal(historyCalls, 2); assert.equal(noticeCalls, 1);
+  assert.notEqual(plain, updated); assert.equal(updated, shared); assert.equal(historyCalls, 1); assert.equal(noticeCalls, 1);
 });
 
 test('force不能复用已在途的force监控，同一旧轮次之后的并发force共享一次刷新', async () => {

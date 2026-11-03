@@ -138,9 +138,3 @@ function noticeFactValueText(check) {
   }
   return typeof value === 'string' ? value : JSON.stringify(value);
 }
-function renderScreenPerformanceResults(result, search) {
-  const root = $('screen-performance-results');
-  if (!result.performanceScreen) { root.innerHTML = ''; return; }
-  const rows = [...(result.performancePendingRows || []), ...(result.performanceFailedRows || [])].filter(row => !search || row.symbol.includes(search) || (row.name || '').toLowerCase().includes(search));
-  root.innerHTML = `<details class="screen-risk-excluded"><summary>预告 / 快报条件未通过 · ${rows.length} 只</summary><p class="tiny">此处为业绩数值条件；重大异常和公告原文不足在风险检查中另列。</p>${rows.slice(0, 100).map(row => `<article><b>${esc(row.name || row.symbol)} · ${esc(row.symbol)}</b>${performanceReviewHtml(row.performanceReview)}<button class="text-button" data-screen-open="${esc(row.symbol)}">查看股票</button></article>`).join('')}${rows.length > 100 ? '<p>仅展示前 100 条，请搜索股票缩小范围。</p>' : ''}</details>`;
-}

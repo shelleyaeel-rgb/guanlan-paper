@@ -1,6 +1,6 @@
 (function(root) {
   'use strict';
-  const channels = ['trade', 'order', 'strategy:buy', 'agency:transfer'];
+  const channels = ['legacy:exit', 'agency:transfer'];
   const stable = value => JSON.stringify(value, function(key, item) {
     return item && typeof item === 'object' && !Array.isArray(item)
       ? Object.fromEntries(Object.keys(item).sort().map(name => [name, item[name]])) : item;

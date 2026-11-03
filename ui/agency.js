@@ -1,11 +1,16 @@
 'use strict';
 
-const agencyUi = { strategyId: 'swing', limitsGroup: null, limitsDirty: false, busy: new Set(), dismissedMigration: null, memberPage: 1, memberGroup: null, reconcileSession: 0, reconcileContext: null, assignConditions: null, poolPage: 1, poolResultId: null, poolRenderKey: null, screeningMode: 'strategy' };
+const agencyUi = { strategyId: 'swing', limitsGroup: null, limitsDirty: false, busy: new Set(), dismissedMigration: null, memberPage: 1, memberGroup: null, reconcileSession: 0, reconcileContext: null, poolPage: 1, poolResultId: null, poolRenderKey: null, screeningMode: 'strategy' };
 const agencyModeNames = { running: '运行中', paused: '暂停新开仓', stopped: '全部停止' };
-const agencyMemberNames = { active: '参与规则检查', removing: '退出后移除', closing: '尽快退出' };
+const agencyMemberNames = { active: '活跃监控', standby: '候补 · 低频重选', removing: '退出后移除', closing: '尽快退出' };
 const agencyActionNames = { buy: '买入', hold: '持有', sell: '卖出', reduce: '减仓', wait: '等待' };
 const agencyDecisionStatus = { executed: '已模拟执行', blocked: '规则拦截', waiting: '继续等待', stale: '条件已变化', request: '正在检查', error: '检查失败', complete: '检查完成', idle: '暂无可检查股票' };
 function agencyGroups() { return state?.agency?.groups || []; }
+function agencyActiveCandidateLimit() {
+  const value = state?.agencyPool?.policy?.candidateSelection?.activeLimitPerGroup
+    ?? state?.agencyPool?.policies?.strategy?.candidateSelection?.activeLimitPerGroup;
+  return Number.isSafeInteger(value) && value > 0 ? value : 20;
+}
 function agencyGroup() { return agencyGroups().find(group => group.id === agencyUi.strategyId); }
 function agencyOwner(symbol) { return agencyGroups().find(group => (group.members || []).some(member => member.symbol === symbol)); }
 function agencyCycles(group) { return Number.isFinite(group.completedCycles) ? group.completedCycles : Array.isArray(group.cycles) ? group.cycles.filter(cycle => cycle.status === 'closed').length : 0; }
@@ -18,6 +23,9 @@ function agencyDecisionSource(item) {
   if (item.model || ['model', 'llm'].includes(item.decisionMode) || ['model', 'llm'].includes(item.decisionSource)) return '历史模型决策' + (item.model ? ` · ${item.model}` : '');
   if (agencyIsRuleDecision(item)) return `固定规则${item.rulesVersion ? ` · v${item.rulesVersion}` : ''}`;
   return '来源未标注的历史记录';
+}
+function agencyHistoricalDecisionHtml(item) {
+  return item ? `<small class="agency-member-decision">历史决策记录 · ${esc(timeText(item.time))} · ${esc(agencyDecisionSource(item))} · ${esc(agencyDecisionStatus[item.status] || '记录')}：${esc(agencyText(item.reason || item.message))}</small>` : '';
 }
 function agencyEntryConditionLabels(conditions) {
   if (!conditions) return [];
@@ -34,15 +42,10 @@ function agencyEntryConditionLabels(conditions) {
   labels.push(...researchRuleLabels(conditions.research), ...performanceLabels(conditions.performance), ...industryRuleLabels(conditions.evidence?.industry));
   return labels;
 }
-function agencyEntryConditionSummary(conditions) {
-  if (!conditions) return '<p class="tiny">未携带选股条件：加入后纳入策略监控；不额外附加共同财务或行业研究条件。纳入监控不代表立即买入，实际开仓仍须通过策略买点、数据、风险及资金检查。</p>';
-  const labels = agencyEntryConditionLabels(conditions);
-  return `<div class="agency-entry-summary"><b>保存本次个人额外条件 · ${labels.length} 项</b>${labels.length ? `<ul>${labels.map(label => `<li>${esc(label)}</li>`).join('')}</ul>` : '<p>本次未设置额外限制。</p>'}<p class="tiny">加入后纳入策略监控，不代表立即买入。新开仓须同时通过这些个人条件、内置策略和资金成交约束。财务随最新披露、技术指标随完整日线、价格与盘口在开仓前复核。范围、板块和排序不保存为开仓条件；以后修改选股页面不会修改已保存条件。条件失效只阻止新开仓，已有持仓沿用退出规则。</p></div>`;
-}
 function agencyEntryCheckHtml(check, held = false) {
   if (!check) return '<small>尚无持续条件检查记录，等待下一轮。</small>';
   if (check.status === 'skipped' && check.skippedBy === 'pool-qualification') {
-    return `<div class="agency-entry-check"><b class="agency-pending">持续开仓条件：本轮未检查</b><small>检查 ${esc(timeText(check.checkedAt))}</small><p>严格研究资格尚未通过，本轮跳过持续开仓复核。具体原因见上方“严格研究资格”；使用严格研究筛选更新并通过后恢复检查。</p></div>`;
+    return `<div class="agency-entry-check"><b class="muted">历史检查：当时未检查持续条件</b><small>检查 ${esc(timeText(check.checkedAt))}</small><p>当时因严格研究资格未通过而跳过；该研究门槛现已停用。本记录不代表当前开仓状态，等待新的行情与技术检查。</p></div>`;
   }
   const status = ({ pass: '通过', passed: '通过', fail: '不满足', failed: '不满足', pending: '待核验', unavailable: '资料不足', none: '未设置', blocked: '未通过', skipped: '未检查' })[check.status] || (check.passed ? '通过' : '未通过');
   const reasons = Array.isArray(check.reasons) ? check.reasons : check.reason ? [check.reason] : [];
@@ -50,40 +53,112 @@ function agencyEntryCheckHtml(check, held = false) {
   return `<div class="agency-entry-check">${researchInlineHtml(check.researchReview)}${performanceReviewHtml(check.performanceReview)}${industryReviewHtml(check.industryReview || check.selectionEvidence?.industryReview, check.conditions?.evidenceMode === 'automatic' ? 'automatic' : 'manual')}<b class="${failed ? 'agency-pending' : 'teal'}">持续开仓条件：${esc(status)}</b><small>检查 ${esc(timeText(check.checkedAt))}</small>${reasons.length ? `<p>${reasons.map(reason => esc(agencyText(reason))).join('；')}</p>` : ''}${held && failed ? '<p class="agency-pending">已有持仓提示：当前不再满足新开仓条件；不会因此直接卖出，仍按原退出规则管理。</p>' : ''}${check.checks?.length ? `<details data-detail-key="entry-check"><summary>逐项检查 · ${check.checks.length} 项</summary>${check.checks.map(item => `<p><b>${esc(item.label || '条件')} · ${esc(({ pass: '通过', fail: '不满足', failed: '不满足', pending: '待核验' })[item.status] || item.status || '')}</b>${item.actual != null ? `<span>实际：${esc(agencyText(item.actual))}</span>` : ''}${item.expected != null ? `<span>要求：${esc(agencyText(item.expected))}</span>` : ''}${item.reason ? `<span>${esc(agencyText(item.reason))}</span>` : ''}</p>`).join('')}</details>` : ''}</div>`;
 }
 function agencyMemberEntryHtml(member, decisions, held) {
-  const strict = member.selectionMode === 'strict', poolCheck = member.poolCheck;
-  const poolHtml = poolCheck ? `<details class="agency-entry-check agency-pool-member"><summary class="${strict && poolCheck.status !== 'pass' ? 'agency-pending' : 'muted'}">${strict ? '严格研究资格' : '历史筛选记录'}：${esc(({ pass: '通过', pending: '待核验', failed: '不满足' })[poolCheck.status] || poolCheck.status)}</summary><small>${esc(timeText(poolCheck.checkedAt))} · 标准 ${esc(poolCheck.policyVersion || '未标注')}</small>${poolCheck.reasons?.length ? `<p>${poolCheck.reasons.map(reason => esc(agencyText(reason))).join('；')}</p>` : ''}${poolCheck.matchedStrategies?.length ? `<small>符合：${poolCheck.matchedStrategies.map(id => esc(strategyProfile(id).name)).join(' / ')}</small>` : ''}<small>${!strict ? '记录仅说明该次筛选结果；不取消监控身份，当前能否开仓见最近规则检查。' : held ? '持仓继续沿用原退出计划，不因本次复核直接卖出。' : poolCheck.status !== 'pass' ? '严格研究资格待核验，暂停新开仓；使用严格研究筛选更新并通过后恢复。' : '实际开仓仍须通过实时规则检查。'}</small></details>` : '';
-  if (!member.entryConditions) return `<div class="agency-entry-summary">${poolHtml}<b>未保存选股条件</b><small>此成员仅按内置策略检查。再次加入会跳过，保留原归属和条件，不会自动补入本次筛选规则。</small></div>`;
+  const poolCheck = member.poolCheck, standby = agencyMemberPhase(member, held) === 'standby';
+  const archived = member.legacyResearchConditions || member.legacyPoolConditions;
+  const archivedLabels = agencyEntryConditionLabels(archived);
+  const archiveHtml = archived ? `<details data-detail-key="archived-research"><summary>原选股条件留档 · 研究条件已停用</summary><p class="tiny">以下是变更前的完整条件快照，仅供追溯；其中研究、财务与估值条件不再参与自动开仓。当前有效条件另列。</p>${archivedLabels.length ? `<ul>${archivedLabels.map(label => `<li>${esc(label)}</li>`).join('')}</ul>` : '<p>未记录可展示的条件。</p>'}</details>` : '';
+  const poolHtml = poolCheck ? `<details class="agency-entry-check agency-pool-member"><summary class="muted">历史筛选记录：${esc(({ pass: '通过', pending: '待核验', failed: '不满足' })[poolCheck.status] || poolCheck.status)}</summary><small>${esc(timeText(poolCheck.checkedAt))} · 标准 ${esc(poolCheck.policyVersion || '未标注')}</small>${poolCheck.reasons?.length ? `<p>${poolCheck.reasons.map(reason => esc(agencyText(reason))).join('；')}</p>` : ''}${poolCheck.matchedStrategies?.length ? `<small>符合：${poolCheck.matchedStrategies.map(id => esc(strategyProfile(id).name)).join(' / ')}</small>` : ''}<small>${held ? '持仓继续沿用原退出计划，不因本次复核直接卖出。' : standby ? '当前为候补，等待候选池更新重新筛选与排序；本记录不代表当前可以开仓。' : '记录仅说明当次结果；旧研究门槛已停用，当前能否开仓见最近行情与技术检查。'}</small></details>` : '';
+  if (!member.entryConditions) return `<div class="agency-entry-summary">${poolHtml}${archiveHtml}<b>未设置额外行情技术条件</b><small>此成员按内置策略检查，旧研究条件不再参与开仓判断。</small></div>`;
   const conditions = member.entryConditions, labels = agencyEntryConditionLabels(conditions);
   const latestDecision = decisions.find(item => {
     const check = item.executionCheck?.entryConditionsCheck || item.entryConditionsCheck;
     return check?.conditions && JSON.stringify(check.conditions) === JSON.stringify(conditions);
   });
   const latest = latestDecision?.executionCheck?.entryConditionsCheck || latestDecision?.entryConditionsCheck;
-  return `<div class="agency-entry-summary">${poolHtml}<details data-detail-key="entry-conditions"><summary>已保存选股条件 · ${labels.length} 项</summary><small>保存 ${esc(timeText(conditions.savedAt))}${conditions.source?.selectedAt ? ` · 筛选 ${esc(timeText(conditions.source.selectedAt))}` : ''}</small>${labels.length ? `<ul>${labels.map(label => `<li>${esc(label)}</li>`).join('')}</ul>` : '<p>未设置额外限制。</p>'}<small>新开仓持续复核；选股页面后续修改不会改变此快照。</small></details>${agencyEntryCheckHtml(latest, held)}</div>`;
+  return `<div class="agency-entry-summary">${poolHtml}${archiveHtml}<details data-detail-key="entry-conditions"><summary>有效行情技术条件 · ${labels.length} 项</summary><small>保存 ${esc(timeText(conditions.savedAt))}${conditions.source?.selectedAt ? ` · 筛选 ${esc(timeText(conditions.source.selectedAt))}` : ''}</small>${labels.length ? `<ul>${labels.map(label => `<li>${esc(label)}</li>`).join('')}</ul>` : '<p>未设置额外限制。</p>'}<small>新开仓持续复核；旧研究、财务和估值条件已停用。</small></details>${standby ? '<small>候补期间暂停持续开仓检查，恢复活跃后重新核验。</small>' : agencyEntryCheckHtml(latest, held)}</div>`;
 }
 
-const agencyMonitoringNames = { eligible: '本轮开仓检查通过', holding: '持仓管理', paused: '暂停开仓', data: '数据待核验', risk: '风险阻断', funds: '资金或仓位受限', conditions: '等待买点或个人条件', unchecked: '尚未检查' };
-function agencyMonitoringStatus(member) { return Object.hasOwn(agencyMonitoringNames, member.monitoringCheck?.status) ? member.monitoringCheck.status : 'unchecked'; }
-function agencyMonitoringHtml(member) {
-  const check = member.monitoringCheck, status = agencyMonitoringStatus(member);
-  return `<div class="agency-monitoring-check" data-monitoring-status="${esc(status)}"><b class="${status === 'eligible' || status === 'holding' ? 'teal' : 'agency-pending'}">${esc(agencyMonitoringNames[status])}</b>${check?.reason ? `<span>${esc(check.reason)}</span>` : '<span>等待下一轮规则检查；纳入监控不代表立即买入。</span>'}${check?.checkedAt ? `<small>最近检查 ${esc(timeText(check.checkedAt))}</small>` : ''}</div>`;
+const agencyMonitoringNames = { eligible: '本轮开仓检查通过', holding: '持仓管理', paused: '暂停开仓', data: '数据待核验', risk: '风险阻断', funds: '资金或仓位受限', conditions: '等待买点或个人条件', recheck: '待重新检查', unchecked: '尚未检查' };
+const agencyPreparationNames = { prepared: '盘前资料已准备 · 等待开市', 'waiting-live': '历史资料已备 · 等待当日行情与基准', ready: '资料就绪 · 等待策略判断', preparing: '正在准备交易资料', error: '数据准备异常', inactive: '当前无需准备开仓资料' };
+function agencyMemberPreparationHtml(symbol, strategyId) {
+  const item = state.agency?.runtime?.preparation?.members?.find(value => value.symbol === symbol && value.strategyId === strategyId);
+  if (!item) return '';
+  return `<div class="agency-member-preparation" data-preparation-status="${esc(item.status)}"><b class="${['ready', 'prepared'].includes(item.status) ? 'teal' : item.status === 'inactive' ? 'muted' : 'agency-pending'}">${esc(agencyPreparationNames[item.status] || '等待资料检查')}</b>${item.reason ? `<span>${esc(item.reason)}</span>` : ''}${item.preparedAt ? `<small>资料准备 ${esc(timeText(item.preparedAt))}</small>` : ''}</div>`;
+}
+function agencyPreparationHtml(preparation) {
+  if (!preparation) return '';
+  const total = preparation.total || 0, ready = preparation.ready || 0, prepared = preparation.prepared || 0;
+  const waiting = preparation.waitingLive || 0, failed = preparation.failed || 0, preparing = preparation.preparing || 0;
+  const closed = state.agency?.runtime?.session?.open === false;
+  const standbyOnly = !total && agencyGroups().some(group => (group.members || []).some(member => member.mode === 'standby'));
+  const title = failed ? `数据准备异常 ${failed} 只${ready + prepared + waiting ? ' · 其余成员独立检查' : ''}`
+    : preparing ? '正在准备交易资料' : closed && prepared ? '盘前资料已准备 · 等待开市'
+      : waiting ? '历史资料已备 · 等待当日行情与基准' : ready ? '成员资料就绪 · 等待策略判断'
+        : total && preparation.inactive === total ? '当前策略均已停止，未准备开仓资料' : standbyOnly ? '暂无需自动准备的成员 · 候补等待重选' : '等待交易资料准备';
+  const group = agencyGroup(), modeNote = group?.mode === 'paused' ? '当前策略暂停新开仓；资料准备不会自动启用策略。'
+    : group?.mode === 'stopped' ? '当前策略自动买卖已停止；资料准备不会自动启用策略。' : '';
+  return `<div data-preparation-summary="${failed ? 'error' : preparing ? 'preparing' : waiting ? 'waiting-live' : closed && prepared ? 'prepared' : ready ? 'ready' : 'idle'}"><b class="${failed || preparing || waiting ? 'agency-pending' : 'teal'}">${esc(title)}</b><span>全部策略 ${total} 只 · 盘前已备 ${prepared} · 等待当日行情 ${waiting} · 资料就绪 ${ready} · 准备中 ${preparing} · 异常 ${failed}${preparation.inactive ? ` · 无需准备 ${preparation.inactive}` : ''}</span><small>${esc(modeNote)}资料就绪仅表示数据检查完成；新开仓还须通过市场环境、策略信号、资金与盘口检查。市场环境改善需至少 120 秒确认，回踩或突破信号仍需至少 60 秒站稳确认。</small></div>`;
+}
+function agencyMemberPhase(member, held = false) { return ['closing', 'removing'].includes(member.mode) ? 'exiting' : held ? 'held' : member.mode === 'active' ? 'active' : member.mode === 'standby' ? 'standby' : 'exiting'; }
+function agencyMemberCounts(group) {
+  const held = new Set((group.positions || []).map(position => position.symbol));
+  const counts = { active: 0, held: 0, standby: 0, exiting: 0 };
+  for (const member of group.members || []) {
+    const phase = agencyMemberPhase(member, held.has(member.symbol));
+    counts[phase]++;
+    // Exit intent is also visible as a separate filter, including held stocks.
+    if (phase === 'exiting' && held.has(member.symbol)) counts.held++;
+  }
+  return counts;
+}
+function agencyOverviewHtml(groups) {
+  if (!groups.length) return '<p class="tiny">正在加载策略股票…</p>';
+  return groups.map(group => {
+    const counts = agencyMemberCounts(group), held = new Set((group.positions || []).map(position => position.symbol));
+    const active = (group.members || []).filter(member => agencyMemberPhase(member, held.has(member.symbol)) === 'active');
+    return `<article class="agency-overview-card${group.id === agencyUi.strategyId ? ' is-selected' : ''}" data-agency-overview="${esc(group.id)}"><div class="agency-overview-heading"><button type="button" data-agency-select="${esc(group.id)}" aria-label="查看${esc(group.name)}策略详情">${esc(group.name)}<span aria-hidden="true"> ↗</span></button><span class="${group.mode === 'running' ? 'teal' : 'muted'}">${esc(agencyModeNames[group.mode] || '尚未启用')}</span></div><div class="agency-overview-count"><strong>${active.length}<small> / ${agencyActiveCandidateLimit()}</small></strong><span>活跃候选</span></div><div class="agency-overview-stocks">${active.length ? active.map(member => `<button type="button" data-agency-open="${esc(member.symbol)}"><strong>${esc(state.quotes[member.symbol]?.name || member.poolCheck?.name || member.symbol)}</strong><span>${esc(member.symbol.toUpperCase())}</span></button>`).join('') : '<p class="agency-overview-empty">暂无活跃候选<br><small>等待候选池更新与筛选</small></p>'}</div><div class="agency-overview-footer"><button type="button" data-agency-select="${esc(group.id)}" data-agency-phase="held">持仓 ${counts.held}</button><button type="button" data-agency-select="${esc(group.id)}" data-agency-phase="standby">候补 ${counts.standby}</button>${counts.exiting ? `<button type="button" data-agency-select="${esc(group.id)}" data-agency-phase="exiting">退出 ${counts.exiting}</button>` : ''}</div></article>`;
+  }).join('');
+}
+function agencyCurrentMonitoringCheck(member) { return member.monitoringCheck?.entryPolicyVersion === 1 ? member.monitoringCheck : null; }
+function agencyLegacyMonitoringCheck(member) { return !agencyCurrentMonitoringCheck(member) && member.monitoringCheck || member.legacyMonitoringCheck; }
+function agencyMonitoringStatus(member, held = false) {
+  const phase = agencyMemberPhase(member, held), check = agencyCurrentMonitoringCheck(member);
+  return ['standby', 'exiting'].includes(phase) ? phase : Object.hasOwn(agencyMonitoringNames, check?.status) ? check.status : agencyLegacyMonitoringCheck(member) ? 'recheck' : 'unchecked';
+}
+function agencyUnopenedReason(member, held = false, group = agencyOwner(member.symbol)) {
+  if (held) return '';
+  const phase = agencyMemberPhase(member, held), check = agencyCurrentMonitoringCheck(member);
+  if (phase === 'standby') return member.standbyReason || '当前为候补，等待更新候选池后重新筛选与排序。';
+  if (phase === 'exiting') return '已有退出或移除安排，不参与新开仓。';
+  if (group?.mode === 'paused') return '本策略已暂停新开仓，恢复运行后才会继续检查买入条件。';
+  if (group?.mode === 'stopped') return '本策略已全部停止，恢复运行后才会继续检查买入条件。';
+  const runtime = state?.agency?.runtime;
+  if (runtime?.online === false) return `自动交易当前不可用，等待恢复后重新检查。${runtime.lastError ? `最近运行错误：${runtime.lastError}` : ''}`;
+  if (runtime?.session?.known === false) return runtime.session.label || '交易日历尚未核验，暂停自动开仓。';
+  if (runtime?.session?.open === false) return `${runtime.session.label || '当前非连续竞价时段'}，等待连续竞价时段重新检查。`;
+  const preparation = runtime?.preparation?.members?.find(item => item.symbol === member.symbol && item.strategyId === group?.id);
+  if (['error', 'preparing', 'prepared', 'waiting-live'].includes(preparation?.status)) return preparation.reason || agencyPreparationNames[preparation.status];
+  if (check?.status === 'eligible') return '本轮检查已通过，但尚未形成持仓；实际开仓仍需执行前复核。';
+  if (check?.reason && !['holding', 'paused'].includes(check.status)) return check.reason;
+  return '等待新一轮技术开仓检查，确认买点、资金和可成交条件。';
+}
+function agencyMonitoringHtml(member, held = false, group = agencyOwner(member.symbol)) {
+  const reason = agencyUnopenedReason(member, held, group);
+  const unopened = reason ? `<span data-unopened-reason>未开仓原因：${esc(reason)}</span>` : '';
+  if (agencyMemberPhase(member, held) === 'standby') return `<div class="agency-monitoring-check agency-standby-note" data-monitoring-status="standby"><b>候补 · 不参与高频刷新</b>${unopened}<small>点击“更新四策略候选池”后重新评估；保留原归属和个人条件。</small></div>`;
+  if (agencyMemberPhase(member, held) === 'exiting') return `<div class="agency-monitoring-check" data-monitoring-status="exiting"><b>退出安排</b>${unopened || '<span>不参与新开仓，等待退出或移除处理。</span>'}</div>`;
+  const check = agencyCurrentMonitoringCheck(member), status = agencyMonitoringStatus(member, held);
+  const result = check?.reason && check.reason !== reason ? `<small>最近检查结果：${esc(check.reason)}</small>` : '';
+  return `<div class="agency-monitoring-check" data-monitoring-status="${esc(status)}"><b class="${status === 'eligible' || status === 'holding' ? 'teal' : 'agency-pending'}">${esc(agencyMonitoringNames[status])}</b>${unopened}${result}${!reason && !check?.reason ? '<span>等待下一轮持仓检查。</span>' : ''}${check?.checkedAt ? `<small>最近检查 ${esc(timeText(check.checkedAt))}</small>` : ''}</div>`;
 }
 function agencyMonitoringSummary(group) {
   const counts = Object.fromEntries(Object.keys(agencyMonitoringNames).map(key => [key, 0]));
-  for (const member of group.members || []) counts[agencyMonitoringStatus(member)]++;
-  return `<div class="agency-monitoring-heading"><b>监控与实际开仓阶段</b><span>已纳入监控 ${(group.members || []).length} 只</span></div><div class="agency-monitoring-counts">${Object.entries(agencyMonitoringNames).map(([key, label]) => `<div data-monitoring-count="${key}"><span>${label}</span><strong>${counts[key]}</strong></div>`).join('')}</div><p class="tiny">按每只股票最近一次规则检查归类，数量可合计；后续行情可能改变结果。纳入监控不代表立即买入，本轮检查通过也须执行前再次复核。</p>`;
+  const phases = agencyMemberCounts(group), held = new Set((group.positions || []).map(position => position.symbol));
+  for (const member of group.members || []) { const status = agencyMonitoringStatus(member, held.has(member.symbol)); if (Object.hasOwn(counts, status)) counts[status]++; }
+  return `<div class="agency-monitoring-heading"><b>监控与实际开仓阶段</b><span>成员 ${(group.members || []).length} 只 · 活跃 ${phases.active} · 持仓 ${phases.held} · 候补 ${phases.standby}</span></div><div class="agency-member-counts">${Object.entries({ active: '活跃空仓候选', held: '持仓管理', standby: '候补' }).map(([key, label]) => `<div data-member-count="${key}"><span>${label}</span><strong>${phases[key]}</strong></div>`).join('')}</div><p class="tiny">每策略最多 ${agencyActiveCandidateLimit()} 只活跃空仓候选，持仓及退出安排继续管理。候补保留归属和个人条件，不参与高频报价、开仓资料准备或规则检查；点击“更新四策略候选池”后重选及替补。</p><div class="agency-monitoring-counts">${Object.entries(agencyMonitoringNames).map(([key, label]) => `<div data-monitoring-count="${key}"><span>${label}</span><strong>${counts[key]}</strong></div>`).join('')}</div><p class="tiny">上方开仓阶段仅统计活跃与持仓成员的最近检查，不将候补的历史结果计作当前状态。纳入活跃监控不代表立即买入，本轮检查通过也须执行前再次复核。</p>`;
 }
 
-const agencyPoolCategories = { added: '新增', retained: '保留', removed: '移出', pending: '原候选待核验', unassignedPending: '未入池待核验', held: '持仓保留', skipped: '跳过' };
-function agencyPoolResearch() { return ['product', 'company'].includes(agencyUi.screeningMode) ? agencyUi.researchDrafts?.[agencyUi.screeningMode] || { version: 1, enabled: false, path: agencyUi.screeningMode, rules: [] } : undefined; }
-function agencyPoolIndustry() { return agencyUi.screeningMode === 'strict' ? undefined : agencyUi.industry; }
-function agencyIndustryPolicyHtml(industry) { return industry ? `<div class="agency-industry-policy"><b>本次已启用行业原始指标条件</b>${industryRuleLabels(industry).map(label => `<p>${esc(label)}</p>`).join('')}<p class="tiny">所选行业条件与策略、其他已启用条件同时满足才通过；缺少排名依据时待核验。使用公开披露资料，不改变既有成员保存的条件。</p></div>` : ''; }
-function agencyResearchPolicyHtml(research) {
-  const labels = researchRuleLabels(research);
-  return `<b>${esc(researchPathNames[research.path])} · ${research.enabled ? '按自定条件筛选' : '只观察'}</b>${labels.length ? `<ul>${labels.map(label => `<li>${esc(label)}</li>`).join('')}</ul>` : `<p>${research.enabled ? '请先添加至少一项条件并填写阈值。' : '本次研究资料不限制候选，不设置额外研究开仓门槛。'}</p>`}<p>旧研究标签和既有成员的已保存个人条件继续单独生效。</p>`;
+const agencyPoolCategories = { added: '新增', retained: '保留', standby: '候补', removed: '移出', pending: '原候选待核验', unassignedPending: '未入池待核验', held: '持仓保留', skipped: '跳过' };
+function agencyPoolResearch() { return undefined; }
+function agencyPoolIndustry() { return undefined; }
+function agencyResearchDisabled(result) { return result?.selection?.mode === 'technical' || result?.researchChecks?.status === 'disabled' || result?.coverage?.researchChecks?.status === 'disabled' || result?.evidenceMode === 'none'; }
+function agencyPoolModeName(result) {
+  return !result || agencyResearchDisabled(result) ? '行情与技术筛选' : '历史筛选结果 · 原研究条件已停用';
 }
-function agencyResearchWorkflow(research) { return `① 策略数值发现 → ② ${researchPathNames[research.path]}${research.enabled ? '条件核验' : '仅供观察'} → ③ 纳入策略监控`; }
-function agencyPoolModeName(result) { const research = result?.research || result?.query?.research; return research ? `${researchPathNames[research.path] || '研究'} · ${research.enabled ? '条件筛选' : '只观察'}` : result?.screeningMode === 'strategy' || result?.coverage?.researchRequired === false ? '策略监控' : '旧严格研究筛选'; }
+function agencySelectionHtml(selection) {
+  if (!selection) return '<p class="tiny">正在加载入池标准。</p>';
+  return `<div class="agency-selection-heading"><b>${esc(selection.name)} · 入池标准</b><span class="small-badge">v${esc(selection.version)}</span></div><p class="tiny">仅检查流动性、波动、价格偏离与趋势，不采集公告或财务研究资料。${esc(selection.limitations)}</p><div class="agency-selection-strategies">${(selection.strategies || []).map(strategy => `<details data-render-key="selection:${esc(strategy.id)}"><summary>${esc(strategy.name)} · ${strategy.labels.length} 项条件</summary><ul>${strategy.labels.map(label => `<li>${esc(label)}</li>`).join('')}</ul></details>`).join('')}</div><p class="tiny">${esc(selection.basis)}</p><p class="tiny">这是下一轮入池规则；已持仓继续沿用原退出计划，实际开仓仍须通过实时信号、市场环境、资金与盘口约束。</p>`;
+}
 const agencyNoticeLabels = { 'notice-index-fetch': '公告目录获取失败', 'notice-index-data': '公告目录覆盖待核验',
   'notice-body-fetch': '公告正文获取失败', 'notice-page-parse': '公告页面解析待核验', 'notice-facts-pending': '公告事实字段待核验',
   'notice-policy-missing': '公告规则尚未支持', 'notice-event-pending': '公告事件影响待核验', 'notice-blocked': '公告已明确阻断新开仓',
@@ -151,7 +226,7 @@ function agencyPoolDiagnosticsHtml(result) {
   }
   const entries = [...counts];
   const count = value => Number.isFinite(value) ? `${num(value, 0)} 家` : '未记录';
-  return `<div class="agency-pool-diagnostics"><div class="agency-pool-diagnostics-heading"><b>本次列表按公司去重的诊断</b><span>列表 ${count(companies.size)}</span></div>${diagnostics ? `<p class="tiny">全市场扫描 ${count(diagnostics.uniqueCompanies)} · 至少一策略通过 ${count(diagnostics.eligibleCompanies)} · 全部策略条件不符 ${count(diagnostics.failedCompanies)} · 尚有策略待核验 ${count(diagnostics.pendingCompanies)}</p>` : '<p class="tiny">历史结果未记录全市场统计。</p>'}<p class="tiny">下列数量与本次结果全部分类中的逐股标签一致，不受搜索或分类筛选影响；已有成员保留原监控模式和个人条件。</p>${entries.length ? `<div class="agency-pool-stage-counts">${entries.map(([key, stage]) => `<div data-pool-stage="${esc(key)}"><span>${esc(stage.label || key)}</span><strong>${num(stage.count, 0)}<small> 家</small></strong></div>`).join('')}</div><p class="tiny">同一公司可有多个原因，同一原因跨策略只计一次，分类数量不可相加。明确阻断与待核验分别列示。</p>` : '<p class="tiny">本次列表未记录额外诊断原因。</p>'}</div>`;
+  return `<div class="agency-pool-diagnostics"><div class="agency-pool-diagnostics-heading"><b>本次列表按公司去重的诊断</b><span>列表 ${count(companies.size)}</span></div>${diagnostics ? `<p class="tiny">全市场扫描 ${count(diagnostics.uniqueCompanies)} · 至少一策略通过 ${count(diagnostics.eligibleCompanies)} · 全部策略条件不符 ${count(diagnostics.failedCompanies)} · 尚有策略待核验 ${count(diagnostics.pendingCompanies)}</p>` : '<p class="tiny">历史结果未记录全市场统计。</p>'}<p class="tiny">下列数量与本次结果全部分类中的逐股标签一致，不受搜索或分类筛选影响；已有成员保留归属和行情技术条件，重新分配活跃与候补；旧研究条件已停用。</p>${entries.length ? `<div class="agency-pool-stage-counts">${entries.map(([key, stage]) => `<div data-pool-stage="${esc(key)}"><span>${esc(stage.label || key)}</span><strong>${num(stage.count, 0)}<small> 家</small></strong></div>`).join('')}</div><p class="tiny">同一公司可有多个原因，同一原因跨策略只计一次，分类数量不可相加。明确阻断与待核验分别列示。</p>` : '<p class="tiny">本次列表未记录额外诊断原因。</p>'}</div>`;
 }
 function agencyPoolPolicyLabels(query) {
   if (!query) return [];
@@ -168,23 +243,8 @@ function agencyPoolPolicyLabels(query) {
   return values;
 }
 function agencyPoolEvidenceSummaryHtml(result) {
-  const industry = result.industry || result.query?.evidence?.industry;
-  const industryHtml = agencyIndustryPolicyHtml(industry);
-  if (result.research) {
-    const research = result.research, summary = result.coverage?.operatingResearch || result.coverage?.researchSummary;
-    return `${industryHtml}<div class="agency-pool-evidence-heading"><b>${esc(researchPathNames[research.path] || '经营研究')} · ${research.enabled ? '已启用明确条件' : '只观察'}</b><span>${summary ? `通过 ${num(summary.pass ?? summary.passed ?? 0, 0)} · 不符 ${num(summary.failed ?? 0, 0)} · 待核验 ${num(summary.pending ?? 0, 0)}` : '逐股查看已披露资料'}</span></div><p class="tiny">${research.enabled ? '所选研究条件与策略条件同时满足才纳入本次候选。公司经营与产品指标分别判断，缺失值不会补为 0。' : '本次产品或公司经营资料只用于观察，不限制候选。原始指标和具体缺项可逐股查看。'} 产品未知不等于前景差，经营条件通过也不代表产品前景通过。</p>${researchRuleLabels(research).map(label => `<p class="tiny">${esc(label)}</p>`).join('')}<p class="tiny">公告风险与实际开仓条件另行核验；原有成员的个人条件继续保留。</p>`;
-  }
-  if (result.coverage?.researchRequired === false || result.screeningMode === 'strategy') {
-    const checked = result.coverage?.noticeFulltextChecked;
-    return `${industryHtml}<div class="agency-pool-evidence-heading"><b>策略监控 · 敏感公告专项核验</b><span>尝试读取原文 ${Number.isFinite(checked) ? `${num(checked, 0)} 家` : '未记录'}</span></div><p class="tiny">按各策略数值条件发现股票，并对最近 14 个自然日内的敏感公告按需读取原文。尝试读取包含下载或解析失败，不代表公告核验通过。</p><p class="tiny">${industry ? '本次另行核验上方行业排名条件；不附加产品前景或专项财务研究。' : '本次未附加产品前景、行业排名或专项财务研究。'} 公告原文核验不计作这三类研究完成。已有成员保留原监控模式及个人条件。</p>`;
-  }
-  const coverage = result.coverage || {}, summary = coverage.evidenceSummary;
-  const historical = Number.isFinite(result.policyVersion) && result.policyVersion <= 2
-    ? '<p class="tiny agency-pool-history-note">这是旧版研究筛选的历史结果，不等于当前默认策略监控的开仓门槛。已有成员按各自监控模式和个人条件检查；当前阻断原因请查看最近规则检查。</p>' : '';
-  if (result.policyVersion < 2 && !summary) return '<p class="tiny">本次为旧版研究证据结果；重新更新时将先进行数值筛选，再核验公开披露资料。</p>' + historical;
-  const checks = Object.entries(summary?.checks || {});
-  const count = value => Number.isFinite(value) ? `${num(value, 0)} 家` : '未记录';
-  return `${historical}<div class="agency-pool-evidence-heading"><b>公开披露资料程序核验</b><span>量化入围 ${count(coverage.quantitativeCandidates)}</span></div><div class="agency-pool-research-counts"><span>尝试核验 <b>${count(coverage.diagnostics?.researchAttempted ?? coverage.evidenceChecked)}</b></span><span>资料收集完整（仍需内容核验） <b>${count(coverage.diagnostics?.researchComplete)}</b></span><span>核验通过 <b>${count(summary?.pass)}</b></span></div><p>核验不符 ${count(summary?.failed)} · 资料不足 ${count(summary?.pending)}</p><p class="tiny">尝试核验包含获取或解析失败；取得完整资料后仍须通过研究条件判断。“产品前景”仅核验已披露的需求、商业化、竞争优势及风险材料，不预测未来收益。</p>${checks.length ? `<details><summary>研究资料核验与缺项</summary><div class="agency-pool-evidence-checks">${checks.map(([key, check]) => `<div><b>${esc(check.label || ({ productOutlook: '产品前景', leadership: '行业地位', financialReview: '财务事项' })[key] || key)}</b><span>通过 ${num(check.pass, 0)} · 不符 ${num(check.failed, 0)} · 资料不足 ${num(check.pending, 0)}</span></div>`).join('')}</div><p class="tiny">按量化入围公司去重核验；同一公司可有多类资料缺项，分类数量不能相加作为公司数量。缺项及实际依据可在下方逐股展开查看。</p></details>` : '<p class="tiny">本次未提供研究资料的分类统计；具体情况以逐股核验结果为准。</p>'}`;
+  const current = agencyResearchDisabled(result);
+  return `<div class="agency-pool-evidence-heading"><b>${current ? '行情与技术筛选' : '历史筛选结果 · 仅留档'}</b><span>研究筛查已停用 · 未核验</span></div><p class="tiny">公告风险、财报与行业经营研究、财务及业绩指标不参与自动入池和开仓判断。未核验不能理解为条件通过或没有风险。</p>${current ? '' : '<p class="tiny agency-pool-history-note">下方保留当时的研究结论及原因，不代表当前开仓要求。更新候选池后将按行情与技术规则重新筛选。</p>'}<p class="tiny">持仓及历史权益的公司行为核算继续保留；首次开仓仍检查行情、完整未复权日线及价格基准。</p>`;
 }
 function agencyEvidenceLocationHtml(record) {
   const locations = (record.locations || []).map(item => [item.page ? '第 ' + item.page + ' 页' : '', ({ 'pdf-text': 'PDF 文字', 'provider-text': '公告正文', ocr: '扫描识别 · 待核对' })[item.method] || '', item.lineStart ? `第 ${item.lineStart}${item.lineEnd && item.lineEnd !== item.lineStart ? `—${item.lineEnd}` : ''} 行` : '', item.method === 'ocr' && Number.isFinite(item.confidence) ? '识别置信度 ' + item.confidence + '%' : ''].filter(Boolean).join(' · '));
@@ -262,65 +322,59 @@ function agencyPoolElapsed(milliseconds) {
   return seconds >= 3600 ? `${Math.floor(seconds / 3600)} 小时 ${Math.floor(seconds / 60) % 60} 分`
     : seconds >= 60 ? `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒` : `${seconds} 秒`;
 }
+function initializeAgencyPoolConfiguration() {
+  agencyUi.configurationAccount = state.account.createdAt;
+  agencyUi.screeningMode = 'strategy';
+}
 function renderAgencyPool() {
   const pool = state.agencyPool || {}, result = pool.lastResult, progress = pool.progress || {};
+  initializeAgencyPoolConfiguration(pool);
+  const automation = pool.automation;
+  const automationLabels = { running: '正在自动更新', completed: '今日已完成更新', cancelled: '本次运行内今日自动更新已取消', unavailable: '等待应用就绪', 'calendar-unverified': '交易日历待核验', 'non-trading-day': '非交易日，等待下一交易日', 'outside-window': '等待交易日更新时段', 'retry-wait': '更新失败，等待重试', 'waiting-busy': '等待当前更新结束', waiting: '等待自动更新' };
+  setHtml('agency-pool-automation-status', automation ? `<b>自动选股 · ${esc(automationLabels[automation.status] || '等待调度')}</b><br><span class="tiny">${esc(automation.window || '交易日 08:45–15:00')} · 按行情与技术规则筛选。${automation.lastSuccessAt ? `最近完成 ${esc(timeText(automation.lastSuccessAt))}。` : ''}${automation.nextAttemptAt ? `下次尝试 ${esc(timeText(automation.nextAttemptAt))}。` : ''}${automation.lastError ? `最近失败：${esc(automation.lastError)}` : ''}</span>` : '正在加载自动选股计划。');
   const running = pool.running || agencyUi.busy.has('pool-run') || agencyUi.busy.has('pool-retry');
   const retrying = running && (pool.operation === 'retry' || agencyUi.busy.has('pool-retry'));
-  const retryAvailable = Boolean(result && (result.coverage?.diagnostics?.pendingCompanies > 0 || ['pending', 'unassignedPending'].some(key => (result.counts?.[key] ?? result[key]?.length ?? 0) > 0) || (result.held || []).some(item => item.status === 'pending')));
-  const selectedMode = agencyUi.screeningMode, strict = selectedMode === 'strict';
-  const research = agencyPoolResearch();
-  const industry = agencyPoolIndustry();
-  performanceRuleEditor('agency-performance-controls', { get: () => agencyUi.performance, set: value => { agencyUi.performance = value; }, busy: running });
-  $('agency-industry-controls').classList.toggle('hidden', strict);
-  industryRuleEditor('agency-industry-controls', { get: () => agencyUi.industry, set: (value, mode, part) => { agencyUi.industry = value; if (['mode', 'scope'].includes(part)) renderAgencyPool(); else setHtml('agency-pool-policy-content', (agencyPoolResearch() ? agencyResearchPolicyHtml(agencyPoolResearch()) : '<b>策略监控</b>') + agencyIndustryPolicyHtml(value)); }, source: 'automatic', busy: running || strict });
-  $('agency-pool-mode').value = selectedMode;
-  $('agency-pool-mode').disabled = running;
-  $('agency-research-controls').classList.toggle('hidden', !research);
-  if (research) researchRuleEditor('agency-research-controls', { path: selectedMode, get: agencyPoolResearch, set: value => { agencyUi.researchDrafts ||= {}; agencyUi.researchDrafts[selectedMode] = value; setHtml('agency-pool-policy-content', agencyResearchPolicyHtml(value) + agencyIndustryPolicyHtml(agencyPoolIndustry())); $('agency-pool-workflow').textContent = agencyResearchWorkflow(value); }, busy: running });
-  $('agency-pool-description').textContent = strict
-    ? '先对沪深全部 A 股进行财务与四策略数值筛选，再由程序核验产品前景、行业地位及财务事项；新加入成员采用严格研究模式。'
-    : research ? `先按四种策略各自的数值条件发现股票，再查看${researchPathNames[selectedMode]}资料。只有明确开启条件筛选并填写阈值，才据此判断候选；公司经营结论与产品证据分别呈现。`
-    : '按四种策略各自的数值条件发现股票并纳入监控。已有成员持续跟踪，不因本轮条件不符自动移出；买点、数据、风险和资金在开仓前另行检查。';
-  $('agency-pool-workflow').textContent = strict ? '① 数值初筛 → ② 研究核验 → ③ 加入严格研究监控' : research ? agencyResearchWorkflow(research) : '① 策略数值发现 → ② 纳入监控 → ③ 等待买点并检查交易约束';
+  const retryAvailable = Boolean(result && (result.coverage?.diagnostics?.pendingCompanies > 0 || ['pending', 'unassignedPending'].some(key => (result.counts?.[key] ?? result[key]?.length ?? 0) > 0) || [...result.held || [], ...result.standby || []].some(item => item.status === 'pending')));
+  const selection = pool.policy?.candidateSelection || pool.policies?.strategy?.candidateSelection;
+  setHtml('agency-selection-rules', agencySelectionHtml(selection));
+  const screened = result?.selection?.criteria;
+  $('agency-overview-note').textContent = `${selection ? screened?.version === selection.version ? `${selection.name} · ` : result ? '当前名单尚未按新版稳健条件重筛，请更新候选池。' : '稳健精选 · 等待候选池更新。' : ''}每策略最多 ${agencyActiveCandidateLimit()} 只空仓活跃候选，持仓另计；不足不补齐，入选不代表立即买入。`;
+  $('agency-pool-settings-summary').textContent = '筛选规则 · 行情与技术';
+  $('agency-pool-description').textContent = `按四种策略的行情与技术条件重新筛选。每组最多 ${agencyActiveCandidateLimit()} 只活跃空仓候选，不足不补齐；不符合、行情日线待核验或超出名额的成员进入候补。`;
+  $('agency-pool-workflow').textContent = '① 行情初筛 → ② 完整日线与技术条件 → ③ 排序进入活跃或候补';
   $('agency-pool-run').disabled = running;
   $('agency-pool-run').textContent = running && !retrying ? '正在更新候选池…' : '更新四策略候选池';
   $('agency-pool-retry').classList.toggle('hidden', !retryAvailable && !retrying);
   $('agency-pool-retry').disabled = running;
-  $('agency-pool-retry').textContent = retrying ? '正在重试失败资料…' : '重试失败资料';
+  $('agency-pool-retry').textContent = retrying ? '正在重试行情日线…' : '重试行情日线';
   $('agency-pool-retry-note').classList.toggle('hidden', !retryAvailable && !retrying);
   $('agency-pool-cancel').classList.toggle('hidden', !running);
   $('agency-pool-cancel').disabled = agencyUi.busy.has('pool-cancel');
   $('agency-pool-cancel').textContent = agencyUi.busy.has('pool-cancel') ? '正在取消…' : '取消本次更新';
   $('agency-pool-progress').classList.toggle('hidden', !running);
-  const phase = ({ quotes: '获取沪深 A 股行情', daily: '数值初筛 · 检查完整日线', finance: '数值初筛 · 检查财务质量', evidence: '为量化入围股票程序核验三类研究资料', noticeEvidence: '按需读取敏感公告原文并核验', 'risk-quotes': '复核行情风险', notices: '核验公告风险', syncing: '同步四策略候选', sync: '同步四策略候选', strategies: '匹配四种策略', screening: '匹配四种策略', preparing: '准备全市场筛选' })[progress.stage] || progress.message || '正在筛选与核验';
-  const detail = ['evidence', 'noticeEvidence'].includes(progress.stage) ? progress.detail : null;
-  $('agency-pool-progress-label').textContent = (retrying ? '重试资料 · ' : '') + phase + (detail?.name ? ` · ${detail.name}${detail.page && detail.pages ? ` · ${detail.stage === 'ocr' ? '识别扫描页' : '读取报告'} ${detail.page}/${detail.pages} 页` : detail.stage === 'index' ? ' · 检查公告目录' : detail.stage === 'parser-queue' ? (detail.status === 'waiting' ? ' · 等待解析' : ' · 正在解析') : detail.stage === 'download' ? ' · 下载原始附件' : ''}` : '');
+  const phase = ({ quotes: '获取沪深 A 股行情', daily: '检查完整日线与技术条件', 'risk-quotes': '复核行情风险', syncing: '同步四策略候选', sync: '同步四策略候选', strategies: '匹配四种策略', screening: '匹配四种策略', preparing: '准备全市场筛选' })[progress.stage] || '正在筛选行情与技术条件';
+  $('agency-pool-progress-label').textContent = (retrying ? '重试行情日线 · ' : '') + phase;
   const progressCount = progress.total > 0 ? `${num(progress.completed || 0, 0)} / ${num(progress.total, 0)}` : '等待数据';
-  const queued = detail?.queued ?? detail?.queueDepth;
-  $('agency-pool-progress-count').textContent = `${progressCount} · 已用 ${agencyPoolElapsed(pool.elapsedMs)}${Number.isFinite(queued) ? ` · 排队 ${num(queued, 0)} 份` : ''}`;
+  $('agency-pool-progress-count').textContent = `${progressCount} · 已用 ${agencyPoolElapsed(pool.elapsedMs)}`;
   const bar = $('agency-pool-progress-bar');
   if (progress.total > 0) bar.value = Math.min(100, Math.max(0, (progress.completed || 0) / progress.total * 100)); else bar.removeAttribute('value');
-  const policy = pool.policies?.[strict ? 'strict' : 'strategy'] || pool.policy, labels = strict ? agencyPoolPolicyLabels(policy?.commonQuery) : researchRuleLabels(research);
-  let policyHtml = labels.length
-    ? `<b>${esc(policy.name || '共同选股标准')}${policy.version ? ` · ${esc(policy.version)}` : ''}</b><ul>${labels.map(label => `<li>${esc(label)}</li>`).join('')}</ul>`
-    : strict ? '<p>严格研究标准正在加载。</p>' : research ? `<b>${esc(researchPathNames[selectedMode])} · ${research.enabled ? '尚未完成条件设置' : '只观察'}</b><p>请在上方选择资料用途。只观察不会产生额外研究门槛；开启筛选时，必须由你添加条件，不预设阈值。旧研究标签和已保存个人条件仍单独检查。</p>` : '<b>策略监控（默认）</b><p>使用各策略自己的数值发现条件，不附加统一的财务质量、产品前景或行业排名门槛。对最近 14 个自然日的敏感公告按需读取原文并核验，资料缺失或结论不明时继续阻断新开仓。发现条件不另存为持续开仓条件；实际买点由内置策略逐轮检查。</p>';
-  if (research) policyHtml = agencyResearchPolicyHtml(research);
-  if (industry) {
-    policyHtml = (research ? agencyResearchPolicyHtml(research) : '<b>策略监控</b><p>使用各策略数值发现条件，并单独核验敏感公告。下方行业条件作为本次额外条件。</p>') + agencyIndustryPolicyHtml(industry);
-    $('agency-pool-workflow').textContent = `① 策略数值发现 → ② ${research?.enabled ? `${researchPathNames[research.path]}与` : ''}行业条件核验 → ③ 纳入监控并等待买点`;
-  }
+  let policyHtml = '<b>行情与技术条件</b><p>采用上方四策略入池规则，不再附加公告、财报、经营、行业或业绩条件；入池后仍须通过实时买点与成交检查。旧研究配置只留档，不再生效。</p>';
+  policyHtml += `<b>活跃名额与归属</b><p>每组最多 ${agencyActiveCandidateLimit()} 只空仓活跃候选，持仓不占该名额。全部条件通过后，按距策略均线的百分比距离、成交额、原活跃优先、股票代码排序；排序用于分配刷新资源，不代表收益排名。数量不足不放宽条件，不改写已有持仓的退出计划。</p><p>本次不满足、待核验及超出名额的成员进入候补，不参与高频刷新。交易日更新时段内自动补更，也可手动更新或重试；每轮重新筛选及替补。</p>`;
   setHtml('agency-pool-policy-content', policyHtml);
   $('agency-pool-error').textContent = agencyUi.poolError || pool.lastError || '';
   $('agency-pool-error').classList.toggle('hidden', !agencyUi.poolError && !pool.lastError);
   $('agency-pool-status').textContent = running
     ? `${retrying ? '本次重试正在执行' : '本次更新正在执行'}${result?.finishedAt ? `；下方保留上次完成结果（${timeText(result.finishedAt)}）` : '，完成后展示处理结果'}。`
-    : result ? `最近${result.operation === 'retry' ? '重试' : '执行'}：${timeText(result.startedAt)} · 完成：${timeText(result.finishedAt)} · ${agencyPoolModeName(result)}` : '尚未执行候选池更新。没有定时任务，由你点击按钮启动。';
-  $('agency-pool-retry-note').textContent = `重试沿用上次${agencyPoolModeName(result)}模式及已保存阈值，先刷新全市场数值筛选，再复用仍然有效的资料，只补取缺失或失败部分；不会变更已有成员的模式和个人条件。`;
+    : result ? `最近${result.operation === 'retry' ? '重试' : '执行'}：${timeText(result.startedAt)} · 完成：${timeText(result.finishedAt)} · ${agencyPoolModeName(result)}` : '尚未完成候选池更新；等待自动选股，也可手动更新。';
+  $('agency-pool-retry-note').textContent = '重试按当前行情与技术规则重新筛选，复用仍有效的日线，只补取缺失或失败的行情日线；旧公告、财务和研究筛查不会恢复。完成后重新分配活跃与候补。';
   $('agency-pool-results').classList.toggle('hidden', !result);
+  $('agency-pool-report').classList.toggle('hidden', !result);
   if (!result) return;
   if (agencyUi.poolResultId !== result.id) { agencyUi.poolResultId = result.id; agencyUi.poolPage = 1; agencyUi.poolRenderKey = null; }
   $('agency-pool-result-title').textContent = running ? '上一次完成结果' : '最近一次更新结果';
   const scope = [result.coverage ? agencyPoolCoverageText(result.coverage) : '行情覆盖信息未提供', agencyPoolSourceText(result.sources)];
+  scope.push(screened ? `${screened.name} v${screened.version}` : '历史入池标准（未按稳健精选重筛）');
+  if (result.selection) scope.push(`每组活跃上限 ${result.selection.activeLimitPerGroup} 只空仓候选`, `排序：${result.selection.ranking}`);
   $('agency-pool-result-scope').textContent = scope.join(' · ');
   const filter = $('agency-pool-filter').value, search = $('agency-pool-search').value.trim().toLowerCase();
   const renderKey = `${result.id}:${result.finishedAt}:${filter}:${search}:${agencyUi.poolPage}`;
@@ -328,7 +382,7 @@ function renderAgencyPool() {
   agencyUi.poolRenderKey = renderKey;
   setHtml('agency-pool-evidence-summary', agencyPoolEvidenceSummaryHtml(result));
   setHtml('agency-pool-diagnostics', agencyPoolDiagnosticsHtml(result));
-  setHtml('agency-pool-metrics', Object.entries(agencyPoolCategories).map(([key, label]) => `<div class="${['pending', 'unassignedPending'].includes(key) ? 'is-pending' : ''}"><span>${label}</span><strong>${num(result.counts?.[key] ?? result[key]?.length ?? 0, 0)}</strong><small>${({ added: '已纳入监控', retained: '继续监控', removed: '本次移出记录', pending: '保留监控与诊断', unassignedPending: '资料不足，未新增', held: '沿用原退出计划', skipped: '保留现有安排' })[key]}</small></div>`).join(''));
+  setHtml('agency-pool-metrics', Object.entries(agencyPoolCategories).map(([key, label]) => `<div data-pool-count="${key}" class="${['pending', 'unassignedPending'].includes(key) ? 'is-pending' : ''}"><span>${label}</span><strong>${num(result.counts?.[key] ?? result[key]?.length ?? 0, 0)}</strong><small>${({ added: '新增活跃候选', retained: '继续或恢复活跃', standby: '不参与高频刷新', removed: '本次移出记录', pending: '历史待核验分类', unassignedPending: '资料不足，未新增', held: '沿用原退出计划', skipped: '保留现有安排' })[key]}</small></div>`).join(''));
   setHtml('agency-pool-strategies', Object.entries(result.strategies || {}).map(([id, counts]) => `<div><b>${esc(strategyProfile(id).name)}</b><span>通过 ${num(counts.pass || 0, 0)} · 不符合 ${num(counts.failed || 0, 0)} · 待核验 ${num(counts.pending || 0, 0)}</span></div>`).join('') + '<p class="tiny">策略统计为独立筛选结果，同一股票可能在多组中计数；下方按实际同步动作或未入池待核验去重展示。</p>');
   const rows = Object.keys(agencyPoolCategories).flatMap(category => (result[category] || []).map(item => ({ ...item, category })))
     .filter(item => (filter === 'all' || item.category === filter) && (!search || `${item.symbol} ${item.name || ''}`.toLowerCase().includes(search)));
@@ -339,7 +393,7 @@ function renderAgencyPool() {
   setHtml('agency-pool-items', rows.length ? rows.slice((agencyUi.poolPage - 1) * size, agencyUi.poolPage * size).map(item => {
     const reasons = Array.isArray(item.reasons) ? item.reasons : item.reason ? [item.reason] : [];
     const stages = agencyPoolItemStages(item, result.coverage?.researchRequired !== false);
-    return `<details class="agency-pool-item" data-render-key="${esc(`${result.id}:${item.category}:${item.symbol}:${item.strategyId || ''}`)}"><summary><span class="agency-pool-category ${['pending', 'unassignedPending'].includes(item.category) ? 'agency-pending' : ''}">${esc(agencyPoolCategories[item.category])}</span><strong>${esc(item.name || item.symbol)}</strong><span>${esc(item.symbol?.toUpperCase())}</span><span>${item.strategyId ? esc(strategyProfile(item.strategyId).name) : '未分配策略'}</span>${stages.length ? `<span class="agency-pool-stage-tags">${stages.map(stage => `<span>${esc(stage.label)}</span>`).join('')}</span>` : ''}</summary><div>${reasons.length ? `<ul>${reasons.map(reason => `<li>${esc(agencyText(reason))}</li>`).join('')}</ul>` : '<p>本项未提供额外说明。</p>'}${item.matchedStrategies?.length ? `<p>符合策略：${item.matchedStrategies.map(id => esc(strategyProfile(id).name)).join(' / ')}</p>` : ''}${item.strategyIds?.length ? `<p>待核验策略：${item.strategyIds.map(id => esc(strategyProfile(id).name)).join(' / ')}</p>` : ''}${item.category === 'held' ? `<p>本次选股复核：${esc(({ pass: '通过', pending: '待核验', failed: '不满足' })[item.status] || item.status || '见上方原因')}。已有持仓保留原归属和退出计划。</p>` : ''}${independentFinanceHtml(item)}${performanceReviewHtml(item.performanceReview)}${researchInlineHtml(item.researchReview)}${researchInspectButton(item.symbol, "agency")}${agencyPoolEvidenceHtml(item.evidenceReview)}${agencyNoticeReviewHtml(item.noticeReview)}<button type="button" class="text-button" data-agency-open="${esc(item.symbol)}">查看股票 ↗</button></div></details>`;
+    return `<details class="agency-pool-item" data-render-key="${esc(`${result.id}:${item.category}:${item.symbol}:${item.strategyId || ''}`)}"><summary><span class="agency-pool-category ${['pending', 'unassignedPending'].includes(item.category) ? 'agency-pending' : ''}">${esc(agencyPoolCategories[item.category])}</span><strong>${esc(item.name || item.symbol)}</strong><span>${esc(item.symbol?.toUpperCase())}</span><span>${item.strategyId ? esc(strategyProfile(item.strategyId).name) : '未分配策略'}</span>${stages.length ? `<span class="agency-pool-stage-tags">${stages.map(stage => `<span>${esc(stage.label)}</span>`).join('')}</span>` : ''}</summary><div>${reasons.length ? `<ul>${reasons.map(reason => `<li>${esc(agencyText(reason))}</li>`).join('')}</ul>` : '<p>本项未提供额外说明。</p>'}${item.matchedStrategies?.length ? `<p>符合策略：${item.matchedStrategies.map(id => esc(strategyProfile(id).name)).join(' / ')}</p>` : ''}${item.strategyIds?.length ? `<p>待核验策略：${item.strategyIds.map(id => esc(strategyProfile(id).name)).join(' / ')}</p>` : ''}${item.category === 'held' ? `<p>本次选股复核：${esc(({ pass: '通过', pending: '待核验', failed: '不满足' })[item.status] || item.status || '见上方原因')}。已有持仓保留原归属和退出计划。</p>` : ''}${agencyResearchDisabled(result) ? '' : `<details><summary>历史研究记录 · 已停用</summary>${independentFinanceHtml(item)}${performanceReviewHtml(item.performanceReview)}${researchInlineHtml(item.researchReview)}${agencyPoolEvidenceHtml(item.evidenceReview)}${agencyNoticeReviewHtml(item.noticeReview)}</details>`}<button type="button" class="text-button" data-agency-open="${esc(item.symbol)}">查看股票 ↗</button></div></details>`;
   }).join('') : '<p class="tiny agency-pool-no-results">没有此分类的处理结果。</p>', result.id);
 }
 function agencyPoolCoverageText(coverage) {
@@ -355,11 +409,9 @@ function agencyPoolSourceText(sources) {
 async function agencyUpdatePool(operation = 'update') {
   if (state.agencyPool?.running || agencyUi.busy.has('pool-run') || agencyUi.busy.has('pool-retry')) return;
   const retry = operation === 'retry', key = retry ? 'pool-retry' : 'pool-run';
-  const research = agencyPoolResearch(), industry = agencyPoolIndustry(), error = retry ? '' : researchRuleError(research) || performanceRuleError(agencyUi.performance) || industryRuleError(industry);
-  if (error) { agencyUi.poolError = error; renderAgencyPool(); return; }
   agencyUi.busy.add(key); agencyUi.poolError = ''; renderAgencyPool();
   try {
-    const result = await api(retry ? 'agency:pool:retry' : 'agency:pool:run', retry ? undefined : { screeningMode: agencyUi.screeningMode === 'strict' ? 'strict' : 'strategy', ...(research ? { research } : {}), ...(industry ? { industry } : {}), ...(agencyUi.performance ? { performance: agencyUi.performance } : {}) });
+    const result = await api(retry ? 'agency:pool:retry' : 'agency:pool:run', retry ? undefined : { screeningMode: 'strategy' });
     renderState(await api('state'));
     toast(result?.cancelled ? '本次更新已取消，监控列表未同步' : retry ? '资料重试已完成，可展开查看处理原因' : '四策略监控列表已更新；纳入监控不代表立即买入');
   } catch (error) {
@@ -371,13 +423,13 @@ async function agencyUpdatePool(operation = 'update') {
 function renderAgency() {
   const root = $('page-agency');
   if (!root || !state) return;
-  const owner = agencyOwner(selected), selectedButton = $('agency-selected');
-  if (selectedButton) { selectedButton.textContent = owner ? `${owner.name} · 自动交易` : '加入自动交易'; selectedButton.disabled = false; }
   if (page !== 'agency') return;
   renderAgencyPool();
   const groups = agencyGroups();
   $('agency-unavailable').classList.toggle('hidden', groups.length > 0);
   $('agency-workspace').classList.toggle('hidden', !groups.length);
+  if (groups.length && !agencyGroup()) agencyUi.strategyId = groups[0].id;
+  setHtml('agency-overview', agencyOverviewHtml(groups));
   renderAgencyRuntime();
   for (const [id, key] of [['agency-transfer-form', 'transfer'], ['agency-limits-form', 'limits']]) {
     $(id).querySelectorAll('input, select, button').forEach(control => { control.disabled = agencyUi.busy.has(key); });
@@ -385,9 +437,9 @@ function renderAgency() {
   if (!groups.length) return;
   if (!agencyGroup()) agencyUi.strategyId = groups[0].id;
   const group = agencyGroup(), profile = strategyProfile(group.id);
-  setHtml('agency-tabs', groups.map(item => `<button type="button" role="tab" aria-selected="${item.id === group.id}" aria-controls="agency-group-panel" tabindex="${item.id === group.id ? '0' : '-1'}" data-agency-tab="${esc(item.id)}"><strong>${esc(item.name)}</strong><span>${esc(agencyModeNames[item.mode] || '尚未启用')} · ${(item.members || []).length} 只</span></button>`).join(''));
+  setHtml('agency-tabs', groups.map(item => `<button type="button" role="tab" aria-selected="${item.id === group.id}" aria-controls="agency-group-panel" tabindex="${item.id === group.id ? '0' : '-1'}" data-agency-tab="${esc(item.id)}"><strong>${esc(item.name)}</strong><span>${esc(agencyModeNames[item.mode] || '尚未启用')}</span></button>`).join(''));
   $('agency-group-title').textContent = `${group.name}策略账户`;
-  $('agency-group-summary').textContent = profile.horizon || '按所选固定规则检查并模拟执行';
+  $('agency-group-summary').textContent = `可用资金 ¥ ${cash(group.availableCash ?? group.cash)} · 策略权益 ¥ ${cash(group.equity)}${group.comparable === false ? '（暂估）' : ''}`;
   $('agency-rule-title').textContent = `${group.name} · 固定买卖规则`;
   setHtml('agency-rule-details', [['买入条件', profile.entryDescription], ['退出条件', profile.exitDescription]].map(([title, description]) => `<section><h3>${title}</h3><p>${esc(description || '策略规则尚未加载，等待资料后再启用')}</p></section>`).join(''));
   $('agency-rule-data').textContent = profile.dataDescription || '使用完整未复权日线及有效报价；资料缺失或风险待核验时暂停新开仓。';
@@ -406,7 +458,7 @@ function renderAgency() {
   document.querySelectorAll('[data-agency-mode]').forEach(button => { button.disabled = button.dataset.agencyMode === group.mode || agencyUi.busy.has('mode'); });
   const runtime = state.agency.runtime;
   $('agency-run').disabled = group.mode === 'stopped' || (group.mode === 'paused' && !group.positions?.length) || runtime?.decisionMode !== 'rules' || runtime.online === false || runtime.session?.open === false || runtime.session?.known === false || (runtime.runningGroups || []).includes(group.id) || agencyUi.busy.has('run');
-  $('agency-manual-cash').textContent = `手动账户可划入 ¥ ${cash(state.agency.manualCash)}；当前策略现金余额 ¥ ${cash(group.cash)}，可用 ¥ ${cash(group.availableCash ?? group.cash)}${group.receivable ? `，应收分红 ¥ ${cash(group.receivable)}` : ''}${group.taxReserve ? `，预留预计税款 ¥ ${cash(group.taxReserve)}` : ''}。正数划入，负数划回；应收分红与预留预计税款不用于新开仓或划回。`;
+  $('agency-manual-cash').textContent = `未分配资金可划入 ¥ ${cash(state.agency.manualCash)}；当前策略现金余额 ¥ ${cash(group.cash)}，可用 ¥ ${cash(group.availableCash ?? group.cash)}${group.receivable ? `，应收分红 ¥ ${cash(group.receivable)}` : ''}${group.taxReserve ? `，预留预计税款 ¥ ${cash(group.taxReserve)}` : ''}。正数划入，负数划回；应收分红与预留预计税款不用于新开仓或划回。`;
   if (agencyUi.limitsGroup !== group.id || !agencyUi.limitsDirty) {
     const limits = group.limits || {};
     for (const [key, fallback] of [['maxPosition', .3], ['maxTotalPosition', .8], ['maxPositions', 5], ['riskPercent', .5], ['maxPlannedRiskPercent', 2], ['minRewardRisk', 2]]) {
@@ -415,6 +467,7 @@ function renderAgency() {
     agencyUi.limitsGroup = group.id; agencyUi.limitsDirty = false;
   }
   setHtml('agency-members', agencyMembersHtml(group), group.id);
+  $('agency-member-title').textContent = `${group.name} · ${{ active: '活跃候选', held: '持仓', standby: '候补', exiting: '退出安排', all: '全部成员' }[$('agency-member-filter').value] || '成员'}`;
   setHtml('agency-monitoring-summary', agencyMonitoringSummary(group));
   setHtml('agency-decisions', agencyDecisionsHtml(group), group.id);
   setHtml('agency-corporate-history', agencyCorporateHistoryHtml(group), group.id);
@@ -425,13 +478,14 @@ function renderAgency() {
 
 function agencyVerificationView(member) {
   const corporate = member?.corporateVerification;
+  const withoutCorporate = corporate?.status === 'not-required';
   if (corporate?.status === 'blocked') {
     return { pending: true, checkedAt: corporate.checkedAt, label: '价格与公司行为：未通过',
       note: corporate.reason || member?.reconciliation?.reason || '公司行为资料核验未通过，暂停该股自动执行' };
   }
   const check = member?.automaticCheck;
   if (check?.phase === 'prepared' && check.status === 'waiting') {
-    return { pending: true, checkedAt: check.checkedAt, label: '盘前资料已准备 · 等待开盘核验', note: check.reason };
+    return { pending: true, checkedAt: check.checkedAt, label: '盘前资料已准备 · 等待当日行情与基准', note: check.reason };
   }
   if (check?.status === 'clear' && member.awaitingVerification) {
     return { pending: true, label: '价格与公司行为：等待重新核验',
@@ -439,30 +493,33 @@ function agencyVerificationView(member) {
   }
   if (check && ['clear', 'waiting', 'blocked'].includes(check.status)) {
     return { pending: check.status !== 'clear', checkedAt: check.checkedAt,
-      label: ({ clear: '价格与公司行为：通过', waiting: '价格与公司行为：等待核验', blocked: '价格与公司行为：未通过' })[check.status],
-      note: check.reason || '限定公告窗口与价格基准已检查，不等于全部事件已核验' };
+      label: withoutCorporate ? ({ clear: '价格基准：通过', waiting: '价格基准：等待核验', blocked: '价格基准：未通过' })[check.status] : ({ clear: '价格与公司行为：通过', waiting: '价格与公司行为：等待核验', blocked: '价格与公司行为：未通过' })[check.status],
+      note: check.reason || (withoutCorporate ? '无持仓权益，首次开仓无需公司行为公告前置；尚未核验公司行为资料。' : '限定公告窗口与价格基准已检查，不等于全部事件已核验') };
   }
   const pending = member?.reconciliation?.status !== 'clear' || member?.awaitingVerification;
+  if (withoutCorporate) return { pending, label: pending ? '价格基准：等待核验' : member?.lastVerifiedAt ? '价格基准：通过' : '价格基准：尚未检查',
+    note: member?.reconciliation?.reason || '无持仓权益，首次开仓无需公司行为公告前置；仍须核验行情与完整日线。' };
   return { pending, label: pending ? '价格与公司行为：等待核验' : member?.lastVerifiedAt ? '价格与公司行为：通过' : '价格与公司行为：尚未检查',
     note: pending ? member?.reconciliation?.reason || '等待新鲜行情与公告复核，暂停该股自动执行'
       : member?.lastVerifiedAt ? '限定公告窗口与价格基准已检查，不等于全部事件已核验' : '等待新鲜行情与公告资料，尚未完成价格基准检查' };
 }
 function agencyCorporateStatus(check) {
   if (!check) return '';
+  if (check.status === 'not-required') return '公司行为资料：未核验 · 首次开仓无需公告前置';
   return `公司行为资料：${check.status === 'clear' ? '已核验' : check.status === 'blocked' ? '核验未通过' : '等待核验'}`;
 }
 
 function agencyMembersHtml(group) {
   if (agencyUi.memberGroup !== group.id) { agencyUi.memberPage = 1; agencyUi.memberGroup = group.id; }
-  const search = $('agency-member-search').value.trim().toLowerCase(), heldOnly = $('agency-member-held').checked;
+  const search = $('agency-member-search').value.trim().toLowerCase(), phase = $('agency-member-filter').value;
   const positions = new Map((group.positions || []).map(position => [position.symbol, position]));
-  const members = (group.members || []).filter(member => (!heldOnly || positions.has(member.symbol)) && (!search || member.symbol.includes(search) || (state.quotes[member.symbol]?.name || positions.get(member.symbol)?.name || member.poolCheck?.name || '').toLowerCase().includes(search)));
+  const members = (group.members || []).filter(member => (phase === 'all' || phase === 'held' && positions.has(member.symbol) || agencyMemberPhase(member, positions.has(member.symbol)) === phase) && (!search || member.symbol.includes(search) || (state.quotes[member.symbol]?.name || positions.get(member.symbol)?.name || member.poolCheck?.name || '').toLowerCase().includes(search)));
   const size = 30, pages = Math.max(1, Math.ceil(members.length / size));
   agencyUi.memberPage = Math.max(1, Math.min(agencyUi.memberPage, pages));
-  $('agency-member-page-info').textContent = `第 ${agencyUi.memberPage} / ${pages} 页 · ${search || heldOnly ? '筛选后 ' : ''}${members.length} 只 · 每页 ${size} 只`;
+  $('agency-member-page-info').textContent = `第 ${agencyUi.memberPage} / ${pages} 页 · ${search || phase !== 'all' ? '筛选后 ' : ''}${members.length} 只 · 每页 ${size} 只`;
   $('agency-member-prev').disabled = agencyUi.memberPage <= 1; $('agency-member-next').disabled = agencyUi.memberPage >= pages;
-  if (!group.members?.length) return empty('还没有自动交易自选', '划入模拟资金并加入股票，确认规则后启用；遇到待核验事项时先核对依据。');
-  if (!members.length) return empty('没有匹配的自动交易股票', '可清空搜索或取消仅看持仓');
+  if (!group.members?.length) return empty('还没有策略候选', '等待自动选股或点击更新候选池；划入资金并启用策略后，程序核验资料和买点。');
+  if (!members.length) return empty('没有匹配的自动交易股票', `可清空搜索或切换成员范围；活跃候选不足 ${agencyActiveCandidateLimit()} 只时按实际数量展示`);
   const visibleMembers = members.slice((agencyUi.memberPage - 1) * size, agencyUi.memberPage * size);
   const decisionsBySymbol = new Map();
   for (const item of (state.agency.decisions || []).slice().reverse()) {
@@ -470,19 +527,16 @@ function agencyMembersHtml(group) {
     if (!decisionsBySymbol.has(item.symbol)) decisionsBySymbol.set(item.symbol, []);
     decisionsBySymbol.get(item.symbol).push(item);
   }
-  return table(['股票 / 策略归属', '托管状态', '持有 / 可卖', '行情 / 浮动盈亏', '持续开仓条件', '核验与最新说明', '操作'], visibleMembers.map(member => {
+  return table(['股票', '持有 / 行情', '最近检查', '明细与操作'], visibleMembers.map(member => {
     const symbol = member.symbol, q = state.quotes[symbol], position = positions.get(symbol);
-    const verification = agencyVerificationView(member), corporateStatus = agencyCorporateStatus(member.corporateVerification);
+    const verification = agencyVerificationView(member), corporateStatus = agencyCorporateStatus(member.corporateVerification), standby = agencyMemberPhase(member, !!position) === 'standby';
     const decisions = decisionsBySymbol.get(symbol) || [];
     const latest = decisions.find(item => !['complete', 'request'].includes(item.status));
     return [
-      `<button class="screen-stock" data-agency-open="${esc(symbol)}"><strong>${esc(q?.name || position?.name || member.poolCheck?.name || symbol.slice(2))}</strong><small>${esc(symbol.toUpperCase())} · ${esc(group.name)}</small></button>`,
-      `<span class="status-tag ${member.mode === 'active' ? 'done' : ''}">${esc(agencyMemberNames[member.mode] || member.mode)}</span><small>${member.selectionMode === 'strict' ? '严格研究监控' : '策略监控'}</small>${agencyMonitoringHtml(member)}`,
-      position ? `${num(position.quantity, 0)} / ${num(position.available, 0)} 股` : '未持仓',
-      `${num(q?.price ?? position?.price)}<small>${esc(timeText(q?.timestamp || position?.quoteTime))}</small>${position ? `<span class="${cls(position.pnl)}">${signed(position.pnl / 100)} 元</span>` : ''}`,
-      independentFinanceHtml(latest?.executionCheck?.financeCheck ? latest.executionCheck : latest) + agencyMemberEntryHtml(member, decisions, !!position) + researchInspectButton(symbol, "agency-member"),
-      `<div class="agency-member-note"><b class="${verification.pending ? 'agency-pending' : member.lastVerifiedAt ? 'teal' : 'muted'}">${verification.label}</b><span>${esc(verification.note)}</span>${corporateStatus ? `<small>${esc(corporateStatus)}</small>` : ''}${verification.checkedAt ? `<small>自动检查 ${esc(timeText(verification.checkedAt))}</small>` : ''}${position?.risk?.note ? `<small>${esc(position.risk.note)}</small>` : ''}${latest ? `<small>${esc(timeText(latest.time))} · ${esc(agencyDecisionSource(latest))} · ${esc(agencyDecisionStatus[latest.status] || '记录')}：${esc(agencyText(latest.reason || latest.message))}</small>` : ''}</div>`,
-      `<div class="agency-row-actions"><button class="table-action" data-agency-reconcile="${esc(symbol)}">核验详情</button><button class="table-action" data-agency-member="close" data-agency-symbol="${esc(symbol)}" ${!position || member.mode === 'closing' ? 'disabled' : ''}>尽快退出</button><button class="text-button" data-agency-member="remove" data-agency-symbol="${esc(symbol)}" ${member.mode === 'removing' ? 'disabled' : ''}>${position ? '退出后移除' : '移出'}</button></div>`
+      `<button class="screen-stock" data-agency-open="${esc(symbol)}"><strong>${esc(q?.name || position?.name || member.poolCheck?.name || symbol.slice(2))}</strong><small>${esc(symbol.toUpperCase())}</small></button><small>${esc(position && member.mode === 'active' ? '持仓管理' : agencyMemberNames[member.mode] || member.mode)}</small>`,
+      `${position ? `${num(position.quantity, 0)} 股 / 可卖 ${num(position.available, 0)}` : '未持仓'}<small>¥ ${num(q?.price ?? position?.price)} · ${esc(timeText(q?.timestamp || position?.quoteTime))}</small>${position ? `<span class="${cls(position.pnl)}">${signed(position.pnl / 100)} 元</span>` : ''}`,
+      agencyMonitoringHtml(member, !!position, group),
+      `<details class="agency-member-details" data-detail-key="member-review"><summary>条件、核验与操作</summary><div class="agency-member-detail-body"><small>行情与技术模式 · 研究筛查已停用</small>${agencyMemberEntryHtml(member, decisions, !!position)}${standby ? '<div class="agency-member-note agency-standby-note"><b>等待低频重选</b><span>候补不自动刷新开仓资料；自动或手动更新候选池后重选。</span><small>过去的核验与开仓检查不作为候补的当前状态。</small></div>' : `<div class="agency-member-note">${agencyMemberPreparationHtml(symbol, group.id)}<b class="${verification.pending ? 'agency-pending' : member.lastVerifiedAt ? 'teal' : 'muted'}">${verification.label}</b><span>${esc(verification.note)}</span>${dailyHistoryHtml(member.automaticCheck?.dailyHistory)}${corporateStatus ? `<small>${esc(corporateStatus)}</small>` : ''}${verification.checkedAt ? `<small>自动检查 ${esc(timeText(verification.checkedAt))}</small>` : ''}${position?.risk?.note ? `<small>${esc(position.risk.note)}</small>` : ''}${agencyHistoricalDecisionHtml(latest)}</div>`}<div class="agency-row-actions"><button class="table-action" data-agency-reconcile="${esc(symbol)}">核验详情</button><button class="table-action" data-agency-member="close" data-agency-symbol="${esc(symbol)}" ${!position || member.mode === 'closing' ? 'disabled' : ''}>尽快退出</button><button class="text-button" data-agency-member="remove" data-agency-symbol="${esc(symbol)}" ${member.mode === 'removing' ? 'disabled' : ''}>${position ? '退出后移除' : '移出'}</button></div></div></details>`
     ];
   }), visibleMembers.map(member => `${group.id}:${member.symbol}`));
 }
@@ -529,17 +583,20 @@ function renderAgencyRuntime() {
   const interval = Number.isFinite(runtime?.intervalSeconds) && runtime.intervalSeconds > 0 ? runtime.intervalSeconds : 300;
   const intervalText = interval % 60 === 0 ? `${interval / 60} 分钟` : `${interval} 秒`;
   $('agency-runtime-badge').textContent = ready ? `固定规则 · v${runtime.rulesVersion || '1'}` : '正在加载规则';
-  $('agency-runtime-frequency').textContent = `盘前自动准备日线、公告等资料，获取失败后约每分钟重试，开盘后自动核验实时条件。交易时段规则每批检查 ${runtime?.batchSize || 20} 只，未完成时随行情刷新继续下一批，全部处理后再按 ${intervalText}间隔启动新一轮。完整轮次耗时取决于候选数量和数据服务；持仓退出独立刷新检查。`;
+  $('agency-runtime-frequency').textContent = `盘前为活跃成员准备行情与完整日线；持仓及历史权益另查公司行为，候补不参加开仓资料准备；获取失败后约每分钟重试；开市复用仍有效的资料，补核当日行情与价格基准。交易时段规则每批检查 ${runtime?.batchSize || 20} 只，未完成时随行情刷新继续下一批，全部处理后再按 ${intervalText}间隔启动新一轮。完整轮次耗时取决于候选数量和数据服务；持仓退出独立刷新检查。`;
+  setHtml('agency-runtime-preparation', agencyPreparationHtml(runtime?.preparation));
+  $('agency-runtime-preparation')?.classList.toggle('hidden', !runtime?.preparation);
   const active = (runtime?.runningGroups || []).map(id => agencyGroups().find(group => group.id === id)?.name || id);
   $('agency-runtime-status').textContent = !ready ? '等待自动交易运行状态。' : [
     runtime.online === false ? '行情不可用，等待恢复' : '行情服务已连接',
     runtime.session?.label || '等待交易时段核验',
     active.length ? `正在检查：${active.join('、')}` : '等待下一轮规则检查'
   ].join(' · ');
-  const coverage = runtime?.coverage?.[agencyUi.strategyId], group = agencyGroup();
+  const coverage = runtime?.coverage?.[agencyUi.strategyId], group = agencyGroup(), memberCounts = group ? agencyMemberCounts(group) : null;
   $('agency-runtime-coverage').textContent = group?.mode === 'stopped' ? `${group.name}：自动买卖已停止，公司行为权益仍会核验并按日期处理。`
+    : memberCounts?.standby && !memberCounts.active && !memberCounts.held ? `${group.name}：当前 ${memberCounts.standby} 只成员均为候补，不参与高频刷新。请更新四策略候选池重新筛选与排序。`
     : coverage?.total ? `${group?.name || '当前策略'} · 本轮已处理 ${coverage.processed} / ${coverage.total} 只（含规则拦截） · 剩余 ${coverage.remaining} 只${coverage.status === 'complete' ? ' · 本轮完成' : coverage.status === 'checking' ? ' · 正在检查' : ' · 等待续检'}。${group?.mode === 'paused' ? '暂停新开仓期间仅检查持仓。' : ''}`
-      : group?.mode === 'paused' ? `${group.name}：暂停新开仓；后台继续准备资料，启用后分批检查全部候选。` : '后台自动准备资料，开盘后取得有效行情将自动开始规则检查。';
+      : group?.mode === 'paused' ? `${group.name}：暂停新开仓；后台继续准备资料，启用后分批检查活跃候选，候补不参与高频刷新。` : '后台自动准备资料，开盘后取得有效行情将自动开始规则检查。';
   $('agency-runtime-error').textContent = runtime?.lastError || '';
   $('agency-runtime-error').classList.toggle('hidden', !runtime?.lastError);
   const notice = state.agency?.migrationNotice;
@@ -549,6 +606,18 @@ function renderAgencyRuntime() {
   $('agency-migration').classList.toggle('hidden', !notice || dismissed);
   $('agency-migration-note').textContent = typeof notice === 'string' ? notice : notice?.message || '';
   $('agency-migration-dismiss').dataset.storageKey = key;
+}
+
+function agencyMarketPreparationHtml(preparation) {
+  if (!preparation) return '';
+  const labels = { ready: '市场盘前资料已准备', partial: '市场资料仍有缺项', loading: '正在准备市场资料', failed: '市场资料准备异常', idle: '等待市场资料准备' };
+  const indices = preparation.indices, universe = preparation.universe;
+  const details = [indices ? `指数完整日线 ${num(indices.ready || 0, 0)} / ${num(indices.total || 3, 0)}` : '',
+    universe?.ready ? `证券名单 ${num(universe.count, 0)} 只已核对` : '证券名单待核对'].filter(Boolean);
+  const missing = [...(preparation.missing || []), ...(!universe?.ready && universe?.error ? [universe.error] : [])];
+  const live = preparation.liveRequired || [];
+  const liveLabel = state.agency?.runtime?.session?.open ? '实时判断继续依赖' : '开市后仍需';
+  return `<div data-market-preparation="${esc(preparation.status || 'idle')}"><b class="${preparation.ready ? 'teal' : 'agency-pending'}">${esc(labels[preparation.status] || labels.idle)}</b><span>${details.map(esc).join(' · ')}</span>${preparation.preparedAt ? `<small>资料检查 ${esc(timeText(preparation.preparedAt))}</small>` : ''}${missing.length ? `<span class="agency-pending">${[...new Set(missing)].map(esc).join('；')}</span>` : ''}<small>${live.length ? `${liveLabel}：${live.map(esc).join('、')}。` : ''}资料准备完成不代表策略信号成立；市场环境改善仍需至少 120 秒确认。</small></div>`;
 }
 
 function renderAgencyMarketRegime() {
@@ -565,12 +634,15 @@ function renderAgencyMarketRegime() {
   const names = { strong: '偏强', neutral: '中性', weak: '偏弱', unknown: '待核验' };
   card.dataset.marketStatus = enabled ? status : 'disabled';
   $('agency-market-badge').textContent = enabled ? `${names[status]} · ${fresh && snapshot?.metrics?.highVolatility ? '高波动 · ' : ''}${multiplier === 1 ? '正常风险预算' : multiplier === 0.5 ? '半额风险预算' : '暂停新开仓'}` : '市场环境过滤未启用';
+  $('agency-market-badge').className = 'small-badge ' + (enabled && !multiplier ? 'agency-pending' : multiplier === 1 ? 'teal' : '');
   $('agency-market-summary').textContent = !enabled ? '当前未启用市场环境过滤；按固定策略、资金及其他风控条件检查新开仓。'
     : !multiplier ? '当前暂停四类策略新开仓；已有持仓继续执行原退出计划。'
       : breakout ? '超短线、短线和波段可检查回踩或突破条件；长线仍只检查回踩条件。已有持仓不自动加仓。'
         : '四类策略仅检查回踩条件，单笔计划风险预算减半；已有持仓不自动加仓。';
   const acquisition = snapshot?.acquisition, loading = enabled && acquisition?.loading === true;
   const prepared = enabled && !loading && acquisition?.stage === 'prepared';
+  setHtml('agency-market-preparation', enabled ? agencyMarketPreparationHtml(snapshot?.preparation) : '');
+  $('agency-market-preparation')?.classList.toggle('hidden', !enabled || !snapshot?.preparation);
   card.setAttribute('aria-busy', String(loading));
   const reason = enabled && snapshot && !fresh && snapshot.status !== 'unknown'
     ? '市场证据已过期或跨日，等待重新核验。' : snapshot?.reason || '等待指数完整日线、同日指数报价与全市场广度资料。';
@@ -591,7 +663,7 @@ function renderAgencyMarketRegime() {
     : `${loading ? `本次获取开始 ${timeText(acquisition.startedAt)} · ` : acquisition?.finishedAt ? `最近获取完成 ${timeText(acquisition.finishedAt)} · ` : ''}${snapshot && !fresh ? '最近证据已失效 · ' : ''}广度来源：${breadth?.source || acquisition?.source || '待获取'} · 原始行情最早时间 ${timeText(snapshot?.evidence?.quoteTime)} · 核验 ${timeText(snapshot?.checkedAt)} · 有效至 ${timeText(snapshot?.expiresAt)}`;
   const indices = snapshot?.metrics?.indices || [];
   setHtml('agency-market-indices', indices.length ? table(['指数', '完整日线', '中期趋势', '5 日 MA20 变化', 'ATR / 收盘价', '指数原始报价时间'], indices.map(index => [
-    esc(({ sh000001: '上证指数', sz399001: '深证成指', sz399006: '创业板指' })[index.symbol] || index.symbol), esc(index.asOf),
+    esc(({ sh000001: '上证指数', sz399001: '深证成指', sz399006: '创业板指' })[index.symbol] || index.symbol), dailyHistoryHtml(index.dailyHistory) || esc(index.asOf),
     esc(({ up: '向上', down: '向下', mixed: '未形成一致趋势' })[index.trend] || '待核验'), pct(index.ma20Slope5), pct(index.atrRatio), esc(timeText(index.quoteTime))
   ])) : '<p class="tiny">尚无可核验的指数趋势数据。</p>');
   $('agency-market-policy-note').textContent = snapshot?.policyNote || '市场环境阈值为尚未回测及样本外验证的产品模板，不代表收益优势。';
@@ -604,20 +676,6 @@ async function agencyRequest(key, name, payload, success) {
   finally { agencyUi.busy.delete(key); renderAgency(); }
 }
 
-function openAgencyAssign(symbol = '', preferredStrategy, entryConditions = null) {
-  if (!agencyGroups().length) { toast('策略自动交易模块尚未就绪，请更新账户状态后重试', true); return; }
-  const owner = symbol ? agencyOwner(symbol) : null;
-  if (owner) { agencyUi.strategyId = owner.id; switchPage('agency'); toast(`该股票已由${owner.name}策略管理；保留已有条件，本次未覆盖`); return; }
-  agencyUi.assignConditions = entryConditions ? structuredClone(entryConditions) : null;
-  $('agency-assign-symbol').value = symbol;
-  $('agency-assign-symbol').readOnly = !!agencyUi.assignConditions;
-  setHtml('agency-assign-conditions', agencyEntryConditionSummary(agencyUi.assignConditions));
-  $('agency-assign-policy').textContent = '仅授权所选策略管理该股票。加入后纳入策略监控；策略启用且通过买点、数据、风险和资金检查后，才可自动模拟买卖。已有手动持仓不会被自动接管。';
-  setHtml('agency-assign-strategy', agencyGroups().map(group => `<option value="${esc(group.id)}">${esc(group.name)} · ${esc(agencyModeNames[group.mode] || '尚未启用')}</option>`).join(''));
-  $('agency-assign-strategy').value = preferredStrategy && agencyGroups().some(group => group.id === preferredStrategy) ? preferredStrategy : agencyUi.strategyId;
-  $('agency-assign-error').textContent = '';
-  $('agency-assign-dialog').showModal();
-}
 
 function agencyReconcileCurrent(context) {
   return context && agencyUi.reconcileContext === context && $('agency-reconcile-dialog').open;
@@ -669,6 +727,10 @@ function renderAgencyReconcile() {
   const context = agencyUi.reconcileContext; if (!context) return;
   const group = agencyGroups().find(item => item.id === context.strategyId), member = group?.members?.find(item => item.symbol === context.symbol);
   const rec = member?.reconciliation, verification = group ? agencyCorporateCheck(group, context.symbol) : null;
+  const withoutCorporate = verification?.status === 'not-required';
+  $('agency-corporate-description').textContent = withoutCorporate
+    ? '无持仓权益，首次开仓仅核验行情与完整日线价格基准，无需先获取公司行为公告。成交后继续核验持仓权益。'
+    : '程序自动收集公告、核对登记日权益并处理支持的公司行为。资料缺失、冲突或不支持的事件会列出原因，只有这些异常需要补充。';
   const automatic = member?.automaticCheck ? agencyVerificationView(member) : null;
   const historical = (state.account?.trades || []).some(item => item.owner === context.strategyId && item.symbol === context.symbol);
   const stages = group ? agencyCorporateActions(group, context.symbol) : [];
@@ -677,7 +739,8 @@ function renderAgencyReconcile() {
   const records = group ? agencyCorporateEvents(group, context.symbol) : [];
   const isBusy = agencyUi.busy.has('verify:' + context.strategyId) || agencyUi.busy.has('verify:' + context.strategyId + ':' + context.symbol);
   const pending = member && (automatic ? automatic.pending : rec?.status !== 'clear' || member.awaitingVerification);
-  $('agency-reconcile-status').textContent = isBusy ? '正在自动核验…' : verification?.status === 'blocked' ? '本次资料核验异常' : pending ? automatic?.label || '等待自动检查或异常补充' : records.some(item => item.automatic || item.source === 'automatic') ? '已有自动处理流水' : !member ? '已移出 · 历史权益' : verification?.status === 'clear' || member?.lastVerifiedAt ? '当前资料已核验 · 暂无自动入账流水' : '等待自动检查';
+  $('agency-reconcile-status').textContent = isBusy ? '正在自动核验…' : verification?.status === 'blocked' ? '本次资料核验异常' : pending ? automatic?.label || '等待自动检查或异常补充' : withoutCorporate ? '价格基准已核验 · 公司行为资料未核验' : records.some(item => item.automatic || item.source === 'automatic') ? '已有自动处理流水' : !member ? '已移出 · 历史权益' : verification?.status === 'clear' || member?.lastVerifiedAt ? '当前资料已核验 · 暂无自动入账流水' : '等待自动检查';
+  setHtml('agency-reconcile-daily', dailyHistoryHtml(member?.automaticCheck?.dailyHistory));
   $('agency-reconcile-checked').textContent = [automatic?.checkedAt ? `自动检查 ${timeText(automatic.checkedAt)}` : '', agencyCorporateStatus(verification), verification?.checkedAt ? `公司行为检查 ${timeText(verification.checkedAt)}` : '', verification?.coverageStart ? `资料区间 ${verification.coverageStart} 至 ${verification.coverageEnd || '未提供结束日期'}` : ''].filter(Boolean).join(' · ');
   $('agency-reconcile-verify').disabled = !member && !historical || isBusy || agencyUi.busy.has('reconcile:' + context.strategyId + ':' + context.symbol);
   $('agency-reconcile-submit').disabled = !member || isBusy || agencyUi.busy.has('reconcile:' + context.strategyId + ':' + context.symbol);
@@ -691,7 +754,7 @@ function renderAgencyReconcile() {
     if (!seen.has(id)) { seen.add(id); evidence.push({ id, title: item.title || '公司行为来源公告', date: '' }); }
   }
   context.evidence = evidence;
-  setHtml('agency-reconcile-evidence-list', evidence.length ? evidence.map((item, index) => `<article class="agency-corporate-evidence"><div><strong>${esc(item.title || item.reason || '公司行为核验依据')}</strong><small>${[item.date, item.id, item.source].filter(Boolean).map(esc).join(' · ')}</small></div>${/^(?:AN|CN)\d{10,30}$/.test(item.id || '') ? `<button class="table-action" type="button" data-agency-notice="${index}">查看公告原文 ↗</button>` : '<span class="tiny">尚未获取可用公告编号</span>'}</article>`).join('') : '<p class="tiny">本次尚无可展示的公告；可重新自动核验，程序会补查所需资料。</p>');
+  setHtml('agency-reconcile-evidence-list', evidence.length ? evidence.map((item, index) => `<article class="agency-corporate-evidence"><div><strong>${esc(item.title || item.reason || '公司行为核验依据')}</strong><small>${[item.date, item.id, item.source].filter(Boolean).map(esc).join(' · ')}</small></div>${/^(?:AN|CN)\d{10,30}$/.test(item.id || '') ? `<button class="table-action" type="button" data-agency-notice="${index}">查看公告原文 ↗</button>` : '<span class="tiny">尚未获取可用公告编号</span>'}</article>`).join('') : withoutCorporate ? '<p class="tiny">首次开仓无需公司行为公告前置，本次未收集公告。</p>' : '<p class="tiny">本次尚无可展示的公告；可重新自动核验，程序会补查所需资料。</p>');
   setHtml('agency-reconcile-events', records.length ? records.map(agencyCorporateRecordHtml).join('') : '<p class="tiny">暂无该股票的公司行为处理流水。</p>');
   const displayedEvents = [...stages, ...(verification?.events || []).filter(item => !stages.some(stage => stage.eventId === item.eventId))];
   setHtml('agency-reconcile-stages', displayedEvents.length ? displayedEvents.map(agencyCorporateActionHtml).join('') : '<p class="tiny">尚无已登记的公司行为事件。</p>');
@@ -702,7 +765,7 @@ function agencyVerificationSummary(result) {
   if (!summary || !Number.isFinite(summary.checked)) return '自动核验已完成，请查看股票状态与处理流水';
   const environment = result?.marketRegime, marketStatus = ({ strong: '偏强', neutral: '中性', weak: '偏弱', unknown: '待核验' })[environment?.status] || '待核验';
   const marketSummary = environment ? ` · 市场环境：${marketStatus}${environment.allowEntry === true ? '（已确认）' : '（暂停新开仓）'}` : '';
-  return `已检查 ${summary.checked} 只 · 通过 ${summary.clear || 0} 只 · 等待 ${summary.waiting || 0} 只 · 异常 ${summary.blocked || 0} 只${summary.skipped ? ` · 跳过 ${summary.skipped} 只` : ''}${marketSummary}`;
+  return `已检查 ${summary.checked} 只 · 通过 ${summary.clear || 0} 只 · 等待 ${summary.waiting || 0} 只 · 异常 ${summary.blocked || 0} 只${summary.skipped ? ` · 跳过 ${summary.skipped} 只` : ''}${summary.cached ? ` · 复用有效日线 ${summary.cached} 只${summary.degraded ? `（其中刷新失败 ${summary.degraded} 只）` : ''}` : summary.degraded ? ` · 日线刷新失败 ${summary.degraded} 只` : ''}${marketSummary}`;
 }
 
 async function agencyVerify(strategyId, symbol, context) {
@@ -740,38 +803,34 @@ function openAgencyReconcile(symbol) {
   $('agency-reconcile-dialog').showModal();
 }
 
+function selectAgencyGroup(strategyId, phase = 'active') {
+  agencyUi.strategyId = strategyId; agencyUi.limitsDirty = false; agencyUi.memberPage = 1;
+  $('agency-member-filter').value = phase; $('agency-member-search').value = '';
+  renderAgency();
+}
 $('agency-tabs').addEventListener('click', event => {
   const button = event.target.closest('[data-agency-tab]'); if (!button) return;
-  agencyUi.strategyId = button.dataset.agencyTab; agencyUi.limitsDirty = false; renderAgency();
+  selectAgencyGroup(button.dataset.agencyTab);
 });
-for (const id of ['agency-member-search', 'agency-member-held']) $(id).addEventListener(id.endsWith('search') ? 'input' : 'change', () => { agencyUi.memberPage = 1; renderAgency(); });
+for (const id of ['agency-member-search', 'agency-member-filter']) $(id).addEventListener(id.endsWith('search') ? 'input' : 'change', () => { agencyUi.memberPage = 1; renderAgency(); });
 $('agency-member-prev').addEventListener('click', () => { agencyUi.memberPage--; renderAgency(); });
 $('agency-member-next').addEventListener('click', () => { agencyUi.memberPage++; renderAgency(); });
 $('agency-tabs').addEventListener('keydown', event => {
   if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
   const groups = agencyGroups(), current = groups.findIndex(group => group.id === agencyUi.strategyId);
   const index = event.key === 'Home' ? 0 : event.key === 'End' ? groups.length - 1 : (current + (event.key === 'ArrowRight' ? 1 : -1) + groups.length) % groups.length;
-  if (!groups[index]) return; event.preventDefault(); agencyUi.strategyId = groups[index].id; agencyUi.limitsDirty = false; renderAgency();
+  if (!groups[index]) return; event.preventDefault(); selectAgencyGroup(groups[index].id);
   $('agency-tabs').querySelector('[aria-selected="true"]')?.focus();
 });
-$('agency-selected').addEventListener('click', () => openAgencyAssign(selected, selectedStrategyId(), typeof screenSelectedEntryConditions === 'function' ? screenSelectedEntryConditions(selected) : null));
-$('agency-add').addEventListener('click', () => openAgencyAssign('', agencyUi.strategyId));
 $('agency-migration-dismiss').addEventListener('click', () => {
   const key = $('agency-migration-dismiss').dataset.storageKey; agencyUi.dismissedMigration = key;
   try { localStorage.setItem(key, 'acknowledged'); } catch {}
   $('agency-migration').classList.add('hidden');
 });
-$('agency-assign-cancel').addEventListener('click', () => $('agency-assign-dialog').close());
-$('agency-assign-dialog').addEventListener('close', () => { agencyUi.assignConditions = null; });
-$('agency-assign-form').addEventListener('submit', async event => {
-  event.preventDefault(); const button = $('agency-assign-submit'); if (button.disabled) return; button.disabled = true;
-  try {
-    const strategyId = $('agency-assign-strategy').value, symbol = $('agency-assign-symbol').value.trim();
-    await api('agency:member', { strategyId, symbol, action: 'add', ...(agencyUi.assignConditions ? { entryConditions: agencyUi.assignConditions } : {}) }); agencyUi.strategyId = strategyId;
-    renderState(await api('state')); $('agency-assign-dialog').close(); switchPage('agency'); toast('已纳入策略监控；纳入监控不代表立即买入，符合规则并启用策略后才会模拟交易');
-  } catch (error) { $('agency-assign-error').textContent = error.message; } finally { button.disabled = false; }
-});
 $('page-agency').addEventListener('click', event => {
+  const select = event.target.closest('[data-agency-select]'), disclosure = event.target.closest('[data-agency-disclosure]');
+  if (select) { selectAgencyGroup(select.dataset.agencySelect, select.dataset.agencyPhase || 'active'); $('agency-group-panel').scrollIntoView({ block: 'start' }); }
+  if (disclosure) { const panel = $(disclosure.dataset.agencyDisclosure); panel.open = true; panel.scrollIntoView({ block: 'start' }); panel.querySelector('summary, button')?.focus({ preventScroll: true }); }
   const mode = event.target.closest('[data-agency-mode]'), member = event.target.closest('[data-agency-member]'), reconcile = event.target.closest('[data-agency-reconcile]'), open = event.target.closest('[data-agency-open]');
   if (mode) action(async () => {
     const strategyId = agencyUi.strategyId, next = mode.dataset.agencyMode;
@@ -784,11 +843,10 @@ $('page-agency').addEventListener('click', event => {
     await agencyRequest('member:' + symbol, 'agency:member', { strategyId, symbol, action: memberAction }, memberAction === 'close' ? '已登记尽快退出意图' : '移除请求已保存；有持仓时保留退出管理');
   });
   if (reconcile) openAgencyReconcile(reconcile.dataset.agencyReconcile);
-  if (open) { switchPage('market'); action(() => selectStock(open.dataset.agencyOpen)); }
+  if (open) { switchPage('market', { detailView: true }); action(() => selectStock(open.dataset.agencyOpen)); }
 });
 $('agency-run').addEventListener('click', () => action(() => agencyRequest('run', 'agency:run', { strategyId: agencyUi.strategyId }, '已请求本轮规则检查，进度与结果见执行日志')));
 $('agency-pool-run').addEventListener('click', () => agencyUpdatePool());
-$('agency-pool-mode').addEventListener('change', event => { agencyUi.screeningMode = ['strict', 'product', 'company'].includes(event.target.value) ? event.target.value : 'strategy'; renderAgencyPool(); });
 $('agency-pool-retry').addEventListener('click', () => agencyUpdatePool('retry'));
 $('agency-pool-cancel').addEventListener('click', () => action(() => agencyRequest('pool-cancel', 'agency:pool:cancel', undefined, '已请求取消本次更新')));
 for (const id of ['agency-pool-filter', 'agency-pool-search']) $(id).addEventListener(id.endsWith('search') ? 'input' : 'change', () => { agencyUi.poolPage = 1; agencyUi.poolRenderKey = null; renderAgencyPool(); });

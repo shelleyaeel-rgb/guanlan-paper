@@ -7,14 +7,11 @@ const { AgencyService } = require('../core/agency-service.cjs');
 const { EntryEvidenceStore } = require('../core/entry-evidence-store.cjs');
 const { addAgencyMembers } = require('../core/agency-members.cjs');
 const { cnTime } = require('../core/common.cjs');
-const { companyBundle } = require('./fixtures/company-evidence-data.cjs');
 
 const roeCondition = () => ({ rules: [{ field: 'roe', op: 'gt', value: 10 }] });
-const demandEvidence = value => ({ symbol: 'sz000001', kind: 'demand', value, subject: '隔离产品', reviewState: 'confirmed',
-  sourceTitle: '隔离证据样本', url: 'https://example.com/report', publishedAt: '2026-04-01', period: '2025年度',
-  reviewedAt: '2026-05-01', validUntil: '2027-05-01', quote: '可核实的测试事实', notes: '' });
 
-function fixture(t, entryConditions = roeCondition()) {
+const priceCondition = (value = 10) => ({ rules: [{ field: 'price', op: 'gt', value }] });
+function fixture(t, entryConditions = priceCondition()) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'guanlan-entry-conditions-'));
   t.after(() => {
     service.stop();
@@ -53,20 +50,40 @@ function fixture(t, entryConditions = roeCondition()) {
     archiveEntryEvidence: payload => entryEvidence.archive(payload),
     getQuotes: () => quotes, acceptQuotes: batch => Object.assign(quotes, batch), clock: () => now,
     getSelectionEvidence: symbol => { evidenceCalls.push(symbol); return evidenceLoader(symbol); },
-    monitor: { load: async (symbol, force, financial, notices) => {
-      loads.push({ symbol, force, financial, notices });
-      if (loadHook) await loadHook(symbol, loads.length);
-      return snapshot(symbol);
-    } } });
+    monitor: {
+      snapshots: {},
+      load: async (symbol, force, financial, notices) => {
+        loads.push({ symbol, force, financial, notices });
+        if (loadHook) await loadHook(symbol, loads.length);
+        return snapshot(symbol);
+      },
+      async prepare(symbol, financial, notices) { return this.snapshots[symbol] = structuredClone(await this.load(symbol, false, financial, notices)); },
+      readPrepared(symbol) { if (!this.snapshots[symbol]) throw Error('开仓资料未就绪：尚未准备'); return structuredClone(this.snapshots[symbol]); },
+      assertPrepared(symbol, value) {
+        const current = this.readPrepared(symbol);
+        for (const key of ['technical']) if (JSON.stringify(current[key]) !== JSON.stringify(value[key])) throw Error('开仓资料未就绪：已准备资料发生变化');
+        return value;
+      }
+    } });
   let service = createService();
   transaction(() => {
     engine.agencyTransfer({ strategyId: 'swing', amount: 50000 });
     engine.agencyMember({ strategyId: 'swing', symbol: 'sz000001', action: 'add', ...(entryConditions ? { entryConditions } : {}) });
     engine.agencyMode({ strategyId: 'swing', mode: 'running' });
   });
-  return { get engine() { return engine; }, get service() { return service; }, store, entryEvidence, transaction, quote, snapshot, loads, marketCalls, evidenceCalls,
+  // Prepare fixture inputs before running the trading lane; production schedules
+  // these independently. Tests can use poll() alone to assert that separation.
+  const prepare = async () => {
+    for (const group of service.groups().filter(group => group.enabled)) {
+      const cycle = service.cycles.get(group.id);
+      for (const symbol of cycle.symbols) await service.prepareEntry(symbol, group.id);
+    }
+  };
+  const poll = async () => { await service.poll({ force: true }); await service.runner.drain(); };
+  return { get engine() { return engine; }, get service() { return service; }, store, entryEvidence, transaction, quote, snapshot, loads, marketCalls, evidenceCalls, prepare, poll,
+    publishSnapshot: (symbol = 'sz000001', value = snapshot(symbol)) => { service.monitor.snapshots[symbol] = structuredClone(value); },
     member: (symbol = 'sz000001') => engine.s.agency.groups.find(group => group.id === 'swing').members.find(member => member.symbol === symbol),
-    run: async () => { await service.poll({ force: true }); await service.runner.drain(); },
+    run: async () => { await prepare(); await poll(); },
     addBatch: (symbols, conditions) => addAgencyMembers({ strategyId: 'swing', symbols, entryConditions: conditions },
       { getEngine: () => engine, transaction, market, acceptQuotes: batch => Object.assign(quotes, batch) }),
     roe: value => { roe = value; }, finance: value => { extraFinance = value; }, missingFinance: value => { missingFinance = value; }, price: value => { price = value; },
@@ -75,316 +92,176 @@ function fixture(t, entryConditions = roeCondition()) {
     restart: () => { service.stop(); engine = new Engine(store.load(), () => new Date(now)); service = createService(); } };
 }
 
-test('单只加入冻结当次条件，调用方修改、重复加入和重启都不改写原条件', async t => {
-  const input = roeCondition(), f = fixture(t, input), saved = structuredClone(f.member().entryConditions);
-  assert.equal(saved.version, 1); assert.ok(saved.savedAt); assert.ok(saved.labels.some(label => /ROE|净资产收益率/.test(label)));
+test('行情条件冻结当次输入，重复加入和重启不放宽已保存条件', async t => {
+  const input = priceCondition(), f = fixture(t, input), saved = structuredClone(f.member().entryConditions);
+  assert.equal(saved.version, 1); assert.ok(saved.savedAt); assert.ok(saved.labels.some(label => /最新价/.test(label)));
   input.rules[0].value = 0;
   const returned = f.transaction(() => f.engine.agencyMember({ strategyId: 'swing', symbol: 'sz000001', action: 'add', entryConditions: input }));
   returned.entryConditions.rules[0].value = 100;
   assert.deepEqual(f.member().entryConditions, saved);
   f.restart(); assert.deepEqual(f.member().entryConditions, saved); assert.equal(validState(f.store.load()), true);
-  f.roe(9); await f.run(); assert.equal(f.engine.s.trades.length, 0);
+  f.price(9.9); await f.run(); assert.equal(f.engine.s.trades.length, 0);
 });
 
-test('批量成员各自保存同次条件，等待行情时编辑输入和重复加入不会放宽已有成员', async t => {
-  const f = fixture(t), input = roeCondition();
+test('批量加入保留技术条件并剔除财务研究，等待行情时修改输入不改变已捕获条件', async t => {
+  const f = fixture(t), input = { rules: [...priceCondition().rules, ...roeCondition().rules], evidence: { conditions: ['demand'] } };
   f.refreshing(() => { input.rules[0].value = 0; });
   const result = await f.addBatch(['000001', '600000', '600001'], input);
   assert.deepEqual(result.added, ['sh600000', 'sh600001']); assert.equal(result.skipped.length, 1);
-  for (const symbol of ['sz000001', 'sh600000', 'sh600001']) assert.equal(f.member(symbol).entryConditions.rules[0].value, 10);
-  const first = f.member('sh600000').entryConditions, second = f.member('sh600001').entryConditions;
-  assert.notEqual(first, second); assert.notEqual(first.rules, second.rules);
-  f.refreshing(null); f.restart();
-  for (const symbol of ['sz000001', 'sh600000', 'sh600001']) assert.equal(f.member(symbol).entryConditions.rules[0].value, 10);
+  for (const symbol of ['sz000001', 'sh600000', 'sh600001']) assert.deepEqual(f.member(symbol).entryConditions.rules, priceCondition().rules);
+  assert.notEqual(f.member('sh600000').entryConditions.rules, f.member('sh600001').entryConditions.rules);
+  f.refreshing(null); f.restart(); assert.equal(validState(f.store.load()), true);
 });
 
-test('波段内置条件通过仍受追加 ROE 门禁约束，最新财报达标后才能开仓', async t => {
-  const f = fixture(t); f.roe(9);
+test('内置波段通过仍须满足附加行情条件，更新报价后才可开仓', async t => {
+  const f = fixture(t, priceCondition(10.11));
   const blocked = f.engine.agencyEvaluate('swing', 'sz000001', f.quote('sz000001'), f.snapshot('sz000001'));
-  assert.equal(blocked.buyable, false); assert.ok(blocked.entryConditionsCheck); assert.match(blocked.reasons.join('；'), /ROE|净资产收益率/);
+  assert.equal(blocked.buyable, false); assert.equal(blocked.entryConditionsCheck.passed, false); assert.match(blocked.reasons.join('；'), /最新价/);
   await f.run(); assert.equal(f.engine.s.trades.length, 0);
-  assert.ok(f.engine.s.agency.decisions.some(decision => decision.action === 'wait' && /ROE|净资产收益率/.test(decision.reason)));
-  f.roe(11); await f.run(); assert.equal(f.engine.s.trades.length, 1); assert.equal(f.engine.s.trades[0].side, 'buy');
-  assert.ok(f.loads.length >= 3); assert.ok(f.loads.every(load => load.financial === true), '追加财务条件后波段也必须重新读取财务');
+  f.price(10.12); await f.run(); assert.equal(f.engine.s.trades.length, 1);
+  assert.ok(f.loads.every(load => load.financial === false && load.notices === false));
   const executed = f.engine.s.agency.decisions.find(decision => decision.status === 'executed');
-  assert.ok(executed.entryConditionsCheck); assert.ok(executed.executionCheck.entryConditionsCheck);
+  assert.equal(executed.executionCheck.entryConditionsCheck.passed, true);
 });
 
-test('内置买点未满足也保留额外条件检查及具体差距', t => {
-  const f = fixture(t); f.price(9.9); f.roe(9);
-  const evaluation = f.engine.agencyEvaluate('swing', 'sz000001', f.quote('sz000001'), f.snapshot('sz000001'));
-  assert.equal(evaluation.buyable, false); assert.ok(evaluation.entryConditionsCheck);
-  assert.match(evaluation.reasons.join('；'), /ROE|净资产收益率/);
-});
-
-test('执行前最新财务不再达标或缺失，已通过的买入意向也不得成交', async t => {
-  for (const change of ['lower', 'missing']) {
-    const f = fixture(t);
-    f.loading((_symbol, calls) => { if (calls === 2) { if (change === 'lower') f.roe(9); else f.missingFinance(true); } });
-    await f.run(); assert.equal(f.engine.s.trades.length, 0, change);
-    const decision = f.engine.s.agency.decisions.find(item => item.action === 'buy' && item.status === 'blocked');
-    assert.ok(decision, change); assert.equal(decision.executionCheck.buyable, false); assert.ok(decision.executionCheck.entryConditionsCheck);
-    assert.equal(f.engine.s.agency.executionIntents.length, 0);
+test('研究和财务条件全部停用，缺失财报及正文接口抛错均不阻断首次开仓', async t => {
+  const inputs = [roeCondition(), { rules: [{ field: 'pe', op: 'lt', value: 10 }] },
+    { evidence: { conditions: ['demand'] } }, { research: { version: 1, enabled: true, path: 'company', rules: [{ field: 'revenueYoY', op: 'gt', value: 0 }] } },
+    { research: { version: 1, enabled: true, path: 'product', rules: [{ field: 'currentRevenue', op: 'gt', value: 100000 }] } }];
+  for (const conditions of inputs) {
+    const f = fixture(t, conditions); f.missingFinance(true); let calls = 0;
+    const disabled = () => { calls++; throw Error('已取消的研究服务不能调用'); };
+    f.service.getAutomaticEvidence = disabled; f.service.getNoticeEvidence = disabled; f.service.getSelectionEvidence = disabled;
+    assert.equal(f.member().entryConditions, undefined);
+    await f.run(); assert.equal(f.engine.s.trades.length, 1); assert.equal(calls, 0);
+    assert.ok(f.loads.every(load => load.financial === false && load.notices === false));
+    assert.equal(validState(f.store.load()), true);
   }
 });
 
-test('缺失追加条件数据时不默认为通过，补齐后下一轮重新检查', async t => {
-  const f = fixture(t); f.missingFinance(true); await f.run(); assert.equal(f.engine.s.trades.length, 0);
-  assert.ok(f.engine.s.agency.decisions.some(decision => decision.action === 'wait'));
-  f.missingFinance(false); await f.run(); assert.equal(f.engine.s.trades.length, 1);
+test('财务和公告快照变化不撤销技术买点，日线变化仍在成交前阻断', async t => {
+  for (const part of ['finance', 'notices', 'technical']) {
+    const f = fixture(t);
+    f.refreshing((_symbols, calls) => {
+      if (calls !== 2) return;
+      const next = f.snapshot('sz000001');
+      if (part === 'technical') next.technical.ma20 = 20;
+      else next[part] = { status: 'unavailable', error: '接口失败' };
+      f.publishSnapshot('sz000001', next);
+    });
+    await f.run(); assert.equal(f.engine.s.trades.length, part === 'technical' ? 0 : 1, part);
+    assert.equal(f.loads.length, 1, '成交前只本地核验已准备资料');
+  }
 });
 
-test('已有持仓的附加条件失效只提示，退出仍由原计划及 T+1 管理', async t => {
-  const f = fixture(t); await f.run(); const quantity = f.engine.s.lots[0].quantity, originalRisk = structuredClone(f.engine.s.risks.sz000001);
-  f.roe(9); await f.run();
+test('技术附加条件数据缺失不得默认为通过，补齐后重新检查', async t => {
+  const f = fixture(t, { rules: [{ field: 'rsi', op: 'gt', value: 50 }] });
+  const load = f.service.monitor.load; let missing = true;
+  f.service.monitor.load = async (...args) => { const snapshot = await load(...args); if (missing) delete snapshot.technical.rsi; return snapshot; };
+  await f.run(); assert.equal(f.engine.s.trades.length, 0);
+  missing = false; await f.run(); assert.equal(f.engine.s.trades.length, 1);
+});
+
+test('持仓技术条件失效只作提示，退出仍按原计划和 T+1 管理', async t => {
+  const f = fixture(t); await f.run(); const quantity = f.engine.s.lots[0].quantity, risk = structuredClone(f.engine.s.risks.sz000001);
+  f.price(9.9); await f.run();
   assert.equal(f.engine.s.trades.length, 1); assert.equal(f.engine.s.lots[0].quantity, quantity);
-  assert.equal(f.engine.s.agency.executionIntents.length, 0); assert.deepEqual(f.engine.s.risks.sz000001, originalRisk);
+  assert.deepEqual(f.engine.s.risks.sz000001, risk); assert.equal(f.engine.s.agency.executionIntents.length, 0);
   const hold = f.engine.s.agency.decisions.find(decision => decision.action === 'hold');
-  assert.ok(hold.entryConditionsCheck); assert.match(hold.reason, /ROE|净资产收益率/);
+  assert.equal(hold.entryConditionsCheck.passed, false); assert.match(hold.reason, /最新价/);
   f.price(9.5); f.transaction(() => f.engine.tick({ sz000001: f.quote('sz000001') }, { sz000001: f.snapshot('sz000001') }));
   assert.equal(f.engine.s.trades.length, 1);
   f.setTime('2026-09-30T10:00:00+08:00');
   f.transaction(() => f.engine.tick({ sz000001: f.quote('sz000001') }, { sz000001: f.snapshot('sz000001') }));
-  assert.equal(f.engine.s.trades.length, 2); assert.equal(f.engine.s.trades[1].side, 'sell');
+  assert.equal(f.engine.s.trades[1].side, 'sell');
 });
 
-test('未保存选股条件的旧成员仍按内置策略正常开仓', async t => {
-  const f = fixture(t, null); f.missingFinance(true); f.restart(); await f.run();
-  assert.equal(f.engine.s.trades.length, 1); assert.ok(f.loads.every(load => load.financial === false));
-});
-
-test('直接成交与手动策略接口不能绕过已保存的附加新开仓条件', t => {
-  const f = fixture(t); f.roe(9); const quote = f.quote('sz000001'), snapshot = f.snapshot('sz000001');
-  const executeAutomatic = () => {
-    const { epoch, revision } = f.engine.s.agency;
-    return f.engine.agencyExecute({ strategyId: 'swing', symbol: 'sz000001', action: 'buy', targetPercent: 20,
-      decisionId: 'isolated-direct-entry', expectedEpoch: epoch, expectedRevision: revision }, quote, snapshot);
-  };
-  assert.throws(() => f.transaction(executeAutomatic), /ROE|净资产收益率/);
+test('直接成交与手动策略接口不能绕过已保存的行情条件', t => {
+  const f = fixture(t, priceCondition(10.2)), quote = f.quote('sz000001'), snapshot = f.snapshot('sz000001');
+  const executeAutomatic = () => f.engine.agencyExecute({ strategyId: 'swing', symbol: 'sz000001', action: 'buy', targetPercent: 20,
+    decisionId: 'isolated-direct-entry', expectedEpoch: f.engine.s.agency.epoch, expectedRevision: f.engine.s.agency.revision }, quote, snapshot);
+  assert.throws(() => f.transaction(executeAutomatic), /最新价/);
   assert.throws(() => f.transaction(() => f.engine.execute({ symbol: 'sz000001', side: 'buy', quantity: 100 }, quote)), /已授权策略自动交易/);
   assert.throws(() => f.transaction(() => f.engine.strategyEntry({ symbol: 'sz000001', strategyId: 'swing', quantity: 100 }, quote, snapshot)), /已授权策略自动交易/);
-  assert.throws(() => f.transaction(() => f.engine.place({ symbol: 'sz000001', side: 'buy', quantity: 100, limit: 10.1 })), /不能添加手动委托/);
-  assert.equal(f.engine.s.trades.length, 0); assert.equal(f.engine.s.orders.length, 0); assert.equal(f.engine.s.lots.length, 0);
+  assert.equal(f.engine.s.trades.length, 0); assert.equal(f.engine.s.lots.length, 0);
 });
 
-test('旧 v2 账户迁移保留资金和成员，新条件禁止降级到旧版本或静默丢失', t => {
-  const legacy = fixture(t, null), old = structuredClone(legacy.engine.s);
-  old.agency.version = 2; delete old.agency.entryConditionsVersion; delete old.agency.monitoringVersion;
-  delete old.agency.poolVersion; delete old.agency.pool; delete old.agency.poolAuthorizationRevision;
+test('旧 v7 研究条件留档并迁移为技术条件，资金成交保留且旧版本不得读取新状态', t => {
+  const f = fixture(t, null), old = structuredClone(f.engine.s);
+  old.agency.version = 7; delete old.agency.technicalTradingVersion;
+  const original = require('../core/entry-conditions.cjs').createEntryConditions({ rules: [...priceCondition().rules, ...roeCondition().rules], evidence: { conditions: ['demand'] } }, f.engine.clock());
+  old.agency.groups.find(group => group.id === 'swing').members[0].entryConditions = original;
   assert.equal(validState(old), true);
-  const migrated = new Engine(old, () => new Date('2026-09-29T10:00:00+08:00'));
-  assert.equal(migrated.s.agency.version, 5); assert.equal(migrated.s.agency.entryConditionsVersion, 1);
-  assert.equal(migrated.s.cash, legacy.engine.s.cash);
-  assert.deepEqual(migrated.s.agency.groups, legacy.engine.s.agency.groups);
-  const current = fixture(t), before = structuredClone(current.engine.s);
-  for (const change of [state => { state.agency.version = 2; delete state.agency.entryConditionsVersion; },
-    state => { state.agency.entryConditionsVersion = 99; },
-    state => { state.agency.groups.find(group => group.id === 'swing').members[0].entryConditions.rules[0].value = 'bad'; }]) {
-    const invalid = structuredClone(before); change(invalid);
-    assert.equal(validState(invalid), false); assert.throws(() => new Engine(invalid), /账户数据格式不正确/);
+  const migrated = new Engine(old, f.engine.clock), member = migrated.s.agency.groups.find(group => group.id === 'swing').members[0];
+  assert.equal(migrated.s.agency.version, 8); assert.deepEqual(member.legacyResearchConditions, original);
+  assert.deepEqual(member.entryConditions.rules, priceCondition().rules); assert.equal(member.entryConditions.evidence, undefined);
+  assert.equal(migrated.s.cash, f.engine.s.cash); assert.deepEqual(migrated.s.trades, f.engine.s.trades);
+  for (const mutate of [state => { state.agency.version = 7; }, state => { state.agency.technicalTradingVersion = 99; },
+    state => { state.agency.groups.find(group => group.id === 'swing').members[0].legacyResearchConditions.rules[0].value = 'bad'; }]) {
+    const invalid = structuredClone(migrated.s); mutate(invalid); assert.equal(validState(invalid), false); assert.throws(() => new Engine(invalid), /账户数据格式/);
   }
 });
 
-test('候选和执行阶段每次异步取数后都重新检查授权，追加规则不能恢复暂停权限', async t => {
-  for (const phase of ['candidate-data', 'candidate-quote', 'execution-data', 'execution-quote']) {
+test('后台准备、候选报价和执行报价等待期间暂停策略都撤销开仓权限', async t => {
+  for (const phase of ['preparation', 'candidate-quote', 'execution-quote']) {
     const f = fixture(t), pause = () => f.transaction(() => f.engine.agencyMode({ strategyId: 'swing', mode: 'paused' }));
-    if (phase.endsWith('data')) f.loading((_symbol, calls) => { if (calls === (phase.startsWith('candidate') ? 1 : 2)) pause(); });
-    else f.refreshing((_symbols, calls) => { if (calls === (phase.startsWith('candidate') ? 1 : 2)) pause(); });
+    if (phase === 'preparation') f.loading(pause);
+    else f.refreshing((_symbols, calls) => { if (calls === (phase === 'candidate-quote' ? 1 : 2)) pause(); });
     await f.run(); assert.equal(f.engine.s.trades.length, 0, phase);
-    assert.equal(f.engine.s.agency.groups.find(group => group.id === 'swing').mode, 'paused', phase);
-    assert.ok(f.engine.s.agency.decisions.some(decision => decision.status === 'stale'), phase);
+    assert.equal(f.engine.s.agency.groups.find(group => group.id === 'swing').mode, 'paused');
   }
 });
 
-test('证据条件保存条件定义，每轮从当前证据库重读，不冻结选股时肯定结论', async t => {
-  const f = fixture(t, { rules: [], evidence: { conditions: ['demand'] } });
-  let current = [demandEvidence('unsupported')]; f.evidence(() => current);
-  await f.run(); assert.equal(f.engine.s.trades.length, 0);
-  current = [demandEvidence('supported')]; await f.run(); assert.equal(f.engine.s.trades.length, 1);
-  assert.ok(f.evidenceCalls.length >= 3); assert.ok(f.evidenceCalls.every(symbol => symbol === 'sz000001'));
-});
-
-test('自动研究条件无需人工记录即可通过，执行前重新取得正文并复算，缺失则拦截', async t => {
-  for (const revoke of [false, true]) {
-    const f = fixture(t, { rules: [], evidence: { conditions: ['productOutlook', 'financialReview'], leadership: 'either', minSegmentRevenuePct: 30 }, source: { kind: 'agency-pool', policyVersion: 2 } });
-    let calls = 0;
-    f.evidence(() => { throw Error('自动路径不能读取人工库'); });
-    f.service.getAutomaticEvidence = async symbol => {
-      calls++;
-      const now = new Date('2026-09-29T10:00:00+08:00');
-      return revoke && calls > 1 ? { symbol, checkedAt: now.getTime(), status: 'unavailable', documents: [], errors: ['执行前资料失效'] } : companyBundle(symbol, now);
-    };
-    await f.run();
-    assert.ok(calls >= 2); assert.equal(f.evidenceCalls.length, 0);
-    assert.equal(f.engine.s.trades.length, revoke ? 0 : 1);
-    const decision = f.engine.s.agency.decisions.find(item => item.action === 'buy');
-    assert.equal(decision.status, revoke ? 'blocked' : 'executed');
-    assert.ok(decision.executionCheck.entryConditionsCheck);
-  }
-});
-
-test('自动资料不能借用人工通过记录或保存的肯定结论，旧检查时间和串股均阻断', () => {
-  const { createEntryConditions, evaluateEntryConditions } = require('../core/entry-conditions.cjs');
-  const now = new Date('2026-09-29T10:00:00+08:00'), symbol = 'sz000001';
-  const saved = createEntryConditions({ rules: [], evidence: { conditions: ['demand'] }, source: { kind: 'agency-pool', policyVersion: 2 } }, now);
-  for (const bundle of [null, { ...companyBundle(symbol, now), checkedAt: now.getTime() - 21600001 }, companyBundle('sh600001', now)]) {
-    const checked = evaluateEntryConditions(saved, symbol, {}, { automaticEvidence: bundle, selectionEvidence: { checkedAt: now.getTime(), records: [demandEvidence('supported')] } }, now);
-    assert.equal(checked.status, 'pending');
-  }
-});
-
-function automaticArchiveFixture(t) {
-  const f = fixture(t, { rules: [], evidence: { conditions: ['productOutlook', 'financialReview'], leadership: 'either', minSegmentRevenuePct: 30 }, source: { kind: 'agency-pool', policyVersion: 2 } });
-  f.service.getAutomaticEvidence = async symbol => companyBundle(symbol, new Date('2026-09-29T10:00:00+08:00'));
-  return f;
-}
-
-test('公司经营条件保存重启后仍复核；不取产品文档，候选通过后数值撤销也不能开仓', async t => {
-  for (const revoke of [false, true]) {
-    const research = { version: 1, enabled: true, path: 'company', rules: [{ field: 'revenueYoY', op: 'gt', value: 0 }] };
-    const f = fixture(t, { research }); f.finance({ revenueYoY: 10 });
-    f.restart(); assert.deepEqual(f.member().entryConditions.research, research);
-    f.service.getAutomaticEvidence = () => { throw Error('公司指标不应获取产品报告'); };
-    if (revoke) f.loading((_symbol, calls) => { if (calls === 2) f.finance({ revenueYoY: -10 }); });
-    await f.run();
-    assert.equal(f.engine.s.trades.length, revoke ? 0 : 1);
-    assert.ok(f.loads.every(call => call.financial));
-    const decision = f.engine.s.agency.decisions.find(item => item.action === 'buy');
-    assert.equal(decision.status, revoke ? 'blocked' : 'executed');
-    assert.equal(decision.executionCheck.entryConditionsCheck.researchReview.status, revoke ? 'failed' : 'pass');
-  }
-});
-
-test('经营条件和已有个人研究条件同时生效，不能用公司通过抵消个人缺项', async t => {
-  const f = fixture(t, { research: { version: 1, enabled: true, path: 'company', rules: [{ field: 'revenueYoY', op: 'gt', value: 0 }] }, evidence: { conditions: ['demand'] } });
-  f.finance({ revenueYoY: 10 }); await f.run();
-  assert.equal(f.engine.s.trades.length, 0);
-  f.evidence(() => [demandEvidence('supported')]); await f.run();
-  assert.equal(f.engine.s.trades.length, 1);
-});
-
-test('产品指标新开仓读取原始报告并复核：无需行业排名且执行前资料失效会拦截', async t => {
-  for (const revoke of [false, true]) {
-    const f = fixture(t, { research: { version: 1, enabled: true, path: 'product', rules: [{ field: 'currentRevenue', op: 'gt', value: 100000 }] } });
-    let calls = 0;
-    f.service.getAutomaticEvidence = async (symbol, options) => {
-      calls++; assert.equal(options.includeIndustry, false);
-      if (revoke && calls > 1) return { symbol, documents: [], errors: ['执行前资料不可用'] };
-      const b = companyBundle(symbol, new Date('2026-09-29T10:00:00+08:00'));
-      const text = '主要产品为汽车扬声器\n营业收入构成\n单位：万元\n本报告期 上年同期 同比增减\n金额 占营业收入比重 金额 占营业收入比重\n营业收入合计 200 100% 160 100% 25%\n分产品\n汽车扬声器 120 60% 80 50% 50%';
-      Object.assign(b.documents[1], { text, fullText: text, pageTexts: [{ page: 1, text, method: 'provider-text', complete: true, numericEligible: true }] });
-      return b;
-    };
-    await f.run(); assert.ok(calls >= 2);
-    assert.equal(f.engine.s.trades.length, revoke ? 0 : 1);
-    const decision = f.engine.s.agency.decisions.find(item => item.action === 'buy');
-    assert.equal(decision.status, revoke ? 'blocked' : 'executed');
-  }
-});
-
-test('仅观察经营指标不持久化为门槛、不新增财务或产品取数', async t => {
-  const f = fixture(t, { research: { version: 1, enabled: false, path: 'product', rules: [] } });
-  assert.equal(f.member().entryConditions, undefined);
-  f.service.getAutomaticEvidence = () => { throw Error('仅观察不应取产品资料'); };
-  await f.run(); assert.equal(f.engine.s.trades.length, 1);
-  assert.ok(f.loads.every(call => call.financial === false));
-});
-
-test('真实自动成交写前归档，成交、持仓与周期引用同一冻结依据且原文不受后来修改影响', async t => {
-  const f = automaticArchiveFixture(t), conditions = structuredClone(f.member().entryConditions);
-  const save = f.service.archiveEntryEvidence;
-  f.service.archiveEntryEvidence = payload => {
-    assert.equal(f.engine.s.trades.length, 0); assert.equal(f.engine.s.lots.length, 0);
-    assert.equal(f.engine.s.cash, 10000000); assert.equal(payload.execution.quantity > 0, true);
-    return save(payload);
-  };
+test('技术成交依据仍在写盘后关联成交持仓及周期，独立读取不能改写冻结快照', async t => {
+  const f = fixture(t), conditions = structuredClone(f.member().entryConditions), archive = f.service.archiveEntryEvidence;
+  f.service.archiveEntryEvidence = payload => { assert.equal(f.engine.s.trades.length, 0); return archive(payload); };
   await f.run();
-  const trade = f.engine.s.trades[0], ref = trade.entryEvidenceRef, archived = f.entryEvidence.read(ref);
-  assert.equal(trade.entryEvidenceRequired, true);
-  assert.deepEqual(f.engine.s.lots[0].entryEvidenceRef, ref);
+  const trade = f.engine.s.trades[0], ref = trade.entryEvidenceRef, saved = f.entryEvidence.read(ref);
+  assert.equal(trade.entryEvidenceRequired, true); assert.deepEqual(f.engine.s.lots[0].entryEvidenceRef, ref);
   assert.deepEqual(f.engine.s.agency.groups.find(group => group.id === 'swing').cycles[0].entryEvidenceRef, ref);
-  assert.deepEqual(archived.entryConditions, conditions); assert.equal(archived.rulesVersion, '1');
-  assert.equal(archived.execution.quantity, trade.quantity); assert.equal(archived.execution.evaluation.plan.entry, trade.price);
-  assert.equal(archived.snapshot.automaticEvidenceEvaluation.status, 'pass');
-  assert.equal(archived.snapshot.automaticEvidence.documents.length, 2);
-  assert.match(archived.snapshot.automaticEvidence.documents[1].text, /2026年半年度报告/);
-  assert.equal(archived.snapshot.automaticEvidence.documents[1].publishedAt, '2026-08-15');
-  assert.match(archived.snapshot.automaticEvidence.documents[1].textHash, /^[a-f0-9]{64}$/);
-  f.member().entryConditions.evidence.conditions = ['leadership']; archived.snapshot.automaticEvidence.documents[0].text = '被调用方改写';
-  assert.deepEqual(f.entryEvidence.read(ref).entryConditions, conditions);
-  assert.notEqual(f.entryEvidence.read(ref).snapshot.automaticEvidence.documents[0].text, '被调用方改写');
+  assert.deepEqual(saved.entryConditions, conditions); assert.equal(saved.execution.quantity, trade.quantity);
+  assert.equal(saved.snapshot.automaticEvidence, undefined);
+  saved.snapshot.technical.close = 1; assert.equal(f.entryEvidence.read(ref).snapshot.technical.close, 10.05);
   assert.equal(f.entryEvidence.auditAccount(f.store.load()).verified, 1);
 });
 
-test('归档不可用、写盘失败或异步回调均在买入前拦截，不消耗资金、盘口或生成持仓', async t => {
-  for (const archive of [null, () => { throw Error('永久目录只读'); }, async () => { throw Error('错误异步归档'); }, () => ({ version: 1, hash: '0'.repeat(64) })]) {
-    const f = automaticArchiveFixture(t); f.service.archiveEntryEvidence = archive;
-    const before = structuredClone(f.engine.s); await f.run();
-    assert.equal(f.engine.s.trades.length, 0); assert.equal(f.engine.s.lots.length, 0);
+test('配置的成交归档写盘失败或返回无效引用时不消耗资金和盘口', async t => {
+  for (const archive of [() => { throw Error('永久目录只读'); }, async () => { throw Error('错误异步归档'); }, () => ({ version: 1, hash: '0'.repeat(64) })]) {
+    const f = fixture(t); f.service.archiveEntryEvidence = archive; const before = structuredClone(f.engine.s);
+    await f.run(); assert.equal(f.engine.s.trades.length, 0); assert.equal(f.engine.s.lots.length, 0);
     assert.equal(f.engine.s.cash, before.cash); assert.deepEqual(f.engine.s.consumed, before.consumed);
     assert.equal(f.store.load().trades.length, 0);
-    assert.ok(f.engine.s.agency.decisions.some(decision => decision.action === 'buy' && decision.status === 'blocked'));
-    assert.equal(f.service.storageError, '', 'an archive rejection is not a post-trade account-save failure');
   }
 });
 
-test('归档成功而账户保存失败仅留下孤立依据，原子回滚成交并暂停服务', async t => {
-  const f = automaticArchiveFixture(t), save = f.store.save.bind(f.store); let archivedRef;
-  f.service.archiveEntryEvidence = payload => (archivedRef = f.entryEvidence.archive(payload));
+test('归档后账户保存失败回滚成交并停止服务，孤立依据仍可审计', async t => {
+  const f = fixture(t), save = f.store.save.bind(f.store); let ref;
+  f.service.archiveEntryEvidence = payload => (ref = f.entryEvidence.archive(payload));
   f.store.save = state => { if (state.trades.length) throw Error('归档后的账户保存失败'); return save(state); };
-  await f.run();
-  assert.ok(archivedRef); assert.equal(f.entryEvidence.read(archivedRef).symbol, 'sz000001');
-  assert.equal(f.engine.s.trades.length, 0); assert.equal(f.engine.s.lots.length, 0); assert.equal(f.engine.s.cash, 10000000);
-  assert.deepEqual(f.engine.s.consumed, {}); assert.equal(f.store.load().trades.length, 0);
+  await f.run(); assert.ok(ref); assert.equal(f.entryEvidence.read(ref).symbol, 'sz000001');
+  assert.equal(f.engine.s.trades.length, 0); assert.equal(f.engine.s.cash, 10000000); assert.deepEqual(f.engine.s.consumed, {});
   assert.match(f.service.storageError, /账户保存失败/);
 });
 
-test('平仓、移出候选及日志滚动保留原开仓档案，归档服务故障不阻断持仓退出', async t => {
-  const f = automaticArchiveFixture(t); await f.run(); const ref = structuredClone(f.engine.s.trades[0].entryEvidenceRef);
-  f.service.archiveEntryEvidence = () => { throw Error('退出不应调用归档'); };
+test('清仓和移除成员保留原成交依据，归档服务故障不阻断退出', async t => {
+  const f = fixture(t); await f.run(); const ref = structuredClone(f.engine.s.trades[0].entryEvidenceRef);
+  f.service.archiveEntryEvidence = () => { throw Error('退出不应归档'); };
   f.setTime('2026-09-30T10:00:00+08:00'); f.price(9.5);
   f.transaction(() => f.engine.tick({ sz000001: f.quote('sz000001') }, { sz000001: f.snapshot('sz000001') }));
-  assert.equal(f.engine.s.trades.length, 2); assert.equal(f.engine.s.trades[1].side, 'sell'); assert.equal(f.engine.s.lots.length, 0);
-  f.transaction(() => {
-    f.engine.agencyMember({ strategyId: 'swing', symbol: 'sz000001', action: 'remove' });
-    for (let index = 0; index < 520; index++) f.engine.agencyLog({ status: 'waiting', message: '隔离滚动日志' });
-  });
-  assert.equal(f.engine.s.agency.decisions.length, 500); assert.equal(f.member(), undefined);
-  assert.deepEqual(f.engine.s.trades[0].entryEvidenceRef, ref); assert.equal(f.entryEvidence.read(ref).symbol, 'sz000001');
-  assert.equal(f.entryEvidence.auditAccount(f.store.load()).verified, 1);
+  f.transaction(() => { f.engine.agencyMember({ strategyId: 'swing', symbol: 'sz000001', action: 'remove' });
+    for (let index = 0; index < 520; index++) f.engine.agencyLog({ status: 'waiting', message: '滚动日志' }); });
+  assert.equal(f.engine.s.trades[1].side, 'sell'); assert.equal(f.engine.s.lots.length, 0); assert.equal(f.member(), undefined);
+  assert.deepEqual(f.engine.s.trades[0].entryEvidenceRef, ref); assert.equal(f.entryEvidence.auditAccount(f.store.load()).verified, 1);
 });
 
-test('账户备份携带去重正文，异目录恢复可核验；缺失或篡改的开仓依据不能静默有效', async t => {
-  const f = automaticArchiveFixture(t); await f.run();
-  const trade = f.engine.s.trades[0], ref = trade.entryEvidenceRef, backup = f.entryEvidence.exportAccount(f.engine.s);
+test('技术成交依据可备份到另一目录，丢失或串股引用不能静默通过账户校验', async t => {
+  const f = fixture(t); await f.run(); const backup = f.entryEvidence.exportAccount(f.engine.s);
   const restored = new EntryEvidenceStore(path.join(path.dirname(f.store.file), 'restored-evidence'));
   assert.equal(restored.auditAccount(f.engine.s).status, 'missing');
-  const account = restored.importAccount(backup); assert.equal(validState(account), true);
-  assert.deepEqual(account, f.engine.s); assert.equal(restored.auditAccount(account).verified, 1);
-  const missingRef = structuredClone(account); delete missingRef.trades[0].entryEvidenceRef;
-  assert.equal(validState(missingRef), false);
-  const wrongRef = structuredClone(account); wrongRef.trades[0].entryEvidenceRef.symbol = 'sh600519';
-  assert.equal(validState(wrongRef), false);
-  const text = restored.manifest(ref).snapshot.snapshot.automaticEvidence.documents[0].archivedText;
-  fs.writeFileSync(restored.file('text', text.hash), '篡改后的文件');
-  assert.equal(restored.auditAccount(account).status, 'missing');
-  assert.throws(() => restored.exportAccount(account), /不能导出完整备份/);
-  assert.throws(() => restored.archive(f.entryEvidence.read(ref)), /内容校验失败/, 'normal archive never overwrites corruption');
-  assert.deepEqual(restored.importAccount(backup), account);
-  assert.equal(restored.auditAccount(account).status, 'ready');
-});
-
-test('执行前证据失效或证据库读取失败时阻断，不能复用上一轮肯定结论', async t => {
-  for (const failure of ['revoked', 'unavailable']) {
-    const f = fixture(t, { rules: [], evidence: { conditions: ['demand'] } }); let calls = 0;
-    f.evidence(() => {
-      if (++calls === 1) return [demandEvidence('supported')];
-      if (failure === 'unavailable') throw Error('隔离证据库暂不可用');
-      return [demandEvidence('unsupported')];
-    });
-    await f.run(); assert.equal(f.engine.s.trades.length, 0, failure); assert.ok(calls >= 2, failure);
-    assert.ok(f.engine.s.agency.decisions.some(decision => decision.action === 'buy' && decision.status === 'blocked'), failure);
-  }
+  const account = restored.importAccount(backup); assert.equal(validState(account), true); assert.deepEqual(account, f.engine.s);
+  assert.equal(restored.auditAccount(account).verified, 1);
+  const missing = structuredClone(account); delete missing.trades[0].entryEvidenceRef; assert.equal(validState(missing), false);
+  const wrong = structuredClone(account); wrong.trades[0].entryEvidenceRef.symbol = 'sh600519'; assert.equal(validState(wrong), false);
 });
 
 test('科创板缺选股专用指标的截断报价不能把股当手放大成交量并通过门禁', () => {
@@ -417,25 +294,23 @@ test('真实腾讯解析器贯通科创板股单位、动态 PE 和盘中量比�
   assert.equal(check.passed, true, check.reasons.join('；'));
 });
 
-test('单只加入等待行情时重置账户，旧请求不能把股票和规则写入新账户', async () => {
+test('旧渲染器不能通过单只加入接口人工指定股票，拒绝前不请求行情或改写条件', () => {
   const vm = require('node:vm');
   const { symbolOf } = require('../core/common.cjs');
-  const { createEntryConditions } = require('../core/entry-conditions.cjs');
   const mainPath = path.join(__dirname, '../main.cjs'), source = fs.readFileSync(mainPath, 'utf8');
-  const start = source.indexOf("  handler('agency:member',"), end = source.indexOf("  handler('agency:members:add',");
+  const start = source.indexOf("  handler('agency:member',"), end = source.indexOf("  handler('agency:reconcile',", start);
   assert.ok(start >= 0 && end > start);
-  const now = new Date('2026-09-29T10:00:00+08:00'); let add, release;
+  const now = new Date('2026-09-29T10:00:00+08:00'); let add;
   // Execute the actual IPC callback against in-memory dependencies. Electron,
   // network access and user account paths are never loaded by this test.
-  const context = vm.createContext({ symbolOf, createEntryConditions, structuredClone,
+  const context = vm.createContext({ symbolOf, structuredClone,
     handler: (_name, callback) => { add = callback; }, engine: new Engine(initialState(100000), () => now), quotes: {},
-    market: { quotes: () => new Promise(resolve => { release = resolve; }) }, transaction: callback => callback(),
-    publish: () => {}, monitor: { load: async () => ({}) }, needsFundamentals: () => false, agency: null });
+    market: { quotes: () => { throw Error('拒绝人工加入前不得查询行情'); } }, transaction: () => { throw Error('拒绝人工加入前不得改写账户'); },
+    publish: () => { throw Error('拒绝人工加入前不得广播'); }, monitor: { load: () => { throw Error('拒绝人工加入前不得准备资料'); } } });
   vm.runInContext(source.slice(start, end), context, { filename: mainPath });
-  const pending = add({ strategyId: 'swing', symbol: '000001', action: 'add', entryConditions: roeCondition() });
-  context.engine = new Engine(initialState(200000), () => now);
-  release({ sz000001: { symbol: 'sz000001', price: 10, timestamp: now.getTime() } });
-  await assert.rejects(pending, /账户已重置/);
+  const before = structuredClone(context.engine.s);
+  assert.throws(() => add({ strategyId: 'swing', symbol: '000001', action: 'add', entryConditions: roeCondition() }), /只由策略筛选生成候选/);
+  assert.deepEqual(context.engine.s, before);
   assert.equal(context.engine.s.agency.groups.flatMap(group => group.members).length, 0);
   assert.equal(Object.keys(context.engine.s.marks).length, 0); assert.equal(Object.keys(context.quotes).length, 0);
 });

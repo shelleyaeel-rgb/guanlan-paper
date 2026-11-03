@@ -3,9 +3,8 @@ const { randomUUID } = require('node:crypto');
 const { symbolOf } = require('./common.cjs');
 const { createEntryConditions } = require('./entry-conditions.cjs');
 const { combineDiagnostics, listedDiagnostics } = require('./agency-pool-diagnostics.cjs');
-const { validateResearchRules } = require('./research-rules.cjs');
-const { validatePerformanceRules } = require('./performance-rules.cjs');
-const { validateIndustryRules } = require('./selection-evidence.cjs');
+const { technicalEntryQuery } = require('./agency-selection.cjs');
+const { ACTIVE_CANDIDATE_LIMIT, setStandby, activateCandidate, STANDBY_CAPACITY_REASON } = require('./agency-capacity.cjs');
 const IDS = ['ultra-short', 'short', 'swing', 'long'];
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 const iso = value => new Date(value).toISOString();
@@ -35,7 +34,7 @@ function validPoolLedger(agency) {
   if (!object(result) || typeof result.id !== 'string' || result.policyVersion !== policy.version
     || (policy.version === 3 && result.screeningMode !== policy.screeningMode) || !validTime(result.startedAt) || !validTime(result.finishedAt)
     || !object(result.counts) || !object(result.strategies)) return false;
-  for (const key of ['added', 'retained', 'removed', 'pending', 'held', 'skipped']) {
+  for (const key of ['added', 'retained', 'removed', 'pending', 'held', 'skipped', ...(result.standby !== undefined ? ['standby'] : [])]) {
     if (!Array.isArray(result[key]) || result.counts[key] !== result[key].length) return false;
     for (const item of result[key]) {
       try { if (!object(item) || symbolOf(item.symbol) !== item.symbol || !IDS.includes(item.strategyId) || !Array.isArray(item.reasons)) return false; }
@@ -51,26 +50,13 @@ function validPoolLedger(agency) {
   return agency.groups.every(group => group.members.every(member => (agency.version >= 5 && member.poolCheck === undefined) || validPoolCheck(member.poolCheck)));
 }
 
-// Explicit policy composition remains available for older saved workflows.
-// Ordinary manual additions no longer inherit a global candidate policy.
+// Older callers may still compose pool and personal conditions. Only current
+// technical predicates may become automatic trading admission conditions.
 function poolEntryConditions(input, policy, now) {
-  const source = { kind: 'agency-pool', policyVersion: policy.version, ...(policy.version >= 3 ? { screeningMode: policy.screeningMode } : {}) };
-  const common = createEntryConditions({ ...policy.commonQuery, source }, now), supplied = createEntryConditions(input, now);
-  if (!supplied) return common;
-  const rules = [...new Map([...common.rules, ...supplied.rules].map(rule => [JSON.stringify(rule), rule])).values()];
-  const left = common.evidence, right = supplied.evidence;
-  if (left && right && (left.industry || right.industry) && (left.leadership || right.leadership
-    || left.industry && right.industry && JSON.stringify(left.industry) !== JSON.stringify(right.industry))) throw Error('两套行业条件不能隐式覆盖，请明确选择');
-  const evidence = left && right ? { conditions: [...new Set([...left.conditions, ...right.conditions])],
-    leadership: right.leadership && right.leadership !== 'either' ? right.leadership : left.leadership || right.leadership,
-    minSegmentRevenuePct: Math.max(left.minSegmentRevenuePct || 0, right.minSegmentRevenuePct || 0),
-    ...(left.industry || right.industry ? { industry: left.industry || right.industry } : {}) } : left || right;
-  if (common.research && supplied.research && JSON.stringify(common.research) !== JSON.stringify(supplied.research)) throw Error('两套经营指标条件不能隐式覆盖，请明确选择');
-  const research = supplied.research || common.research;
-  if (common.performance && supplied.performance && JSON.stringify(common.performance) !== JSON.stringify(supplied.performance)) throw Error('两套业绩预告/快报条件不能隐式覆盖，请明确选择');
-  const performance = supplied.performance || common.performance;
-  return createEntryConditions({ rules, excludeST: common.excludeST || supplied.excludeST,
-    ...(evidence ? { evidence } : {}), ...(research ? { research } : {}), ...(performance ? { performance } : {}), source }, now);
+  const source = { kind: 'agency-pool', policyVersion: policy.version, screeningMode: 'strategy' };
+  const common = technicalEntryQuery(policy.commonQuery), supplied = technicalEntryQuery(input);
+  const rules = [...new Map([...(common?.rules || []), ...(supplied?.rules || [])].map(rule => [JSON.stringify(rule), rule])).values()];
+  return createEntryConditions({ rules, excludeST: !!(common?.excludeST || supplied?.excludeST), source }, now);
 }
 function pendingPoolCheck(policy, now, reason) {
   return { policyVersion: policy.version, ...(policy.version >= 3 ? { screeningMode: policy.screeningMode } : {}),
@@ -94,6 +80,23 @@ function checkedResult(scan, policy) {
   return indexes;
 }
 
+// This ordering is a monitoring budget, not a return or success prediction.
+function candidateRanking(row, strategyId) {
+  const anchorField = strategyId === 'long' ? 'ma60' : strategyId === 'swing' ? 'ma20' : 'ma5';
+  const anchor = row[anchorField], price = row.price;
+  return { anchorField, distancePct: Number.isFinite(price) && price > 0 && Number.isFinite(anchor) && anchor > 0
+    ? Math.abs(price - anchor) / anchor * 100 : null,
+    amount: Number.isFinite(row.amount) && row.amount >= 0 ? row.amount : null,
+    technicalAsOf: row.technicalAsOf || null, quoteTime: Number.isFinite(row.timestamp) ? row.timestamp : null };
+}
+function compareCandidates(left, right, strategyId, formerlyActive) {
+  const a = candidateRanking(left, strategyId), b = candidateRanking(right, strategyId);
+  return (a.distancePct ?? Infinity) - (b.distancePct ?? Infinity)
+    || (b.amount ?? -Infinity) - (a.amount ?? -Infinity)
+    || Number(formerlyActive.has(right.symbol)) - Number(formerlyActive.has(left.symbol))
+    || left.symbol.localeCompare(right.symbol);
+}
+
 class AgencyPoolService {
   constructor({ getEngine, transaction, screener, onChange = () => {}, clock = Date.now, screen, policy, prepareSource = () => {} } = {}) {
     Object.assign(this, { getEngine, transaction, screener, onChange, clock, screen, policy, prepareSource });
@@ -110,46 +113,50 @@ class AgencyPoolService {
     const pool = this.getEngine().s.agency.pool;
     const policy = require('./agency-screening.cjs').poolPolicy;
     return { ...this.progressState(), lastResult: pool ? structuredClone(pool.lastResult) : null,
+      savedPolicy: pool?.policy ? structuredClone(pool.policy) : null,
       policy: structuredClone(this.policy?.('strategy') || policy()),
       policies: { strategy: structuredClone(this.policy?.('strategy') || policy('strategy')), strict: structuredClone(this.policy?.('strict') || policy('strict')) } };
   }
   cancel() { if (this.active) { this.active.cancelled = true; this.screener.cancel(); this.onChange({ progressOnly: true }); } return !!this.active; }
-  async run({ retryEvidence = false, refreshQuantitative = false, screeningMode, research, performance, industry } = {}) {
+  async run({ retryEvidence = false, refreshQuantitative = false, automatic = false, screeningMode, research, performance, industry } = {}) {
     if (typeof retryEvidence !== 'boolean' || typeof refreshQuantitative !== 'boolean') throw Error('资料重试参数无效');
+    if (typeof automatic !== 'boolean') throw Error('自动候选池参数无效');
     if (this.active) throw Error('四策略候选池正在更新，请等待完成或取消');
     if (this.screener.activeRun) throw Error('选股任务正在执行，请完成或取消后再更新候选池');
     const engine = this.getEngine(), agency = engine.s.agency;
     const previous = agency.pool?.lastResult;
     if (screeningMode === undefined) screeningMode = retryEvidence ? previous?.screeningMode || (previous?.policyVersion < 3 ? 'strict' : 'strategy') : 'strategy';
-    if (retryEvidence) { research = agency.pool?.policy?.commonQuery?.research; performance = agency.pool?.policy?.commonQuery?.performance; industry = agency.pool?.policy?.commonQuery?.evidence?.industry; }
-    research = validateResearchRules(research);
-    performance = validatePerformanceRules(performance);
-    industry = validateIndustryRules(industry);
     if (!['strategy', 'strict'].includes(screeningMode)) throw Error('候选筛选模式无效');
-    if (retryEvidence && (!previous || !(previous.counts.pending + previous.counts.unassignedPending > 0 || previous.coverage?.diagnostics?.pendingCompanies > 0
+    screeningMode = 'strategy';
+    research = performance = industry = undefined;
+    if (retryEvidence && (!previous || !(previous.counts.pending + previous.counts.unassignedPending > 0 || previous.standby?.some(item => item.status === 'pending') || previous.coverage?.diagnostics?.pendingCompanies > 0
       || previous.held?.some(item => item.status === 'pending')))) throw Error('没有可重试的待核验结果，请先更新四策略候选池');
     const run = { id: randomUUID(), startedAt: Number(this.clock()), epoch: agency.epoch, authorization: agency.poolAuthorizationRevision,
       cancelled: false, operation: retryEvidence ? 'retry' : 'update' };
     const policy = structuredClone(this.policy?.(screeningMode, research, performance, industry) || require('./agency-screening.cjs').poolPolicy(screeningMode, research, performance, industry));
     const requiredSymbols = agency.groups.flatMap(group => group.members.map(member => member.symbol));
-    const exiting = new Set(agency.groups.flatMap(group => group.members.filter(member => member.mode !== 'active').map(member => member.symbol)));
+    const exiting = new Set(agency.groups.flatMap(group => group.members.filter(member => ['closing', 'removing'].includes(member.mode)).map(member => member.symbol)));
     this.active = run; this.lastRun = run; this.lastError = '';
     this.screener.progress = { loading: true, stage: 'preparing', completed: 0, total: 0 };
     this.onChange();
     try {
-      if (screeningMode === 'strict' || industry || research?.enabled && research.path === 'product') this.prepareSource({ retry: retryEvidence });
-      // Even a document retry must recheck current quantitative eligibility;
-      // its source reuses verified bodies, never stale candidate permissions.
+      // A retry always rechecks current market and daily-bar eligibility.
       const scan = await (this.screen || require('./agency-screening.cjs').runAgencyScreening)(this.screener, { force: true, requiredSymbols, retryEvidence, refreshQuantitative, screeningMode, research, performance, industry });
       if (run.cancelled) throw Error('已取消候选池更新，本次结果未应用');
       const indexes = checkedResult(scan, policy);
+      // A background run with no confirmed pass and unresolved data cannot
+      // replace the current pool. Explicit updates may still publish the full
+      // pending diagnostics; a confirmed empty result is applied normally.
+      if (automatic && scan.status === 'unavailable') throw Error('本次自动筛选没有已确认通过的候选，且仍有待核验资料；保留原名单与上次结果，等待重试');
       const finishedAt = iso(scan.finishedAt || this.clock()), startedAt = iso(scan.startedAt || finishedAt);
       const result = { id: randomUUID(), startedAt, finishedAt, policyVersion: policy.version, screeningMode, operation: run.operation,
         ...(research ? { research: structuredClone(research) } : {}),
         ...(performance ? { performance: structuredClone(performance) } : {}),
         ...(industry ? { industry: structuredClone(industry) } : {}),
         coverage: structuredClone(scan.coverage || {}), sources: structuredClone(scan.sources || []), priority: [...policy.priority],
-        added: [], retained: [], removed: [], pending: [], held: [], skipped: [], unassignedPending: [], counts: {}, strategies: {} };
+        added: [], retained: [], removed: [], pending: [], held: [], skipped: [], standby: [], unassignedPending: [], counts: {}, strategies: {},
+        selection: { mode: 'technical', activeLimitPerGroup: ACTIVE_CANDIDATE_LIMIT, ranking: '距策略均线的百分比距离、成交额、原活跃优先、股票代码',
+          ...(scan.candidateSelection ? { criteria: structuredClone(scan.candidateSelection) } : {}) } };
       for (const id of policy.priority) result.strategies[id] = Object.fromEntries(['pass', 'failed', 'pending'].map(status => [status, scan.strategies[id][status].length]));
       this.transaction(() => {
         const current = this.getEngine(), a = current.s.agency;
@@ -159,6 +166,8 @@ class AgencyPoolService {
         const holdings = new Set(current.s.lots.map(lot => lot.symbol));
         const orders = new Set(current.s.orders.filter(order => order.status === 'pending').map(order => order.symbol));
         const owners = new Map();
+        const existing = new Set(a.groups.flatMap(group => group.members.map(member => member.symbol)));
+        const formerlyActive = new Set(a.groups.flatMap(group => group.members.filter(member => member.mode === 'active').map(member => member.symbol)));
         const matches = symbol => policy.priority.filter(id => indexes.get(id).get(symbol)?.status === 'pass');
         const lookup = (id, symbol) => indexes.get(id).get(symbol) || { symbol, status: 'pending', reasons: ['本次资料未覆盖该股票，等待重新核验'] };
         const entry = (id, row) => ({ symbol: row.symbol, name: row.name || current.s.marks[row.symbol]?.name || row.symbol,
@@ -178,17 +187,18 @@ class AgencyPoolService {
           const retained = [];
           for (const member of group.members) {
             const row = lookup(group.id, member.symbol), item = entry(group.id, row);
-            // A strategy scan is diagnostic for existing monitors. It cannot
-            // revoke or grant a member's separately chosen strict qualification.
-            if (member.selectionMode !== 'strict' || screeningMode === 'strict') member.poolCheck = check(row);
+            member.selectionMode = 'strategy';
+            member.poolCheck = check(row);
             if (holdings.has(member.symbol)) {
               retained.push(member); owners.set(member.symbol, group.id); result.held.push(item); continue;
             }
-            if (member.mode !== 'active') {
+            if (['removing', 'closing'].includes(member.mode)) {
               retained.push(member); owners.set(member.symbol, group.id); result.skipped.push({ ...item, reasons: ['已有退出安排，本次不重新授权开仓'] }); continue;
             }
             retained.push(member); owners.set(member.symbol, group.id);
-            result[row.status === 'pending' ? 'pending' : 'retained'].push(item);
+            setStandby(current.s, member, row.status === 'pass' ? STANDBY_CAPACITY_REASON
+              : row.status === 'pending' ? '本轮筛选资料待核验，留在候补，更新候选池时重试'
+                : '本轮不符合筛选条件，留在候补');
           }
           group.members = retained;
         }
@@ -199,10 +209,23 @@ class AgencyPoolService {
           const reason = holdings.has(symbol) ? '已有手动持仓，策略不能自动接管'
             : orders.has(symbol) ? '有待执行手动委托，本次不接管' : exiting.has(symbol) ? '保留本轮开始时的退出安排，不自动重新加入' : '';
           if (reason) { result.skipped.push({ ...item, reasons: [reason] }); continue; }
-          const member = { symbol, mode: 'active', selectionMode: screeningMode, addedAt: current.clock().toISOString(), reconciliation: { status: 'clear', reason: '' }, poolCheck: check(row) };
-          if (screeningMode === 'strict' || research?.enabled || performance?.enabled || industry) member.entryConditions = createEntryConditions({ ...policy.commonQuery,
-            source: { kind: 'agency-pool', policyVersion: policy.version, screeningMode, selectedAt: finishedAt } }, current.clock());
-          a.groups.find(group => group.id === strategyId).members.push(member); owners.set(symbol, strategyId); result.added.push(item);
+          const member = { symbol, mode: 'standby', standbyReason: STANDBY_CAPACITY_REASON, selectionMode: screeningMode, addedAt: current.clock().toISOString(), reconciliation: { status: 'clear', reason: '' }, poolCheck: check(row) };
+          a.groups.find(group => group.id === strategyId).members.push(member); owners.set(symbol, strategyId);
+        }
+        // Rank current technical passes; missing observations cannot become a pass.
+        for (const group of a.groups) {
+          const available = group.members.filter(member => member.mode === 'standby' && member.reconciliation?.status !== 'pending' && lookup(group.id, member.symbol).status === 'pass');
+          available.sort((left, right) => compareCandidates(lookup(group.id, left.symbol), lookup(group.id, right.symbol), group.id, formerlyActive));
+          for (const member of available.slice(0, ACTIVE_CANDIDATE_LIMIT)) activateCandidate(current.s, group, member);
+          for (const member of group.members) {
+            if (holdings.has(member.symbol) || ['closing', 'removing'].includes(member.mode)) continue;
+            const row = lookup(group.id, member.symbol), item = entry(group.id, row);
+            member.candidateRanking = candidateRanking(row, group.id);
+            if (member.mode === 'standby') {
+              if (row.status === 'pass' && member.reconciliation?.status === 'pending') member.standbyReason = `已有核验阻断，留在候补：${member.reconciliation.reason || '等待核验详情处理'}`;
+              result.standby.push({ ...item, reasons: [...new Set([member.standbyReason, ...item.reasons])], ranking: member.candidateRanking });
+            } else result[existing.has(member.symbol) ? 'retained' : 'added'].push({ ...item, ranking: member.candidateRanking });
+          }
         }
         // Unknown eligibility is separate from members awaiting revalidation. A
         // first scan can have thousands of unknown stocks without adding any.
@@ -230,8 +253,8 @@ class AgencyPoolService {
           unknown.set(row.symbol, item);
         }
         result.unassignedPending = [...unknown.values()].sort((a, b) => a.symbol.localeCompare(b.symbol));
-        for (const key of ['added', 'retained', 'removed', 'pending', 'held', 'skipped', 'unassignedPending']) result.counts[key] = result[key].length;
-        result.listedDiagnostics = listedDiagnostics(['added', 'retained', 'removed', 'pending', 'held', 'skipped', 'unassignedPending'].flatMap(key => result[key]));
+        for (const key of ['added', 'retained', 'removed', 'pending', 'held', 'skipped', 'standby', 'unassignedPending']) result.counts[key] = result[key].length;
+        result.listedDiagnostics = listedDiagnostics(['added', 'retained', 'removed', 'pending', 'held', 'skipped', 'standby', 'unassignedPending'].flatMap(key => result[key]));
         a.pool = { policy, lastResult: structuredClone(result) }; a.poolAuthorizationRevision++; a.revision++;
       });
       return result;

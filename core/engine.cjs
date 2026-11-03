@@ -1,3 +1,4 @@
+const { technicalStrategyProfile } = require('./strategy-profiles.cjs');
 const { money, yuan, id, cnTime, session, symbolOf, numberIn } = require('./common.cjs');
 const { fees } = require('./fees.cjs');
 const { strategyDefaults, configureStrategy, evaluateEntry, updateDynamicRisk, strategyProfile } = require('./strategy.cjs');
@@ -10,7 +11,7 @@ const { validClientRequests } = require('./account-operations.cjs');
 const defaults = { commission: 0.00025, minCommission: 5, stampTax: 0.0005, transferFee: 0.00001, slippageTicks: 1, maxPosition: 0.3, refreshSeconds: 10 };
 function initialState(capital = 1000000) {
   const cents = money(numberIn(capital, 10000, 100000000, '初始资金'));
-  return { version: 1, initialCash: cents, cash: cents, settings: { ...defaults }, strategySettings: { ...strategyDefaults }, planSelections: {}, watchlist: ['sh600519', 'sz000001', 'sz300750', 'sh600036', 'sz002594', 'sh601318'], lots: [], risks: {}, orders: [], trades: [], equity: [{ time: Date.now(), value: cents }], marks: {}, consumed: {}, createdAt: new Date().toISOString() };
+  return { version: 1, initialCash: cents, cash: cents, settings: { ...defaults }, strategySettings: { ...strategyDefaults }, planSelections: {}, watchlist: [], lots: [], risks: {}, orders: [], trades: [], equity: [{ time: Date.now(), value: cents }], marks: {}, consumed: {}, createdAt: new Date().toISOString() };
 }
 function validState(s) {
   if (!([1, 2].includes(s?.version) && Number.isSafeInteger(s.cash) && s.cash >= 0 && Number.isSafeInteger(s.initialCash) && s.initialCash > 0 && ['lots', 'orders', 'trades', 'equity', 'watchlist'].every(k => Array.isArray(s[k])) && s.settings && s.risks && s.marks && s.consumed)) return false;
@@ -111,6 +112,8 @@ class Engine {
     if (q.canTrade === false) throw Error(q.tradeBlockedReason || '当前行情仅供展示，暂停模拟成交');
     const age = now.getTime() - q.timestamp;
     if (q.date !== t.date || age > 90000 || age < -15000) throw Error('报价过期或市场休市，暂停撮合；需要当日 90 秒内报价');
+    if (cnTime(q.timestamp).date !== t.date || !session(new Date(q.timestamp)).open)
+      throw Error('等待连续竞价时段的新报价；竞价或休市阶段的报价不用于模拟成交');
     if (!(q.volume > 0) || !(q.open > 0)) throw Error('停牌或无成交行情，暂停撮合');
     if (!Number.isFinite(q.limitUp) || !Number.isFinite(q.limitDown) || !(q.limitUp > q.limitDown) || !(q.limitDown > 0)) throw Error('缺少涨跌停信息；首版暂停无价格限制证券的撮合');
   }
@@ -170,6 +173,25 @@ class Engine {
     this.s.marks[symbol] = q;
     this.s.trades.push(trade); if (!this._agencyPosting) this.record(quotes, true); return trade;
   }
+  legacyExit(input, q, quotes = {}) {
+    const symbol = symbolOf(input?.symbol);
+    if (input.side !== undefined || input.quantity !== undefined || input.limit !== undefined)
+      throw Error('历史手动持仓仅支持按可卖数量和盘口退出，不能指定方向、数量或限价');
+    const lots = this.s.lots.filter(lot => lot.symbol === symbol);
+    if (!lots.length || lots.some(lot => (lot.owner || 'manual') !== 'manual')
+      || this.s.agency.groups.some(group => group.members.some(member => member.symbol === symbol)))
+      throw Error('仅可退出历史手动持仓；自动策略持仓请使用策略退出安排');
+    const available = this.positions().find(position => position.symbol === symbol)?.available || 0;
+    if (!available) throw Error('历史手动持仓受 T+1 限制，当前没有可卖数量');
+    if (q?.symbol !== symbol) throw Error('行情代码不匹配');
+    this.fresh(q);
+    const max = Math.min(available, maxOrderQuantity(symbol), this.liquidity(q, 'sell'));
+    // The compatibility exit follows the same lot-size and one-level liquidity
+    // rules as automatic exits. Unfilled holdings remain for a later request.
+    const quantity = max === available ? max : symbol.startsWith('sh688') ? (max >= 200 ? Math.floor(max) : 0) : Math.floor(max / 100) * 100;
+    if (!quantity) throw Error('对手一档可见数量不足，等待新报价后重试历史持仓退出');
+    return this.execute({ symbol, side: 'sell', quantity }, q, quotes, '历史手动持仓退出');
+  }
   strategyEntry(input, q, snapshot, quotes = {}) {
     const symbol = symbolOf(input.symbol), selected = this.selectedStrategy(symbol), strategyId = strategyProfile(input.strategyId ?? selected).id;
     if (strategyId !== selected) throw Error('已选策略发生变化，请查看当前买卖计划后重新确认');
@@ -189,7 +211,7 @@ class Engine {
       const financialValues = plan => plan.financeEvidence?.finance?.data?.latest || null;
       if ((expected.strategyId || 'swing') !== strategyId || expected.asOf !== p.asOf || expected.stop !== p.stop || expected.target !== p.target || !Number.isFinite(expected.entry) || p.entry > expected.entry || configChanged || (strategyId === 'long' && JSON.stringify(financialValues(expected)) !== JSON.stringify(financialValues(p)))) throw Error('交易策略、计划参数、财报或买价已变化，请查看新计划后重新确认');
     }
-    const profile = strategyProfile(strategyId);
+    const profile = this._agencyContext ? technicalStrategyProfile(strategyId) : strategyProfile(strategyId);
     const trade = this.execute({ symbol, side: 'buy', quantity: evaluation.quantity }, q, quotes, profile.name);
     const plan = { ...p, source: snapshot.source || '来源未标注', entry: trade.price, quantity: trade.quantity, economics: evaluation.economics, config: { ...(p.config || this.s.strategySettings) } };
     trade.strategyPlan = structuredClone(plan);

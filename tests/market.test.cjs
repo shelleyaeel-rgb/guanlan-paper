@@ -54,7 +54,8 @@ test('网络连接失败可切换备用入口，未复权与分时仍分别解�
     });
     const result = await market[method](symbol);
     assert.ok(method === 'strategyHistory' ? result.length === 40 : result.points.length === 1);
-    assert.equal(calls[1], calls[0].replace(primary, backup));
+    assert.equal(calls.at(-1), calls[0].replace(primary, backup));
+    if (method === 'strategyHistory') assert.match(calls[1], /quotes\.sina\.cn/);
   }
 });
 
@@ -125,7 +126,7 @@ test('所有来源格式错误或复权字段不符时拒绝返回日线', async
   calls = 0;
   market.fetcher = async () => { calls++; return json({ qfqday: raw }); };
   await assert.rejects(market.strategyHistory(symbol), /未收到未复权日线/);
-  assert.equal(calls, 3);
+  assert.equal(calls, 4);
   assert.equal(market.cache.size, 0);
 });
 

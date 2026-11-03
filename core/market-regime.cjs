@@ -2,6 +2,7 @@
 const { cnTime, symbolOf } = require('./common.cjs');
 const { dailyIndicators } = require('./daily-indicators.cjs');
 const { calendarSession } = require('./trading-calendar.cjs');
+const { preparedHistoryValid, publicDailyHistory } = require('./daily-history.cjs');
 
 const INDEX_SYMBOLS = Object.freeze(['sh000001', 'sz399001', 'sz399006']);
 // These are disclosed product defaults, not fitted parameters or evidence of profitability.
@@ -60,7 +61,9 @@ function expectedDailyDate(now) {
 
 function preparedIndexHistory(symbol, history, now, expectedDate = expectedDailyDate(now)) {
   const policy = MARKET_REGIME_POLICY;
-  if (!history || (history.symbol != null && history.symbol !== symbol) || history.adjustment !== '未复权' || !goodTime(history.fetchedAt) || history.fetchedAt > now || now - history.fetchedAt > policy.dailyMaxAgeMs || !history.source) throw Error(`${symbol} 指数日线来源、口径或获取时间无效`);
+  const validTime = history?.dailyEvidence !== undefined ? preparedHistoryValid(history, symbol, 'index', now)
+    : history && goodTime(history.fetchedAt) && history.fetchedAt <= now && now - history.fetchedAt <= policy.dailyMaxAgeMs;
+  if (!history || (history.symbol != null && history.symbol !== symbol) || history.adjustment !== '未复权' || !validTime || !history.source) throw Error(`${symbol} 指数日线来源、口径或获取时间无效`);
   const daily = dailyIndicators(history.bars, new Date(now));
   if (daily.asOf !== expectedDate) throw Error(`${symbol} 缺少最近完整交易日 ${expectedDate} 的指数日线`);
   return daily;
@@ -82,7 +85,8 @@ function indexMetrics(symbol, history, quote, now, expectedDate) {
   const down = daily.close < daily.ma20 && daily.ma20 < daily.ma60 && ma20Slope5 < 0;
   return { symbol, asOf: daily.asOf, close: daily.close, price: quote.price, changePct: (quote.price / quote.prevClose - 1) * 100,
     ma20: daily.ma20, ma60: daily.ma60, ma20Slope5, atr, atrRatio, trend: up ? 'up' : down ? 'down' : 'mixed',
-    quoteTime: quote.timestamp, source: quote.source, dailySource: history.source, dailyFetchedAt: history.fetchedAt };
+    quoteTime: quote.timestamp, source: quote.source, dailySource: history.source, dailyFetchedAt: history.fetchedAt,
+    ...(history.dailyEvidence ? { dailyHistory: publicDailyHistory(history, now) } : {}) };
 }
 
 function breadthMetrics(snapshot, now) {

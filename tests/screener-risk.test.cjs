@@ -8,7 +8,7 @@ const now = new Date('2026-10-08T10:36:00+08:00');
 const row = (symbol = 'sh688578', extra = {}) => ({ symbol, name: '测试股票', board: 'star', isST: false,
   timestamp: now.getTime(), price: 112, changePct: 0.38, amount: 4, turnover: 3, ...extra });
 const indicators = { close: 111.58, ma5: 108.092, previousMa5: 107.8, ma20: 104.859, previousMa20: 104.5,
-  ma60: 100, macd: 2.497, rsi: 55.98, dailyVolumeRatio: 1.636, technicalAsOf: '2026-09-30', technicalSource: '测试日线' };
+  ma60: 100, previousMa60: 99.9, macd: 2.497, rsi: 55.98, dailyVolumeRatio: 1.636, technicalAsOf: '2026-09-30', technicalSource: '测试日线' };
 const finance = { roe: 19.7, debtRatio: 10.37, revenueYoY: 39.85, adjustedProfitYoY: 20, latestAdjustedProfit: 2, operatingCash: 5,
   annualRoeLatest: 12, financeReportDate: '2026-06-30', financeNoticeDate: '2026-08-15', financeCurrency: 'CNY',
   financeFetchedAt: now.getTime(), financeSource: '东方财富',

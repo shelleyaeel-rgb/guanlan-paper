@@ -1,7 +1,7 @@
 'use strict';
 const { symbolOf, cnTime } = require('./common.cjs');
 const { calendarSession } = require('./trading-calendar.cjs');
-const { entryConditionNeedsFundamentals } = require('./entry-conditions.cjs');
+const { publicDailyHistory } = require('./daily-history.cjs');
 const COMMIT_BATCH_SIZE = 5;
 
 // Fetch evidence outside account transactions. Only the engine may interpret it
@@ -13,12 +13,14 @@ class CorporateService {
     Object.assign(this, { source, getEngine, transaction, market, getMonitor, acceptQuotes, onChange, isAvailable, clock, intervalMs, retryMs, calendar, scheduleCommit });
     this.lastAttempt = new Map(); this.lastCheck = new Map(); this.inflight = new Map(); this.polling = null;
     this.ready = []; this.commitScheduled = false; this.storageError = null;
+    this.preparing = new Map(); this.lastPreparation = new Map(); this.latestEvidence = new Map();
   }
   available() { return !this.storageError && this.isAvailable(); }
   syncEpoch() {
     const epoch = this.getEngine().s.agency.epoch;
     if (this.epoch !== epoch) {
       this.epoch = epoch; this.lastAttempt.clear(); this.lastCheck.clear(); this.inflight.clear(); this.polling = null;
+      this.preparing.clear(); this.lastPreparation.clear(); this.latestEvidence.clear();
     }
     return epoch;
   }
@@ -41,6 +43,19 @@ class CorporateService {
       ...s.agency.groups.flatMap(g => g.members.map(m => m.symbol))
     ])];
   }
+  preparationSymbols() {
+    return [...new Set([...this.symbols(), ...this.getEngine().s.agency.groups.flatMap(group => group.members
+      .filter(member => member.mode !== 'standby').map(member => member.symbol))])];
+  }
+  requiresEvidence(symbol) {
+    const engine = this.getEngine();
+    return typeof engine.agencyNeedsCorporateEvidence === 'function' ? engine.agencyNeedsCorporateEvidence(symbol) : true;
+  }
+  canVerify(symbol, explicitStrategyId) {
+    return this.preparationSymbols().includes(symbol) || Boolean(explicitStrategyId
+      && this.getEngine().s.agency.groups.some(group => group.id === explicitStrategyId
+        && group.members.some(member => member.symbol === symbol)));
+  }
   fromDate(symbol) {
     const s = this.getEngine().s, today = cnTime(this.clock()).date;
     const dates = s.trades.filter(t => t.symbol === symbol && t.owner && t.owner !== 'manual')
@@ -51,23 +66,47 @@ class CorporateService {
     dates.push(new Date(Date.parse(today) - 14 * 86400000).toISOString().slice(0, 10));
     return dates.sort()[0];
   }
-  async getSnapshot(symbol, force = false) {
+  async getSnapshot(symbol, force = false, explicitStrategyId) {
     symbol = symbolOf(symbol);
-    if (!this.symbols().includes(symbol)) return null;
-    const fromDate = this.fromDate(symbol);
-    try { return await this.source.get({ symbol, fromDate, force }); }
+    if (!this.canVerify(symbol, explicitStrategyId) || !this.requiresEvidence(symbol)) return null;
+    const fromDate = this.fromDate(symbol), epoch = this.getEngine().s.agency.epoch;
+    let result;
+    try { result = await this.source.get({ symbol, fromDate, force }); }
     catch (error) {
-      return { symbol, status: 'unavailable', fetchedAt: this.clock(), coverageStart: fromDate,
+      result = { symbol, status: 'unavailable', fetchedAt: this.clock(), coverageStart: fromDate,
         coverageComplete: false, events: [], notices: [], error: error.message || '公司行为资料获取失败' };
     }
+    if (this.getEngine().s.agency.epoch === epoch && this.canVerify(symbol, explicitStrategyId)) this.latestEvidence.set(symbol, result);
+    return result;
   }
-  async verifyOne(symbol, force = false) {
+  preparedSnapshot(symbol) {
+    return this.getMonitor()?.peekPrepared?.(symbol, false, false) || null;
+  }
+  prepareWarm() {
+    const monitor = this.getMonitor();
+    if (!this.available() || typeof monitor?.prepare !== 'function') return;
+    const epoch = this.epoch, now = this.clock();
+    // Refresh already assembled evidence ahead of expiry in its own lane. These
+    // jobs never take an account transaction or gate the opening quote lane.
+    const candidates = this.prioritize(this.preparationSymbols().filter(symbol => monitor.snapshots?.[symbol] && !this.preparing.has(symbol)
+      && !this.inflight.has(symbol) && now - (this.lastPreparation.get(symbol) ?? -Infinity) >= 15000))
+      .sort((left, right) => (this.lastPreparation.get(left) ?? -Infinity) - (this.lastPreparation.get(right) ?? -Infinity));
+    for (const symbol of candidates.slice(0, Math.max(0, 2 - this.preparing.size))) {
+      this.lastPreparation.set(symbol, now);
+      const task = monitor.prepare(symbol, false, false).catch(() => {}).finally(() => {
+        if (this.getEngine().s.agency.epoch === epoch && this.preparing.get(symbol) === task) this.preparing.delete(symbol);
+      });
+      this.preparing.set(symbol, task);
+    }
+  }
+  async verifyOne(symbol, force = false, explicitStrategyId) {
     symbol = symbolOf(symbol);
     const epoch = this.syncEpoch();
     if (this.inflight.has(symbol)) {
       const pending = this.inflight.get(symbol);
       const result = await pending.promise;
-      return force && !pending.force && this.getEngine().s.agency.epoch === epoch ? this.verifyOne(symbol, true) : result;
+      return force && (!pending.force || explicitStrategyId && pending.explicitStrategyId !== explicitStrategyId)
+        && this.getEngine().s.agency.epoch === epoch ? this.verifyOne(symbol, true, explicitStrategyId) : result;
     }
     const session = this.sessionKey();
     const remember = result => {
@@ -76,23 +115,28 @@ class CorporateService {
     };
     const task = (async () => {
       if (this.storageError) throw this.storageError;
-      if (!this.available() || !this.symbols().includes(symbol)) return { symbol, status: 'skipped' };
+      if (!this.available() || !this.canVerify(symbol, explicitStrategyId)) return { symbol, status: 'skipped' };
+      const explicitStandby = explicitStrategyId && !this.preparationSymbols().includes(symbol);
       this.lastAttempt.set(symbol, this.clock());
       this.lastCheck.set(symbol, { status: 'waiting', session });
-      const monitor = this.getMonitor(), group = this.getEngine().s.agency.groups.find(g => g.members.some(m => m.symbol === symbol));
-      const member = group?.members.find(item => item.symbol === symbol);
-      const snapshot = await monitor.load(symbol, force, group?.id === 'long' || entryConditionNeedsFundamentals(member?.entryConditions), true);
-      if (!this.available() || this.getEngine().s.agency.epoch !== epoch || !this.symbols().includes(symbol)) return { symbol, status: 'skipped' };
+      const monitor = this.getMonitor();
+      let snapshot = !force && this.preparedSnapshot(symbol)
+        || await monitor.load(symbol, force, false, false);
+      if (!this.available() || this.getEngine().s.agency.epoch !== epoch || !this.canVerify(symbol, explicitStrategyId)) return { symbol, status: 'skipped' };
       // Custom/older monitors may not have the corporate evidence extension.
-      if (!snapshot.corporateActions) snapshot.corporateActions = await this.getSnapshot(symbol, force);
+      // A standby member is absent from normal monitor polling; an explicit
+      // verification must replace any old corporate evidence it retained.
+      if (this.requiresEvidence(symbol) && (!snapshot.corporateActions || explicitStandby)) snapshot = { ...snapshot,
+        corporateActions: await this.getSnapshot(symbol, force, explicitStrategyId) };
+      if (!this.available() || this.getEngine().s.agency.epoch !== epoch || !this.canVerify(symbol, explicitStrategyId)) return { symbol, status: 'skipped' };
       const fresh = await this.market.quotes([symbol]).catch(() => ({}));
       if (this.storageError) throw this.storageError;
-      if (!this.available() || this.getEngine().s.agency.epoch !== epoch || !this.symbols().includes(symbol)) return { symbol, status: 'skipped' };
-      return this.enqueueCheck({ symbol, epoch, fresh, snapshot });
+      if (!this.available() || this.getEngine().s.agency.epoch !== epoch || !this.canVerify(symbol, explicitStrategyId)) return { symbol, status: 'skipped' };
+      return this.enqueueCheck({ symbol, epoch, fresh, snapshot, explicitStrategyId });
     })().then(result => { remember(result); return result; }, error => {
       remember({ symbol, status: 'waiting' }); throw error;
     }).finally(() => { if (this.inflight.get(symbol)?.promise === task) this.inflight.delete(symbol); });
-    this.inflight.set(symbol, { promise: task, force }); return task;
+    this.inflight.set(symbol, { promise: task, force, explicitStrategyId }); return task;
   }
   enqueueCheck(input) {
     return new Promise((resolve, reject) => {
@@ -105,9 +149,12 @@ class CorporateService {
     this.scheduleCommit(() => this.flushReady());
   }
   current(job) {
-    return this.available() && this.getEngine().s.agency.epoch === job.epoch && this.symbols().includes(job.symbol);
+    return this.available() && this.getEngine().s.agency.epoch === job.epoch && this.canVerify(job.symbol, job.explicitStrategyId);
   }
   applyCheck({ symbol, fresh, snapshot }) {
+    snapshot = this.getMonitor()?.verificationSnapshot?.(symbol, snapshot, false) || snapshot;
+    const latestCorporate = this.latestEvidence.get(symbol);
+    if (this.requiresEvidence(symbol) && latestCorporate && latestCorporate !== snapshot.corporateActions) snapshot = { ...snapshot, corporateActions: latestCorporate };
     const engine = this.getEngine(), member = engine.s.agency.groups.flatMap(g => g.members).find(m => m.symbol === symbol);
     if (member) {
       const previousCheck = member.automaticCheck;
@@ -121,7 +168,8 @@ class CorporateService {
         && ['clear', 'waiting', 'blocked'].includes(check.status);
       const status = freshCheck ? check.status
         : reason ? (current?.reconciliation.status === 'pending' ? 'blocked' : 'waiting') : 'clear';
-      return { symbol, status, reason: reason || '', ...(freshCheck && check.phase ? { phase: check.phase } : {}) };
+      const dailyHistory = publicDailyHistory(snapshot, this.clock(), symbol);
+      return { symbol, status, reason: reason || '', ...(freshCheck && check.phase ? { phase: check.phase } : {}), ...(dailyHistory ? { dailyHistory } : {}) };
     }
     const checked = engine.agencyProcessCorporateActions(symbol, fresh[symbol], snapshot);
     return { symbol, ...checked, status: checked.status === 'unavailable' ? 'waiting' : checked.status };
@@ -170,16 +218,17 @@ class CorporateService {
       if (!symbols.includes(symbol)) throw Error('股票不属于该策略的成员或历史权益');
       symbols = [symbol];
     }
-    return this.checkMany(symbols, true);
+    return this.checkMany(symbols, true, group.id);
   }
-  async checkMany(symbols, force) {
+  async checkMany(symbols, force, explicitStrategyId) {
     if (this.storageError) throw this.storageError;
     const epoch = this.syncEpoch();
-    const queue = this.prioritize(symbols), results = [];
-    await Promise.all(Array.from({ length: Math.min(2, queue.length) }, async () => {
+    const ordered = this.prioritize(symbols), prepared = force ? [] : ordered.filter(symbol => this.preparedSnapshot(symbol));
+    const preparedSet = new Set(prepared), cold = ordered.filter(symbol => !preparedSet.has(symbol)), results = [];
+    const run = (queue, concurrency) => Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
       while (queue.length && this.available() && this.getEngine().s.agency.epoch === epoch) {
         const symbol = queue.shift();
-        try { results.push(await this.verifyOne(symbol, force)); }
+        try { results.push(await this.verifyOne(symbol, force, explicitStrategyId)); }
         catch (error) {
           if (this.storageError) throw this.storageError;
           // A failed symbol remains pending and must not prevent the rest of
@@ -188,20 +237,30 @@ class CorporateService {
         }
       }
     }));
-    return { checked: results.length, ...Object.fromEntries(['clear', 'waiting', 'blocked', 'skipped'].map(status => [status, results.filter(r => r.status === status).length])), results };
+    await Promise.all([run(prepared, 5), run(cold, 2)]);
+    return { checked: results.length, ...Object.fromEntries(['clear', 'waiting', 'blocked', 'skipped'].map(status => [status, results.filter(r => r.status === status).length])),
+      cached: results.filter(r => r.dailyHistory && r.dailyHistory.status !== 'fresh').length,
+      degraded: results.filter(r => r.dailyHistory?.refreshError).length, results };
   }
   poll() {
     this.syncEpoch();
-    if (this.polling) return this.polling;
+    this.prepareWarm();
     const now = this.clock(), session = this.sessionKey(now);
-    const symbols = this.prioritize(this.symbols().filter(symbol => {
+    const symbols = this.prioritize(this.preparationSymbols().filter(symbol => {
+      if (this.inflight.has(symbol)) return false;
+      // A slow previous batch cannot hold already prepared members behind it.
+      if (this.polling && !this.preparedSnapshot(symbol)) return false;
       const previous = this.lastCheck.get(symbol);
       const interval = previous?.phase === 'prepared' || previous?.status === 'clear' ? this.intervalMs : this.retryMs;
       return (session && previous?.session !== session) || now - (this.lastAttempt.get(symbol) ?? -Infinity) >= interval;
     })).sort((left, right) => (this.lastAttempt.get(left) ?? -Infinity) - (this.lastAttempt.get(right) ?? -Infinity)).slice(0, 20);
+    if (this.polling && !symbols.length) return this.polling;
     // Old account work may still settle after a reset starts a new poll.
     const polling = this.checkMany(symbols, false).finally(() => { if (this.polling === polling) this.polling = null; });
-    this.polling = polling; return polling;
+    // A fast supplemental batch must not release the outstanding cold batch's
+    // concurrency guard when it finishes before the older slow requests.
+    if (!this.polling) this.polling = polling;
+    return polling;
   }
 }
 module.exports = { CorporateService };

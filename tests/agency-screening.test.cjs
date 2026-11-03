@@ -2,9 +2,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Screener, classifyScreenRow, defaults } = require('../core/screener.cjs');
 const { runAgencyScreening: screenAgency, poolPolicy, AGENCY_POOL_POLICY } = require('../core/agency-screening.cjs');
-// Existing research regressions explicitly exercise the optional strict mode.
-const runAgencyScreening = (screener, options = {}) => screenAgency(screener, { screeningMode: 'strict', ...options });
-const { composeStrategyQuery } = require('../core/strategy-presets.cjs');
+const runAgencyScreening = screenAgency;
+const { composeAgencySelectionQuery } = require('../core/agency-selection.cjs');
 const { calendarSession } = require('../core/trading-calendar.cjs');
 const { companyBundle } = require('./fixtures/company-evidence-data.cjs');
 const { ordinaryProfile } = require('./fixtures/industry-profile-data.cjs');
@@ -18,8 +17,11 @@ function bars(end = '2026-10-12') {
     if (session.open) dates.unshift(session.date);
     day -= 86400000;
   }
+  // A rising but two-sided series keeps RSI inside the stricter candidate band;
+  // anchor its last completed close to the quote fixtures' 10.94 reference.
+  const level = i => i * 0.008 + Math.sin(i / 4 + 1.6) * 0.12 + (i % 2 === 0 ? 0.02 : -0.02);
   return dates.map((date, i) => {
-    const close = 10 + i * 0.008 + Math.sin(i / 4 + 1.6) * 0.12;
+    const close = 10.94 + level(i) - level(119);
     return { date, open: close, close, high: close + 0.1, low: close - 0.1, volume: i === 119 ? 150 : 100 };
   });
 }
@@ -46,207 +48,12 @@ function scanner({ rows = [row()], now = NOW, finance, daily, automatic, notices
 }
 const state = (result, id, symbol) => ['pass', 'failed', 'pending'].find(key => result.strategies[id][key].some(item => item.symbol === symbol));
 
-test('公司经营指标独立核验，公告待核验不隐藏经营通过或不符且始终阻断总体入围', async () => {
-  const research = { version: 1, enabled: true, path: 'company', rules: [{ field: 'revenueYoY', op: 'gte', value: 0 }] };
-  for (const revenueYoY of [10, -1]) {
-    const { s } = scanner({ finance: symbol => ({ symbol, section: 'finance', source: '东方财富', status: 'ready', fetchedAt: +NOW, data: report({ revenueYoY }) }),
-      notices: symbol => ({ symbol, section: 'notices', source: '东方财富', status: 'ready', fetchedAt: +NOW,
-        data: { items: [{ id: 'AN20261013000001', date: '2026-10-13', title: '2026年前三季度业绩预告' }], total: 1 } }) });
-    const result = await screenAgency(s, { research });
-    assert.equal(result.strategies.swing.pass.length, 0);
-    const candidate = [...result.strategies.swing.pending, ...result.strategies.swing.failed][0];
-    assert.equal(candidate.researchReview.status, revenueYoY > 0 ? 'pass' : 'failed');
-    assert.equal(candidate.researchReview.companyMetrics.reportDate, '2026-06-30');
-    assert.equal(result.coverage.operatingResearch.evaluated, 1);
-    const long = [...result.strategies.long.pending, ...result.strategies.long.failed][0];
-    assert.equal(long.financeCheck.status, revenueYoY > 0 ? 'pass' : 'failed');
-    assert.equal(long.financeCheck.reportDate, '2026-06-30');
-  }
-});
-
-test('明确正式新报触发财务单次重取，同步成功用新报、仍旧报待同步，预告不触发', async () => {
-  for (const sync of [false, true]) {
-    let financeCount = 0;
-    const { s, calls } = scanner({ finance: symbol => ({ symbol, section: 'finance', source: '东方财富', status: 'ready', fetchedAt: +NOW,
-      data: report(++financeCount > 1 && sync ? { reportDate: '2026-09-30', noticeDate: '2026-10-13' } : {}) }),
-      notices: symbol => ({ symbol, section: 'notices', source: '东方财富', status: 'ready', fetchedAt: +NOW,
-        data: { items: [{ id: 'AN20261013000001', date: '2026-10-13', title: '测试公司：2026年第三季度报告' }], total: 1 } }) });
-    const research = { version: 1, enabled: true, path: 'company', rules: [{ field: 'revenueYoY', op: 'gte', value: 0 }] };
-    const result = await screenAgency(s, { research });
-    assert.equal(calls.finance.length, 2); assert.equal(calls.finance[1].force, true);
-    const candidate = [...result.strategies.long.pass, ...result.strategies.long.pending][0];
-    assert.equal(candidate.status, sync ? 'pass' : 'pending');
-    assert.equal(candidate.researchReview.status, sync ? 'pass' : 'pending');
-    assert.equal(candidate.financeReportDate, sync ? '2026-09-30' : '2026-06-30');
-    if (!sync) assert.equal(candidate.pendingReport.reportDate, '2026-09-30');
-  }
-  const { s, calls } = scanner({ notices: symbol => ({ symbol, section: 'notices', source: '东方财富', status: 'ready', fetchedAt: +NOW,
-    data: { items: [{ id: 'AN20261013000001', date: '2026-10-13', title: '2026年前三季度业绩预告' }], total: 1 } }) });
-  await screenAgency(s); assert.equal(calls.finance.length, 1);
-});
-
-test('业绩附加条件默认不启用，显式启用无公告时独立待核验并保留查询', async () => {
-  const disabled = { version: 1, enabled: false, rules: [] };
-  assert.deepEqual(poolPolicy('strategy', undefined, disabled).commonQuery.performance, disabled);
-  const observed = await screenAgency(scanner().s, { performance: disabled });
-  assert.equal(observed.strategies.swing.pass.length, 1); assert.equal(observed.strategies.swing.pass[0].performanceReview.status, 'observing');
-  const performance = { version: 1, enabled: true, rules: [{ field: 'netProfitGrowthMinPct', op: 'gte', value: -10 }] };
-  const result = await screenAgency(scanner().s, { performance });
-  assert.equal(result.strategies.swing.pass.length, 0); assert.equal(result.strategies.swing.pending[0].performanceReview.status, 'pending');
-  assert.deepEqual(result.strategies.swing.query.performance, performance);
-  assert.equal(result.coverage.performance.pending, 1);
-});
-
-test('候选池按明确预告条件判断同比下界，数值通过不能覆盖另一公告待核验', async () => {
-  const item = { id: 'AN20261013000001', date: '2026-10-13', title: '2026年前三季度业绩预告' };
-  const text = '业绩预告期间：2026年1月1日至2026年9月30日。\n项目  年初至报告期末  上年同期\n归属于上市公司股东的净利润  盈利：90万元  盈利：100万元\n比上年同期下降：10%\n扣除非经常性损益后的净利润  盈利：110万元  盈利：100万元\n比上年同期增长：10%\n二、与会计师事务所沟通情况\n本次业绩预告未经会计师事务所审计。';
-  for (const [minimum, otherNotice, expected] of [[-10, false, 'pass'], [-9, false, 'failed'], [-10, true, 'pending']]) {
-    const items = [item, ...(otherNotice ? [{ id: 'AN20261013000002', date: '2026-10-13', title: '关于重大诉讼进展的公告' }] : [])];
-    const { s } = scanner({ notices: symbol => ({ symbol, section: 'notices', source: '东方财富', status: 'ready', fetchedAt: +NOW, data: { items, total: items.length } }) });
-    s.noticeEvidenceLoader = async symbol => ({ symbol, fetchedAt: +NOW, documents: [{ id: item.id, title: item.title, publishedAt: item.date, issuerSymbol: symbol, kind: 'notice', complete: true,
-      fetchedAt: +NOW, url: `https://data.eastmoney.com/notices/detail/${symbol.slice(2)}/${item.id}.html`, text, pages: 1,
-      pageTexts: [{ page: 1, text, method: 'provider-text', numericEligible: true, complete: true }] }] });
-    const performance = { version: 1, enabled: true, rules: [{ field: 'netProfitGrowthMinPct', op: 'gte', value: minimum }] };
-    const result = await screenAgency(s, { performance });
-    const candidate = result.strategies.swing[expected][0]; assert.ok(candidate, expected);
-    assert.equal(candidate.performanceReview.status, minimum === -9 ? 'failed' : 'pass');
-    assert.equal(candidate.performanceReview.checks[0].actual, -10);
-  }
-});
-
-test('默认候选筛选仅采集敏感公告正文，通过后仍不附加共同研究条件', async () => {
-  const item = { id: 'AN20261013000001', date: '2026-10-13', title: '关于诉讼结案的公告' };
-  const { s, calls } = scanner({ notices: symbol => ({ symbol, section: 'notices', source: '东方财富', status: 'ready', fetchedAt: +NOW, data: { items: [item], total: 1 } }) });
-  let bodyCalls = 0;
-  s.noticeEvidenceLoader = async (symbol, { noticeResponse }) => {
-    bodyCalls++; assert.equal(noticeResponse.data.items[0].id, item.id);
-    const text = '本次诉讼已结案，相关义务已全部履行完毕。本次诉讼对公司生产经营未造成重大不利影响。';
-    return { symbol, fetchedAt: +NOW, documents: [{ id: item.id, title: item.title, publishedAt: item.date, issuerSymbol: symbol, kind: 'notice', complete: true,
-      fetchedAt: +NOW, url: `https://data.eastmoney.com/notices/detail/${symbol.slice(2)}/${item.id}.html`, text, pages: 1,
-      pageTexts: [{ page: 1, text, method: 'provider-text', numericEligible: true, complete: true }] }] };
-  };
-  const result = await screenAgency(s);
-  assert.equal(bodyCalls, 1); assert.equal(calls.evidence.length, 0);
-  assert.equal(result.coverage.noticeFulltextChecked, 1); assert.equal(result.coverage.researchRequired, false);
-  for (const id of IDS) assert.equal(state(result, id, 'sh600001'), 'pass');
-  assert.equal(result.strategies.swing.pass[0].noticeReview.status, 'clear');
-  assert.equal(result.strategies.swing.pass[0].selectionEvidence, undefined);
-  s.noticeEvidenceLoader = async () => { throw Error('原文请求失败'); };
-  const failed = await screenAgency(s); assert.equal(state(failed, 'swing', 'sh600001'), 'pending');
-  const pending = failed.strategies.swing.pending[0];
-  assert.match(pending.noticeReview.notices[0].reason, /原文请求失败/);
-  assert.equal(pending.noticeReview.notices[0].acquisition.stage, 'body');
-  assert.equal(pending.noticeReview.notices[0].acquisition.documentId, item.id);
-  assert.ok(pending.diagnostics.stages.some(item => item.code === 'notice-body-fetch'));
-  assert.ok(!pending.diagnostics.stages.some(item => ['notice-risk', 'notice-index-fetch'].includes(item.code)));
-});
-
-test('标题已阻断和目录覆盖不足仍保存公告逐条依据，不伪装原文已核验', async () => {
-  const { s } = scanner({ notices: symbol => ({ symbol, section: 'notices', source: '东方财富', status: 'ready', fetchedAt: +NOW,
-    data: { items: [{ id: 'AN20261013000001', date: '2026-10-13', title: '公司被立案调查公告' }], total: 1 } }) });
-  const result = await screenAgency(s), row = result.strategies.swing.failed[0];
-  assert.equal(row.noticeReview.status, 'blocked'); assert.equal(row.noticeReview.notices[0].title, '公司被立案调查公告');
-  assert.notEqual(row.noticeReview.mode, 'automatic-fulltext');
-  assert.deepEqual(row.diagnostics.stages.map(item => item.code), ['notice-blocked']);
-});
-
-test('默认按策略筛选不要求公司研究，财务失败只影响长线而不阻断技术策略', async () => {
-  for (const finance of [() => { throw Error('财务接口离线'); }, symbol => ({ symbol, section: 'finance', status: 'ready',
-    source: '东方财富', fetchedAt: +NOW, data: report({ debtRatio: 80 }) })]) {
-    const { s, calls } = scanner({ finance, automatic: () => { throw Error('默认模式不得获取公司报告'); } });
-    const result = await screenAgency(s);
-    for (const id of IDS.slice(0, 3)) assert.equal(state(result, id, 'sh600001'), 'pass');
-    assert.notEqual(state(result, 'long', 'sh600001'), 'pass');
-    assert.equal(calls.evidence.length, 0); assert.equal(calls.notices.length, 1); assert.equal(calls.daily.length, 1);
-    assert.equal(result.screeningMode, 'strategy'); assert.equal(result.policyVersion, 3); assert.equal(result.coverage.researchRequired, false);
-    assert.equal(result.coverage.evidenceChecked, 0); assert.equal(result.strategies.swing.pass[0].selectionEvidence, undefined);
-  }
-});
-
-test('默认策略模式仍阻断敏感公告和明确风险，不用未加载报告作为通过依据', async () => {
-  for (const title of ['关于重大诉讼进展的公告', '关于被立案调查的公告']) {
-    const { s, calls } = scanner({ notices: symbol => ({ symbol, section: 'notices', source: '东方财富', status: 'ready', fetchedAt: +NOW,
-      data: { items: [{ id: 'AN20261013000001', date: '2026-10-13', title }], total: 1 } }) });
-    const result = await screenAgency(s);
-    for (const id of IDS) assert.notEqual(state(result, id, 'sh600001'), 'pass');
-    assert.equal(calls.evidence.length, 0);
-  }
-});
-
-test('两种筛选模式隔离，严格模式仍需财务质量和研究证据全部满足', async () => {
-  const { s, calls } = scanner({ automatic: symbol => ({ symbol, status: 'unavailable', documents: [], errors: ['行业原文缺失'] }) });
-  const strategy = await screenAgency(s);
-  assert.equal(strategy.strategies.swing.pass.length, 1); assert.equal(calls.evidence.length, 0);
-  const strict = await screenAgency(s, { screeningMode: 'strict' });
-  assert.equal(strict.strategies.swing.pass.length, 0); assert.equal(strict.strategies.swing.pending.length, 1);
-  assert.equal(strict.coverage.researchRequired, true); assert.equal(calls.evidence.length, 1);
-  assert.equal(poolPolicy().commonQuery.evidence, undefined); assert.ok(poolPolicy('strict').commonQuery.evidence);
-  await assert.rejects(screenAgency(s, { screeningMode: 'unknown' }), /模式无效/);
-});
-
-test('默认长线只要求自身财务口径，三年年度质量资料缺项属于可选严格筛选', async () => {
-  const { s, calls } = scanner({ finance: symbol => ({ symbol, section: 'finance', status: 'ready', source: '东方财富', fetchedAt: +NOW,
-    data: { latest: report().latest, annual: [annual(2025)] } }) });
-  const strategy = await screenAgency(s);
-  assert.equal(strategy.strategies.long.pass.length, 1); assert.equal(calls.evidence.length, 0);
-  const strict = await screenAgency(s, { screeningMode: 'strict' });
-  assert.equal(strict.strategies.long.pending.length, 1); assert.equal(strict.strategies.long.pass.length, 0);
-  assert.match(strict.strategies.long.pending[0].reasons.join('；'), /数据缺失/);
-});
-
-test('一次共享全市场、证据、财报、日线及公告，四策略分别匹配且不修改快照', async () => {
-  const rows = [row(), row('sh600002')], before = structuredClone(rows), { s, calls } = scanner({ rows });
-  const result = await runAgencyScreening(s);
-  assert.equal(result.status, 'ready'); assert.equal(calls.snapshot, 1);
-  assert.equal(calls.evidence.length, 2); assert.equal(calls.finance.length, 2); assert.equal(calls.daily.length, 2); assert.equal(calls.notices.length, 2); assert.equal(calls.risk, 0);
-  for (const id of IDS) {
-    assert.equal(result.strategies[id].pass.length, 2, id);
-    assert.deepEqual(result.strategies[id].query, composeStrategyQuery(id, result.commonQuery));
-    assert.equal(result.strategies[id].pass[0].technicalAsOf, '2026-10-12');
-    assert.equal(result.strategies[id].pass[0].financeReportDate, '2026-06-30');
-  }
-  assert.equal(result.coverage.universeComplete, true); assert.deepEqual(rows, before);
-  assert.equal(s.activeRun, null); assert.equal(s.progress.loading, false);
-});
-
-test('先筛量化条件，只有至少一种策略入围者进入程序核验，不依赖人工记录', async () => {
-  const rows = [row('sh600001'), row('sh600002'), row('sh600003')];
-  const { s, calls } = scanner({ rows, finance: symbol => ({ symbol, section: 'finance', status: 'ready', source: '东方财富', fetchedAt: NOW.getTime(),
-    data: report(symbol === 'sh600002' ? { debtRatio: 80 } : symbol === 'sh600003' ? { debtRatio: null } : {}) }) });
-  const result = await runAgencyScreening(s);
-  assert.equal(result.status, 'ready'); assert.deepEqual(calls.evidence, ['sh600001']);
-  assert.equal(calls.finance.length, 3); assert.deepEqual(calls.daily, ['sh600001']);
-  assert.equal(result.coverage.quantitativeCandidates, 1); assert.equal(result.coverage.evidenceChecked, 1);
-  assert.equal(result.coverage.evidenceSummary.pass, 1);
-  for (const id of IDS) { assert.equal(state(result, id, 'sh600001'), 'pass'); assert.equal(state(result, id, 'sh600002'), 'failed'); assert.equal(state(result, id, 'sh600003'), 'pending'); }
-});
-
-test('入围后原文缺失明确资料不足，量化失败不能被研究缺项覆盖', async () => {
-  const { s, calls } = scanner({ automatic: symbol => ({ symbol, checkedAt: NOW.getTime(), status: 'unavailable', documents: [], errors: ['离线'] }) });
-  const result = await runAgencyScreening(s);
-  assert.equal(calls.finance.length, 1); assert.equal(calls.daily.length, 1); assert.equal(calls.evidence.length, 1);
-  for (const id of IDS) { assert.equal(state(result, id, 'sh600001'), 'pending'); assert.equal(result.strategies[id].pending[0].stage, 'evidence'); }
-  assert.equal(result.coverage.evidenceSummary.pending, 1);
-});
-
-test('共同ST、确实财务不合格、财务缺失和池外既有候选分别明确分类', async () => {
-  const rows = [row('sh600001', { isST: true }), row('sh600002'), row('sh600003'), row('sh600004')];
-  const { s } = scanner({ rows, finance: symbol => ({ symbol, section: 'finance', status: 'ready', source: '东方财富', fetchedAt: NOW.getTime(),
-    data: report(symbol === 'sh600002' ? { debtRatio: 80 } : symbol === 'sh600003' ? { debtRatio: null } : {}) }) });
-  const result = await runAgencyScreening(s, { requiredSymbols: ['600099'] });
-  for (const id of IDS) {
-    assert.equal(state(result, id, 'sh600001'), 'failed'); assert.equal(state(result, id, 'sh600002'), 'failed');
-    assert.equal(state(result, id, 'sh600003'), 'pending'); assert.equal(state(result, id, 'sh600004'), 'pass'); assert.equal(state(result, id, 'sh600099'), 'pending');
-    assert.equal(result.strategies[id].pass.length + result.strategies[id].failed.length + result.strategies[id].pending.length, 5);
-  }
-  assert.deepEqual(result.coverage.requiredMissing, ['sh600099']);
-});
 
 test('早盘累计成交额与换手不足只待核验，完整收盘数据才可明确不合格', async () => {
   const low = row('sh600001', { amount: 0.1, turnover: 0.1 });
   const intraday = await runAgencyScreening(scanner({ rows: [low] }).s);
   assert.equal(state(intraday, 'ultra-short', low.symbol), 'pending'); assert.equal(state(intraday, 'short', low.symbol), 'pending');
-  assert.equal(state(intraday, 'swing', low.symbol), 'pass'); assert.equal(state(intraday, 'long', low.symbol), 'pass');
+  assert.equal(state(intraday, 'swing', low.symbol), 'pending'); assert.equal(state(intraday, 'long', low.symbol), 'pending');
   const now = new Date('2026-10-13T19:00:00+08:00'), closed = row(low.symbol, { amount: 0.1, turnover: 0.1, price: 10.94, timestamp: Date.parse('2026-10-13T15:00:00+08:00') });
   const result = await runAgencyScreening(scanner({ rows: [closed], now, daily: () => ({ bars: bars('2026-10-13') }) }).s);
   assert.equal(state(result, 'ultra-short', low.symbol), 'failed'); assert.equal(state(result, 'short', low.symbol), 'failed');
@@ -262,7 +69,7 @@ test('周末与盘前使用最近完整交易日，可重复手动更新且无�
       assert.deepEqual(result.sources.allowedQuoteDates, now.getUTCDate() === 10 ? ['2026-10-09'] : ['2026-10-12', '2026-10-09']);
       assert.equal(result.sources.expectedDailyDate, '2026-10-09');
     }
-    assert.equal(calls.snapshot, 2); assert.equal(calls.finance.length, 1); assert.equal(calls.notices.length, 2);
+    assert.equal(calls.snapshot, 2); assert.equal(calls.finance.length, 0); assert.equal(calls.notices.length, 0);
   }
 });
 
@@ -274,16 +81,15 @@ test('真实形状盘前和集合竞价当日报价可核验；昨日收盘也�
     const previousLow = { ...previous, symbol: 'sh600003', amount: 0.1, turnover: 0.1 };
     const { s, calls } = scanner({ now, rows: [current, previous, previousLow] });
     const result = await runAgencyScreening(s);
-    assert.equal(calls.evidence.length, 3); assert.equal(result.sources.expectedQuoteDate, '2026-10-13');
+    assert.equal(calls.evidence.length, 0); assert.equal(result.sources.expectedQuoteDate, '2026-10-13');
     assert.deepEqual(result.sources.allowedQuoteDates, ['2026-10-13', '2026-10-12']);
     assert.equal(result.sources.expectedDailyDate, '2026-10-12');
     for (const id of IDS) assert.equal(state(result, id, previous.symbol), 'pass');
-    for (const id of ['ultra-short', 'short']) {
+    for (const id of IDS) {
       assert.equal(state(result, id, current.symbol), 'pending');
       assert.match(result.strategies[id].pending.find(item => item.symbol === current.symbol).reasons.join(''), /累计值尚未完成/);
       assert.equal(state(result, id, previousLow.symbol), 'failed');
     }
-    for (const id of ['swing', 'long']) assert.equal(state(result, id, current.symbol), 'pass');
   }
 });
 
@@ -310,11 +116,10 @@ test('旧行情、未来报价与旧日线均不能误作明确失败或有效�
     assert.equal(calls.finance.length, 0);
   }
   const result = await runAgencyScreening(scanner({ daily: () => ({ bars: bars('2026-10-09') }) }).s);
-  for (const id of IDS.slice(0, 3)) assert.equal(state(result, id, 'sh600001'), 'pending');
-  assert.equal(state(result, 'long', 'sh600001'), 'pass');
+  for (const id of IDS) assert.equal(state(result, id, 'sh600001'), 'pending');
 });
 
-test('旧行情上的ST名称不能作为本次明确剔除依据，日期检查先于ST和研究证据', async () => {
+test('旧行情上的ST名称不能作为本次明确剔除依据，日期检查先于ST条件', async () => {
   const { s, calls } = scanner({ rows: [row('sh600001', { isST: true, name: '*ST旧名称', timestamp: Date.parse('2026-10-09T15:00:00+08:00') })] });
   const result = await runAgencyScreening(s);
   for (const id of IDS) { assert.equal(state(result, id, 'sh600001'), 'pending'); assert.equal(result.strategies[id].pending[0].stage, 'quotes'); }
@@ -324,27 +129,26 @@ test('旧行情上的ST名称不能作为本次明确剔除依据，日期检查
 test('跨日日线比对同源昨收，同日完整日线比对收盘报价，缺失或错配只待核验', async () => {
   for (const prevClose of [null, 20]) {
     const result = await runAgencyScreening(scanner({ rows: [row('sh600001', { prevClose })] }).s);
-    for (const id of IDS.slice(0, 3)) { assert.equal(state(result, id, 'sh600001'), 'pending'); assert.match(result.strategies[id].pending[0].reasons.join(''), /价格基准/); }
+    for (const id of IDS) { assert.equal(state(result, id, 'sh600001'), 'pending'); assert.match(result.strategies[id].pending[0].reasons.join(''), /价格基准/); }
   }
   const now = new Date('2026-10-10T08:00:00+08:00');
   for (const price of [10.94, 20]) {
     const result = await runAgencyScreening(scanner({ now, rows: [row('sh600001', { timestamp: Date.parse('2026-10-09T15:00:00+08:00'), price, prevClose: null })], daily: () => ({ bars: bars('2026-10-09') }) }).s);
-    for (const id of IDS.slice(0, 3)) assert.equal(state(result, id, 'sh600001'), price === 10.94 ? 'pass' : 'pending');
+    for (const id of IDS) assert.equal(state(result, id, 'sh600001'), price === 10.94 ? 'pass' : 'pending');
   }
 });
 
-test('跨15点的同轮财务和日线使用行情完成时固定的观察时点，不混入刚完成或未来日线', async () => {
+test('跨15点的同轮日线使用行情完成时固定的观察时点，不混入刚完成或未来日线', async () => {
   const now = new Date('2026-10-13T14:59:50+08:00'), observedAt = now.toISOString(), observedMs = now.getTime();
   const previous = bars(), future = date => ({ date, open: 999, high: 1000, low: 998, close: 999, volume: 100 });
-  const { s } = scanner({ now, rows: [row('sh600001', { timestamp: observedMs })], finance: symbol => {
+  const { s } = scanner({ now, rows: [row('sh600001', { timestamp: observedMs })], daily: () => {
     now.setTime(Date.parse('2026-10-13T15:00:05+08:00'));
-    return { symbol, section: 'finance', status: 'ready', source: '东方财富', fetchedAt: now.getTime(), data: report() };
-  }, daily: () => ({ bars: [...previous, future('2026-10-13'), future('2026-10-14')] }) });
+    return { bars: [...previous, future('2026-10-13'), future('2026-10-14')] }; } });
   const result = await runAgencyScreening(s);
   for (const id of IDS) assert.equal(state(result, id, 'sh600001'), 'pass');
   assert.equal(result.sources.scanTime, observedAt); assert.equal(result.sources.expectedDailyDate, '2026-10-12');
-  assert.equal(result.sources.finance.asOfCutoff, observedAt); assert.equal(result.sources.technical.asOfCutoff, observedAt);
-  assert.equal(result.sources.finance.startedAt, observedMs); assert.equal(result.sources.technical.startedAt, now.getTime());
+  assert.equal(result.sources.finance, null); assert.equal(result.sources.technical.asOfCutoff, observedAt);
+  assert.equal(result.sources.technical.startedAt, observedMs);
   assert.equal(result.strategies.swing.pass[0].technicalAsOf, '2026-10-12');
   assert.equal(result.strategies.swing.pass[0].close, previous.at(-1).close);
   assert.equal(result.strategies.swing.pass[0].technicalFetchedAt, now.getTime());
@@ -369,14 +173,13 @@ test('跨午夜或盘前跨开盘不改变本轮日期基准，实际获取时�
   ]) {
     const now = new Date(start), observedAt = now.toISOString();
     const { s } = scanner({ now, rows: [row('sh600001', { timestamp: Date.parse(`${end}T15:00:00+08:00`), price: 10.94, prevClose: null })],
-      finance: symbol => { now.setTime(Date.parse(finish)); return { symbol, section: 'finance', source: '东方财富', status: 'ready', fetchedAt: now.getTime(), data: report() }; },
-      daily: () => ({ bars: bars(end) }) });
+      daily: () => { now.setTime(Date.parse(finish)); return { bars: bars(end) }; } });
     const result = await runAgencyScreening(s);
     for (const id of IDS) assert.equal(state(result, id, 'sh600001'), 'pass', `${start} ${id}`);
-    assert.equal(result.sources.scanTime, observedAt); assert.equal(result.sources.finance.asOfCutoff, observedAt);
+    assert.equal(result.sources.scanTime, observedAt); assert.equal(result.sources.finance, null);
     assert.equal(result.sources.technical.asOfCutoff, observedAt); assert.equal(result.sources.expectedDailyDate, end);
-    assert.equal(s.dailyCache.get('sh600001').cutoff, cutoff); assert.equal(s.financeCache.get('sh600001').cutoff, '2026-10-13');
-    assert.equal(result.sources.technical.startedAt, now.getTime()); assert.equal(result.finishedAt, now.getTime());
+    assert.equal(s.dailyCache.get('sh600001').cutoff, cutoff); assert.equal(s.financeCache.size, 0);
+    assert.equal(result.sources.technical.startedAt, Date.parse(start)); assert.equal(result.finishedAt, now.getTime());
   }
 });
 
@@ -405,44 +208,7 @@ test('技术日期比本轮允许日期更晚也只能待核验，不能用日�
     return { ...result, rows: result.rows.map(item => ({ ...item, technicalAsOf: '2026-10-13' })) };
   };
   const result = await runAgencyScreening(s);
-  for (const id of IDS.slice(0, 3)) { assert.equal(state(result, id, 'sh600001'), 'pending'); assert.equal(result.strategies[id].pending[0].technicalError, 'mismatch'); }
-});
-
-test('年度ROE合格时累计ROE较低不再阻断长线，年度条件仍独立于技术策略', async () => {
-  const result = await runAgencyScreening(scanner({ finance: symbol => ({ symbol, section: 'finance', status: 'ready', source: '东方财富', fetchedAt: NOW.getTime(), data: report({ roe: 3 }) }) }).s);
-  for (const id of IDS.slice(0, 3)) assert.equal(state(result, id, 'sh600001'), 'pass');
-  assert.equal(state(result, 'long', 'sh600001'), 'pass');
-});
-
-test('程序资料读取失败、串股和公告敏感事项分开归类，有效敏感目录继续取得原文', async () => {
-  for (const automatic of [() => { throw Error('离线'); }, () => companyBundle('sh600002', NOW)]) {
-    const unavailable = await runAgencyScreening(scanner({ automatic }).s);
-    for (const id of IDS) assert.equal(state(unavailable, id, 'sh600001'), 'pending');
-  }
-  const b = scanner({ notices: symbol => ({ symbol, section: 'notices', source: '东方财富', status: 'ready', fetchedAt: NOW.getTime(),
-    data: { items: [{ id: 'AN20261013000001', date: '2026-10-13', title: '关于重大诉讼进展的公告' }], total: 1 } }) });
-  const sensitive = await runAgencyScreening(b.s);
-  for (const id of IDS) { assert.equal(state(sensitive, id, 'sh600001'), 'pending'); assert.equal(sensitive.strategies[id].pending[0].stage, 'notices'); }
-  assert.equal(b.calls.notices.length, 1); assert.equal(b.calls.evidence.length, 1);
-  assert.match(sensitive.strategies.long.pending[0].evidenceReview.checks.find(check => check.key === 'noticeBodyReview').reason, /尚未取得/);
-});
-
-test('量化入围后的敏感公告读取原文；完整已解决事件通过，缓存保留生命周期完成', async () => {
-  const item = { id: 'AN20261013000001', date: '2026-10-13', title: '关于诉讼结案的公告' };
-  const { s, calls } = scanner({ notices: symbol => ({ symbol, section: 'notices', source: '东方财富', status: 'ready', fetchedAt: +NOW,
-    data: { items: [item], total: 1 } }), automatic: symbol => {
-    const bundle = companyBundle(symbol, NOW), text = '本次诉讼已结案，相关义务已全部履行完毕。本次诉讼对公司生产经营未造成重大不利影响。';
-    bundle.documents.push({ id: item.id, issuerSymbol: symbol, kind: 'notice', publishedAt: item.date, title: item.title,
-      url: 'https://example.com/notice', fetchedAt: +NOW, complete: true, pages: 1, text,
-      pageTexts: [{ page: 1, text, complete: true, method: 'provider-text', numericEligible: true }] });
-    return bundle;
-  } });
-  let retained, ended = 0; s.evidenceRetention = symbols => { retained = symbols; }; s.endEvidenceBatch = () => { ended++; };
-  const result = await runAgencyScreening(s, { requiredSymbols: ['sh600009'] });
-  assert.deepEqual(retained, ['sh600009', 'sh600001']); assert.equal(ended, 1); assert.equal(calls.evidence.length, 1);
-  for (const id of IDS) assert.equal(state(result, id, 'sh600001'), 'pass');
-  assert.equal(result.strategies.long.pass[0].entryRisk.notices.mode, 'automatic-fulltext');
-  assert.equal(result.coverage.evidenceSummary.checks.noticeBodyReview.pass, 1);
+  for (const id of IDS) { assert.equal(state(result, id, 'sh600001'), 'pending'); assert.equal(result.strategies[id].pending[0].technicalError, 'mismatch'); }
 });
 
 test('快照失败、不完整和重复均抛错，不能发布空成功；忙碌不可覆盖锁', async () => {
@@ -453,58 +219,8 @@ test('快照失败、不完整和重复均抛错，不能发布空成功；忙�
   await assert.rejects(runAgencyScreening(s), /已有选股任务/); assert.equal(s.activeRun, active);
 });
 
-test('公告批次超过五分钟仍研究先返回的有效候选，并在入池前刷新过期公告', async () => {
-  const now = new Date(NOW), rows = Array.from({ length: 6 }, (_, index) => row(`sh60000${index + 1}`));
-  const seen = new Map();
-  const { s, calls } = scanner({ now, rows, notices: async symbol => {
-    const count = (seen.get(symbol) || 0) + 1; seen.set(symbol, count);
-    if (symbol === 'sh600006' && count === 1) {
-      await new Promise(resolve => setImmediate(resolve));
-      now.setTime(now.getTime() + 300001);
-    }
-    return { symbol, section: 'notices', source: '东方财富', status: 'empty', fetchedAt: now.getTime(), data: { items: [], total: 0 } };
-  } });
-  const result = await runAgencyScreening(s);
-  assert.deepEqual(calls.evidence.sort(), rows.map(item => item.symbol));
-  for (const item of rows.slice(0, -1)) assert.equal(seen.get(item.symbol), 2, '先返回的公告应在最终入池前刷新');
-  assert.equal(seen.get('sh600006'), 1);
-  for (const id of IDS) assert.equal(result.strategies[id].pass.length, rows.length);
-});
-
-test('全文采集耗时超过公告有效期时重新取公告，新增敏感事项阻断入池', async () => {
-  const now = new Date(NOW); let notices = 0;
-  const { s, calls } = scanner({ now, automatic: symbol => {
-    const bundle = companyBundle(symbol, now); now.setTime(now.getTime() + 360000); return bundle;
-  }, notices: symbol => ({ symbol, section: 'notices', source: '东方财富', status: ++notices === 1 ? 'empty' : 'ready', fetchedAt: now.getTime(),
-    data: notices === 1 ? { items: [], total: 0 } : { items: [{ id: 'AN20261013000001', date: '2026-10-13', title: '关于重大诉讼的公告' }], total: 1 } }) });
-  const result = await runAgencyScreening(s);
-  assert.equal(calls.notices.length, 2); assert.equal(calls.evidence.length, 1);
-  for (const id of IDS) { assert.equal(state(result, id, 'sh600001'), 'pending'); assert.equal(result.strategies[id].pending[0].stage, 'notices'); }
-  assert.equal(result.finishedAt, now.getTime());
-});
-
-test('最终刷新批次耗时过长时，早期目录再次过期仅待核验，不循环重试或误放行', async () => {
-  const now = new Date(NOW), seen = new Map(); let advanced = false;
-  const { s } = scanner({ now, rows: [row('sh600001'), row('sh600002')], automatic: symbol => {
-    const bundle = companyBundle(symbol, now);
-    if (!advanced) { advanced = true; now.setTime(+now + 300001); }
-    return bundle;
-  }, notices: async symbol => {
-    const count = (seen.get(symbol) || 0) + 1; seen.set(symbol, count);
-    if (symbol === 'sh600002' && count === 2) { await new Promise(resolve => setImmediate(resolve)); now.setTime(+now + 300001); }
-    return { symbol, section: 'notices', source: '东方财富', status: 'empty', fetchedAt: +now, data: { items: [], total: 0 } };
-  } });
-  const result = await runAgencyScreening(s);
-  for (const id of IDS) {
-    assert.equal(state(result, id, 'sh600001'), 'pending');
-    assert.match(result.strategies[id].pending.find(row => row.symbol === 'sh600001').reasons.join('；'), /超过 5 分钟/);
-    assert.equal(state(result, id, 'sh600002'), 'pass');
-  }
-  assert.equal(seen.get('sh600001'), 2); assert.equal(seen.get('sh600002'), 2);
-});
-
-test('财报、日线与公告服务忽略signal时仍能立即取消，不发布部分扫描', async () => {
-  for (const stage of ['finance', 'daily', 'notices', 'automatic']) {
+test('日线服务忽略signal时仍能立即取消，不发布部分扫描', async () => {
+  for (const stage of ['daily']) {
     let began; const started = new Promise(resolve => { began = resolve; });
     const { s } = scanner({ [stage]: () => { began(); return new Promise(() => {}); } });
     const running = runAgencyScreening(s); await started; s.cancel();
@@ -517,10 +233,134 @@ test('普通数值筛选与执行时行情校验未被候选扫描语义放宽�
   assert.equal(classifyScreenRow(row('sh600001', { amount: 0.1 }), query).status, 'failed');
   assert.equal(classifyScreenRow(row('sh600001', { amount: null }), query).status, 'pending');
   assert.equal(classifyScreenRow(row('sh600001', { amount: 0.1 }), query, { deferMinimumFields: ['amount'] }).status, 'pending');
-  const policy = poolPolicy('strict'); policy.commonQuery.rules[0].value = 0; policy.priority.reverse();
-  assert.equal(poolPolicy('strict').commonQuery.rules[0].value, 3); assert.deepEqual(poolPolicy().priority, IDS);
+  const policy = poolPolicy('strict'); policy.commonQuery.excludeST = false; policy.priority.reverse();
+  assert.equal(poolPolicy('strict').commonQuery.excludeST, true); assert.deepEqual(poolPolicy().priority, IDS);
   assert.equal(AGENCY_POOL_POLICY.version, 3); assert.deepEqual(AGENCY_POOL_POLICY.commonQuery.rules, []);
   const { s } = scanner({ now: new Date('2026-10-10T08:00:00+08:00'), rows: [row('sh600001', { timestamp: Date.parse('2026-10-09T15:00:00+08:00') })] });
   const ordinary = await s.run(defaults(), [], false, null, 'short');
   assert.equal(ordinary.rows.length, 0); assert.equal(ordinary.riskExcluded[0].entryRisk.status, 'unverified');
+});
+
+test('稳健扫描用真实完整日线的波幅按周期分流，不从行情振幅冒充历史波动', async () => {
+  const levels = new Map([['sh600001', 2.5], ['sh600002', 3.5], ['sh600003', 4.5], ['sh600004', 5.5], ['sh600005', 6.5]]);
+  const { s } = scanner({ rows: [...levels.keys()].map(symbol => row(symbol, { amplitude: 0.1 })), daily: symbol => {
+    const halfWidth = 10.94 * levels.get(symbol) / 200;
+    return { bars: bars().map(bar => ({ ...bar, high: bar.close + halfWidth, low: bar.close - halfWidth })), source: '隔离未复权日线' };
+  } });
+  const result = await screenAgency(s);
+  for (const [symbol, atrPct] of levels) {
+    for (const [id, maximum] of [['ultra-short', 6], ['short', 5], ['swing', 4], ['long', 3]]) {
+      assert.equal(state(result, id, symbol), atrPct < maximum ? 'pass' : 'failed', `${id} ${symbol} ${atrPct}`);
+    }
+  }
+  assert.ok(Math.abs(result.strategies.long.pass[0].atrPct14 - 2.5) < 1e-8);
+});
+
+test('长线偏离根据日线收盘和MA60计算，移除财务后仍不能过度追高', async () => {
+  for (const [step, expected] of [[0.03, 'pass'], [0.05, 'failed']]) {
+    const { s } = scanner({ daily: () => ({ source: '隔离未复权日线', bars: bars().map((bar, index) => {
+      const close = 10.94 - (119 - index) * step;
+      return { ...bar, open: close, close, high: close + 0.1, low: close - 0.1 };
+    }) }) });
+    const result = await screenAgency(s);
+    assert.equal(state(result, 'long', 'sh600001'), expected, `step=${step}`);
+    if (expected === 'failed') assert.match(result.strategies.long.failed[0].reasons.join('；'), /偏离|乖离/);
+  }
+});
+
+test('稳健四策略盘中成交额不足仅待核验，最近完整收盘不足才明确失败', async () => {
+  const symbol = 'sh600001';
+  for (const time of ['09:25:00', '10:00:00']) {
+    const now = new Date(`2026-10-13T${time}+08:00`);
+    const result = await screenAgency(scanner({ now, rows: [row(symbol, { timestamp: +now, amount: 0.1 })] }).s);
+    for (const id of IDS) {
+      assert.equal(state(result, id, symbol), 'pending', `${id} ${time}`);
+      assert.match(result.strategies[id].pending[0].reasons.join('；'), /累计值尚未完成/, `${id} ${time}`);
+    }
+  }
+  const now = new Date('2026-10-13T16:00:00+08:00');
+  const result = await screenAgency(scanner({ now, rows: [row(symbol, { timestamp: Date.parse('2026-10-13T15:00:00+08:00'), price: 10.94, amount: 0.1 })],
+    daily: () => ({ bars: bars('2026-10-13'), source: '隔离未复权日线' }) }).s);
+  for (const id of IDS) assert.equal(state(result, id, symbol), 'failed', id);
+});
+
+test('稳健新增日线指标不采纳未完成当天极端行情，保持本轮完整日线边界', async () => {
+  const { s } = scanner({ daily: () => ({ source: '隔离未复权日线', bars: [...bars(),
+    { date: '2026-10-13', open: 100, close: 150, high: 200, low: 1, volume: 100000 },
+    { date: '2026-10-14', open: 200, close: 200, high: 300, low: 1, volume: 100000 }] }) });
+  const result = await screenAgency(s);
+  for (const id of IDS) {
+    assert.equal(state(result, id, 'sh600001'), 'pass', id);
+    const selected = result.strategies[id].pass[0];
+    assert.equal(selected.technicalAsOf, '2026-10-12'); assert.equal(selected.close, 10.94);
+    assert.ok(selected.atrPct14 > 0 && selected.atrPct14 < 3);
+  }
+});
+
+test('旧技术缓存缺少稳健字段时重新获取真实日线，不能按旧通过结果放行', async () => {
+  const { s, calls } = scanner();
+  const first = await screenAgency(s);
+  for (const id of IDS) assert.equal(state(first, id, 'sh600001'), 'pass', id);
+  const cached = s.screeningDataCache.get('daily', 'sh600001');
+  assert.ok(cached, '应有可复用完整日线缓存');
+  for (const field of ['atrPct14', 'biasMa5Pct', 'biasMa20Pct', 'biasMa60Pct', 'ma20Change5Pct']) delete cached.data[field];
+  s.dailyLoader = async symbol => {
+    calls.daily.push(symbol);
+    return { source: '隔离未复权日线', bars: bars().map(bar => ({ ...bar, high: bar.close + 0.4, low: bar.close - 0.4 })) };
+  };
+  const result = await screenAgency(s);
+  assert.equal(calls.daily.length, 2);
+  for (const id of IDS) assert.equal(state(result, id, 'sh600001'), 'failed', id);
+  assert.ok(s.screeningDataCache.get('daily', 'sh600001').data.atrPct14 > 6);
+});
+
+test('稳健指标获取失败保持待核验，不利用上次通过结果和缺失默认值放行', async () => {
+  const { s } = scanner();
+  await screenAgency(s);
+  s.dailyLoader = async () => { throw Error('隔离新日线暂不可用'); };
+  const result = await screenAgency(s, { refreshQuantitative: true });
+  for (const id of IDS) {
+    assert.equal(state(result, id, 'sh600001'), 'pending', id);
+    assert.equal(result.strategies[id].pending[0].technicalError, 'fetch');
+  }
+});
+
+test('旧严格研究、公告与财务接口不可用时纯技术候选仍能入围，停用不冒充通过', async () => {
+  for (const screeningMode of ['strategy', 'strict']) {
+    const unavailable = () => { throw Error('net::ERR_HTTP2_PROTOCOL_ERROR'); };
+    const { s, calls } = scanner({ finance: unavailable, automatic: unavailable, notices: unavailable,
+      rows: [row('sh600001', { pe: null, pb: null })] });
+    s.beginEvidenceBatch = s.endEvidenceBatch = s.evidenceRetention = unavailable;
+    const result = await screenAgency(s, { screeningMode, research: { invalidLegacy: true }, performance: { invalidLegacy: true }, industry: { invalidLegacy: true } });
+    assert.equal(result.screeningMode, 'strategy'); assert.equal(result.status, 'ready');
+    assert.equal(calls.finance.length + calls.notices.length + calls.evidence.length, 0); assert.equal(calls.daily.length, 1);
+    for (const id of IDS) {
+      assert.equal(state(result, id, 'sh600001'), 'pass');
+      const candidate = result.strategies[id].pass[0];
+      assert.equal(candidate.researchChecks.status, 'disabled'); assert.equal(candidate.financeCheck, undefined);
+      assert.equal(candidate.noticeReview, undefined); assert.equal(candidate.entryRisk, undefined);
+    }
+    assert.equal(result.coverage.researchRequired, false); assert.equal(result.coverage.researchStatus, 'disabled');
+    assert.equal(result.coverage.noticesChecked + result.coverage.financeChecked + result.coverage.evidenceChecked, 0);
+  }
+});
+
+test('纯技术扫描仍排除有效ST，池外成员和日线失败待核验但不再提示等待研究', async () => {
+  const { s, calls } = scanner({ rows: [row('sh600001', { isST: true }), row('sh600002')], daily: () => { throw Error('日线离线'); } });
+  const result = await screenAgency(s, { requiredSymbols: ['sh600003'] });
+  for (const id of IDS) {
+    assert.equal(state(result, id, 'sh600001'), 'failed'); assert.equal(state(result, id, 'sh600002'), 'pending');
+    assert.equal(state(result, id, 'sh600003'), 'pending');
+  }
+  assert.deepEqual(calls.daily, ['sh600002']); assert.equal(result.coverage.diagnostics.researchNotStarted, 0);
+  assert.equal(result.coverage.diagnostics.stages['research-not-started'], undefined);
+  assert.equal(result.coverage.diagnostics.stages['daily-download'].count, 1);
+});
+
+test('取消研究后短线行情跌幅和缺失拦截继续生效', async () => {
+  for (const [changePct, expected] of [[-5, 'failed'], [null, 'pending']]) {
+    const result = await screenAgency(scanner({ rows: [row('sh600001', { changePct })] }).s);
+    for (const id of ['ultra-short', 'short']) { assert.equal(state(result, id, 'sh600001'), expected); assert.equal(result.strategies[id][expected][0].stage, 'market-risk'); }
+    for (const id of ['swing', 'long']) assert.equal(state(result, id, 'sh600001'), 'pass');
+  }
 });

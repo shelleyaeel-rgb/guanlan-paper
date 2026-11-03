@@ -38,7 +38,8 @@ test('盘前无报价或仅有昨日收盘报价时准备历史资料，但不�
     assert.equal(f.member().automaticCheck.phase, 'prepared');
     assert.equal(f.member().automaticCheck.dailyAsOf, '2026-10-20');
     assert.equal(f.member().lastVerifiedDate, undefined);
-    assert.equal(f.member().corporateVerification.status, 'clear');
+    assert.equal(f.member().corporateVerification, undefined);
+    assert.equal(f.engine.agencyNeedsCorporateEvidence(SYMBOL), false);
     assert.equal(f.engine.s.agency.revision, before.revision);
     assert.equal(f.engine.s.cash, before.cash); assert.deepEqual(f.engine.s.trades, before.trades);
     assert.equal(f.engine.agencyEvaluate('swing', SYMBOL, q, f.snapshot()).buyable, false);
@@ -56,8 +57,9 @@ test('盘前日线 HTTP 501 记录当前失败，恢复后重新准备，无需�
   assert.equal(f.member().automaticCheck.phase, 'prepared'); assert.equal(f.engine.s.trades.length, 0);
 });
 
-test('公司行为获取失败不能标为准备完成，资料恢复不解除旧对账阻断', () => {
-  const f = fixture(), failed = f.snapshot();
+test('已有持仓公司行为获取失败不能标为准备完成，资料恢复不解除旧对账阻断', () => {
+  const f = fixture('2026-10-20T10:00:00+08:00'); f.buy('2026-10-19'); f.setTime('2026-10-21T09:00:00+08:00');
+  const failed = f.snapshot();
   Object.assign(failed.corporateActions, { status: 'unavailable', coverageComplete: false, error: 'HTTP 501' });
   assert.match(f.engine.agencyPrepare(SYMBOL, undefined, failed), /HTTP 501/);
   assert.equal(f.member().automaticCheck.status, 'blocked');
@@ -66,6 +68,36 @@ test('公司行为获取失败不能标为准备完成，资料恢复不解除�
   f.engine.agencyPrepare(SYMBOL, undefined, f.snapshot());
   assert.equal(f.member().automaticCheck.phase, 'prepared');
   assert.deepEqual(f.member().reconciliation, latch);
+});
+
+test('首次开仓只准备日线，公告失败不阻断，旧无权益阻断须等当日价格基准通过才解除', () => {
+  const f = fixture(), snapshot = f.snapshot();
+  delete snapshot.notices;
+  Object.assign(snapshot.corporateActions, { status: 'unavailable', coverageComplete: false, error: '公告连接失败' });
+  f.member().reconciliation = { status: 'pending', reason: '旧公告获取失败', affectsEquity: false };
+  f.engine.s.agency.corporateChecks[SYMBOL] = { status: 'blocked', reason: '旧公告获取失败', affectsEquity: false };
+  f.engine.agencyPrepare(SYMBOL, undefined, snapshot);
+  assert.equal(f.member().automaticCheck.phase, 'prepared');
+  assert.equal(f.member().reconciliation.status, 'pending');
+  assert.equal(f.engine.s.agency.corporateActions.length, 0);
+  f.setTime('2026-10-21T10:00:00+08:00'); snapshot.fetchedAt = f.engine.clock().getTime();
+  assert.match(f.engine.agencyAutomaticBlock(SYMBOL, f.quote({ prevClose: 9.95 }), snapshot), /价格基准不一致/);
+  assert.equal(f.member().reconciliation.status, 'pending');
+  assert.equal(f.engine.agencyAutomaticBlock(SYMBOL, f.quote(), snapshot), null);
+  assert.equal(f.member().reconciliation.status, 'clear');
+  assert.equal(f.member().corporateVerification.status, 'not-required');
+  assert.equal(f.member().exitPriceBasis.corporateVerified, false);
+  assert.equal(f.engine.s.agency.corporateChecks[SYMBOL], undefined);
+  assert.equal(validState(f.engine.s), true);
+});
+
+test('真实权益待对账不能作为纯候选旧故障解除', () => {
+  const f = fixture('2026-10-21T10:00:00+08:00'), snapshot = f.snapshot();
+  f.member().reconciliation = { status: 'pending', reason: '尚有待核实股息权益', affectsEquity: true };
+  delete snapshot.corporateActions; delete snapshot.notices;
+  assert.equal(f.engine.agencyNeedsCorporateEvidence(SYMBOL), true);
+  assert.match(f.engine.agencyAutomaticBlock(SYMBOL, f.quote(), snapshot), /尚有待核实股息权益/);
+  assert.equal(f.member().reconciliation.status, 'pending');
 });
 
 test('盘前已有持仓的价格对账与待复核状态必须保留', () => {
@@ -162,4 +194,22 @@ test('盘前权益入账沿用生效日期且重复准备不重复记账，登�
   assert.deepEqual({ cash: f.engine.s.cash, lots: f.engine.s.lots, risks: f.engine.s.risks,
     events: f.engine.s.agency.corporateEvents, revision: f.engine.s.agency.revision }, posted);
   assert.equal(f.engine.s.trades.length, 1); assert.equal(validState(f.engine.s), true);
+});
+
+test('竞价参考基准预检不解除旧对账、不确认当日执行权限且开盘仍重新比较参考价', () => {
+  const f = fixture('2026-10-21T09:20:00+08:00');
+  f.member().reconciliation = { status: 'pending', reason: '原价格基准待复核', affectsEquity: false };
+  f.member().awaitingVerification = true;
+  const latch = structuredClone(f.member().reconciliation), cash = f.engine.s.cash;
+  const q = f.quote({ provider: 'tencent', source: '腾讯财经', price: 999, volume: 0, canTrade: false });
+  f.engine.agencyPrepare(SYMBOL, q, f.snapshot());
+  assert.equal(f.member().automaticCheck.reference.status, 'checked');
+  assert.equal(f.member().automaticCheck.phase, 'prepared');
+  assert.equal(f.member().automaticCheck.status, 'waiting');
+  assert.equal(f.member().lastVerifiedDate, undefined); assert.equal(f.member().exitPriceBasis, undefined);
+  assert.equal(f.member().awaitingVerification, true); assert.deepEqual(f.member().reconciliation, latch);
+  assert.equal(f.engine.s.cash, cash); assert.equal(f.engine.s.trades.length, 0);
+  f.setTime('2026-10-21T09:30:00+08:00');
+  assert.match(f.engine.agencyPrepare(SYMBOL, f.quote({ prevClose: 8 }), f.snapshot()), /价格基准不一致/);
+  assert.equal(f.member().automaticCheck.status, 'blocked'); assert.equal(f.engine.s.trades.length, 0);
 });

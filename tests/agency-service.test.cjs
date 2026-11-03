@@ -7,6 +7,7 @@ const { AgencyService } = require('../core/agency-service.cjs');
 const { cnTime } = require('../core/common.cjs');
 const { AgencyPoolService } = require('../core/agency-pool.cjs');
 const { poolPolicy } = require('../core/agency-screening.cjs');
+const { ACTIVE_CANDIDATE_LIMIT } = require('../core/agency-capacity.cjs');
 function fixture(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'guanlan-agency-service-'));
   t.after(() => { assert.equal(path.dirname(path.resolve(directory)), path.resolve(os.tmpdir())); assert.ok(path.basename(directory).startsWith('guanlan-agency-service-')); fs.rmSync(directory, { recursive: true, force: true }); });
@@ -28,14 +29,35 @@ function fixture(t) {
   const createService = () => {
     const options = { getEngine: () => engine, transaction, getQuotes: () => quotes, acceptQuotes: batch => Object.assign(quotes, batch),
       market: { quotes: async symbols => { marketCalls.push(symbols); if (refreshHook) await refreshHook(symbols, marketCalls.length); return Object.fromEntries(symbols.filter(symbol => !omitted.has(symbol)).map(s => [s, quote(s)])); } },
-      monitor: { load: async (symbol, force, financial, notices) => { loads.push({ symbol, force, financial, notices }); if (loadHook) await loadHook(symbol, loads.length); return snapshot(symbol); } }, clock: () => now };
+      monitor: {
+        snapshots: {},
+        load: async (symbol, force, financial, notices) => { loads.push({ symbol, force, financial, notices }); if (loadHook) await loadHook(symbol, loads.length); return snapshot(symbol); },
+        async prepare(symbol, financial, notices) { return this.snapshots[symbol] = structuredClone(await this.load(symbol, false, financial, notices)); },
+        readPrepared(symbol) { if (!this.snapshots[symbol]) throw Error('开仓资料未就绪：尚未准备'); return structuredClone(this.snapshots[symbol]); },
+        assertPrepared(symbol, value) {
+          const current = this.readPrepared(symbol);
+          for (const key of ['technical']) if (JSON.stringify(current[key]) !== JSON.stringify(value[key])) throw Error('开仓资料未就绪：已准备资料发生变化');
+          return value;
+        }
+      }, clock: () => now };
     for (const name of ['dir', 'safeStorage', 'fetchImpl', 'model', 'settingsStore']) Object.defineProperty(options, name, { get() { throw Error('不应读取旧模型依赖'); } });
     return new AgencyService(options);
   };
   let service = createService();
   transaction(() => { engine.agencyTransfer({ strategyId: 'swing', amount: 50000 }); engine.agencyMember({ strategyId: 'swing', symbol: 'sz000001', action: 'add' }); engine.agencyMode({ strategyId: 'swing', mode: 'running' }); });
-  const run = async (options = { force: true }) => { await service.poll(options); await service.runner.drain(); };
-  return { get engine() { return engine; }, get service() { return service; }, store, quotes, transaction, marketCalls, loads, run, quote, snapshot, legacyFile, legacyContent,
+  // Most business tests start with completed background preparation. poll()
+  // remains separate so acquisition/latency tests exercise the trading lane alone.
+  const prepare = async () => {
+    const queue = service.groups().filter(group => group.enabled).flatMap(group => {
+      const cycle = service.cycles.get(group.id), start = cycle.cursor >= cycle.symbols.length ? 0 : cycle.cursor;
+      return cycle.symbols.slice(start, start + 20).map(symbol => ({ symbol, strategyId: group.id }));
+    });
+    await Promise.all(Array.from({ length: Math.min(3, queue.length) }, async () => { while (queue.length) { const item = queue.shift(); await service.prepareEntry(item.symbol, item.strategyId); } }));
+  };
+  const poll = async (options = { force: true }) => { await service.poll(options); await service.runner.drain(); };
+  const run = async (options = { force: true }) => { await prepare(); await poll(options); };
+  return { get engine() { return engine; }, get service() { return service; }, store, quotes, transaction, marketCalls, loads, prepare, poll, run, quote, snapshot, legacyFile, legacyContent,
+    publishSnapshot: (symbol, value = snapshot(symbol)) => { service.monitor.snapshots[symbol] = structuredClone(value); },
     add: symbol => transaction(() => engine.agencyMember({ strategyId: 'swing', symbol, action: 'add' })),
     refreshing: fn => { refreshHook = fn; }, loading: fn => { loadHook = fn; }, price: v => { price = v; },
     omit: symbols => { omitted.clear(); for (const symbol of symbols) omitted.add(symbol); }, overrideQuote: (symbol, change) => { quoteOverrides[symbol] = change; },
@@ -49,52 +71,150 @@ function resolvedNoticeSnapshot(snapshot, now) {
   snapshot.notices = { symbol: snapshot.notices.symbol, section: 'notices', source: '东方财富', status: 'ready', fetchedAt: now, data: { items: [notice], total: 1 } };
   return snapshot;
 }
-function resolvedNoticeBundle(symbol, response, now) {
-  const item = response.data.items[0], text = '本次诉讼已结案，相关义务已全部履行完毕。本次诉讼对公司生产经营未造成重大不利影响。';
-  return { symbol, fetchedAt: now, documents: [{ id: item.id, title: item.title, publishedAt: item.date, issuerSymbol: symbol, kind: 'notice', complete: true,
-    fetchedAt: now, url: `https://data.eastmoney.com/notices/detail/${symbol.slice(2)}/${item.id}.html`, text, pages: 1,
-    pageTexts: [{ page: 1, text, method: 'provider-text', numericEligible: true, complete: true }] }] };
-}
-
-test('默认监控自动读取敏感公告并在执行前重新匹配目录，不加载整套研究；持仓后不等待正文', async t => {
-  const f = fixture(t); let notices = 0, fullResearch = 0;
-  f.service.monitor.load = async symbol => resolvedNoticeSnapshot(f.snapshot(symbol), f.service.clock());
-  f.service.getAutomaticEvidence = async () => { fullResearch++; throw Error('不应加载年报和行业研究'); };
-  f.service.getNoticeEvidence = async (symbol, { noticeResponse }) => { notices++; return resolvedNoticeBundle(symbol, noticeResponse, f.service.clock()); };
-  await f.run();
-  assert.equal(notices, 2); assert.equal(fullResearch, 0); assert.equal(f.engine.s.trades.length, 1);
-  assert.equal(f.engine.s.trades[0].strategyPlan.entryRiskEvidence.notices.mode, 'automatic-fulltext');
-  assert.equal(f.engine.s.trades[0].strategyPlan.entryRiskEvidence.notices.status, 'clear');
-  await f.run(); assert.equal(notices, 2, '已有持仓不下载敏感公告延迟退出管理');
-  assert.equal(validState(f.engine.s), true);
+test('未准备成员只记录跳过，候选及成交不调用资料接口，其他已准备成员仍可成交', async t => {
+  const f = fixture(t); f.add('sh600000'); f.publishSnapshot('sh600000');
+  let requested = 0;
+  f.service.monitor.load = async () => { requested++; throw Error('交易流程不应下载资料'); };
+  f.service.monitor.prepare = async () => { requested++; throw Error('交易流程不应等待准备'); };
+  f.service.getAutomaticEvidence = async () => { requested++; throw Error('交易流程不应下载研究'); };
+  f.service.getNoticeEvidence = async () => { requested++; throw Error('交易流程不应下载正文'); };
+  await f.poll();
+  assert.equal(requested, 0); assert.deepEqual(f.engine.s.trades.map(trade => trade.symbol), ['sh600000']);
+  assert.equal(f.marketCalls.length, 2, '只请求候选及成交所需的当前报价');
+  const skipped = f.engine.s.agency.decisions.find(item => item.symbol === 'sz000001' && item.status === 'blocked');
+  assert.match(skipped.message, /资料.*未就绪|尚未准备/); assert.equal(validState(f.store.load()), true);
 });
 
-test('默认监控执行前新增敏感公告或全文获取失败，旧结案正文不能授权买入', async t => {
-  const f = fixture(t); let loads = 0, bodies = 0;
-  f.service.monitor.load = async symbol => {
-    const snapshot = resolvedNoticeSnapshot(f.snapshot(symbol), f.service.clock());
-    if (++loads === 2) { snapshot.notices.data.items.push({ id: 'AN20260929000002', date: cnTime(f.service.clock()).date, title: '新增重大诉讼公告' }); snapshot.notices.data.total++; }
+test('后台准备并发有界且逐槽轮转，慢资料请求不阻断其他股票开仓', async t => {
+  const f = fixture(t); f.add('sh600000'); f.add('sh600001');
+  let release, active = 0, peak = 0;
+  const slow = new Promise(resolve => { release = resolve; });
+  f.loading(async symbol => {
+    active++; peak = Math.max(peak, active);
+    try { if (symbol === 'sz000001') await slow; } finally { active--; }
+  });
+  const first = f.service.prepareEntries();
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(f.loads.map(item => item.symbol), ['sz000001', 'sh600000', 'sh600001'], '空闲槽完成后立即补位，不等下个定时器');
+    assert.equal(f.service.preparingEntries.size, 1);
+    const second = f.service.prepareEntries();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(f.loads.map(item => item.symbol), ['sz000001', 'sh600000', 'sh600001']);
+    assert.equal(peak, 2); assert.equal(active, 1, '慢资料仍在后台等待');
+    await f.poll();
+    assert.deepEqual(f.engine.s.trades.map(trade => trade.symbol), ['sh600000', 'sh600001']);
+    assert.equal(active, 1, '交易完成不依赖慢资料返回');
+    release(); await Promise.all([first, second]);
+    assert.equal(f.service.preparingEntries.size, 0); assert.equal(validState(f.store.load()), true);
+  } finally { release(); await first; }
+});
+
+test('四组80只活跃候选连续补位完成准备，大量候补不取资料且准备本身不触发成交', async t => {
+  const f = fixture(t);
+  f.transaction(() => {
+    for (const [groupIndex, group] of f.engine.s.agency.groups.entries()) {
+      f.engine.agencyMode({ strategyId: group.id, mode: 'running' });
+      for (let i = 0; i < 30; i++) f.engine.agencyMember({ strategyId: group.id, symbol: `sh${600000 + groupIndex * 100 + i}`, action: 'add' });
+    }
+  });
+  const members = f.engine.s.agency.groups.flatMap(group => group.members), activeSymbols = members.filter(member => member.mode === 'active').map(member => member.symbol);
+  const totalActive = f.engine.s.agency.groups.length * ACTIVE_CANDIDATE_LIMIT;
+  assert.equal(totalActive, 80);
+  assert.equal(activeSymbols.length, totalActive); assert.equal(members.filter(member => member.mode === 'standby').length, members.length - totalActive);
+  let release, inflight = 0, peak = 0;
+  const slow = new Promise(resolve => { release = resolve; });
+  f.loading(async symbol => { inflight++; peak = Math.max(peak, inflight); try { if (symbol === activeSymbols[0]) await slow; } finally { inflight--; } });
+  const preparing = f.service.prepareEntries();
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(new Set(f.loads.map(item => item.symbol)), new Set(activeSymbols));
+    assert.equal(peak, 2); assert.equal(inflight, 1, '其余79只连续使用空闲槽，不等待慢成员或下一个5秒定时器');
+    assert.equal(Object.keys(f.service.monitor.snapshots).length, totalActive - 1);
+    assert.equal(f.marketCalls.length, 0); assert.equal(f.engine.s.trades.length, 0);
+    release(); await preparing; await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.service.preparingEntries.size, 0); assert.equal(Object.keys(f.service.monitor.snapshots).length, totalActive);
+    assert.equal(validState(f.store.load()), true);
+  } finally { release(); await preparing; f.service.stop(); }
+});
+
+test('资料从未就绪恢复后下一次普通轮询立即重检，资料准备不下单且已就绪刷新不重复唤醒', async t => {
+  const f = fixture(t); f.price(9.9);
+  await f.poll({});
+  assert.equal(f.service.publicState().coverage.swing.processed, 1);
+  assert.equal(f.engine.s.agency.groups.find(group => group.id === 'swing').members[0].monitoringCheck.status, 'data');
+  await f.service.prepareEntries(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.engine.s.trades.length, 0); assert.equal(f.marketCalls.length, 0);
+  await f.poll({});
+  assert.equal(f.marketCalls.length, 1, '无需等待完整5分钟，普通poll重新检查恢复的候选');
+  assert.equal(f.engine.s.agency.groups.find(group => group.id === 'swing').members[0].monitoringCheck.status, 'conditions');
+  const completed = f.service.runner.lastCompleted.get('swing');
+  f.advance(60000); await f.service.prepareEntries(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.service.runner.lastCompleted.get('swing'), completed, '原本可用的资料刷新不反复解除规则节流');
+  await f.poll({}); assert.equal(f.marketCalls.length, 1); assert.equal(f.engine.s.trades.length, 0);
+});
+
+test('后台准备、候选和成交完全不读取风险公告及财报研究，失效接口不妨碍技术成交', async t => {
+  const f = fixture(t); let researchCalls = 0;
+  const disabled = () => { researchCalls++; throw Error('自动交易已取消研究接口'); };
+  f.service.getAutomaticEvidence = disabled; f.service.getNoticeEvidence = disabled; f.service.getSelectionEvidence = disabled;
+  f.service.getEvidenceVersion = disabled;
+  const load = f.service.monitor.load;
+  f.service.monitor.load = async (...args) => {
+    assert.equal(args[2], false); assert.equal(args[3], false);
+    const snapshot = await load(...args);
+    snapshot.notices = { status: 'unavailable', error: 'HTTP/2 protocol error' };
+    snapshot.finance = { status: 'unavailable', error: '财报失败' };
     return snapshot;
   };
-  f.service.getNoticeEvidence = async (symbol, { noticeResponse }) => { bodies++; return resolvedNoticeBundle(symbol, noticeResponse, f.service.clock()); };
-  await f.run();
-  assert.equal(bodies, 2); assert.equal(f.engine.s.trades.length, 0);
-  const decision = f.engine.s.agency.decisions.findLast(item => item.symbol === 'sz000001');
-  assert.equal(decision.status, 'blocked'); assert.match(decision.message, /新增重大诉讼|尚未取得/);
-  f.service.getNoticeEvidence = async () => { throw Error('隔离正文接口失效'); };
-  await f.run(); assert.equal(f.engine.s.trades.length, 0); assert.equal(validState(f.engine.s), true);
+  await f.run(); assert.equal(researchCalls, 0); assert.equal(f.engine.s.trades.length, 1);
+  const plan = f.engine.s.trades[0].strategyPlan;
+  assert.equal(plan.entryRiskEvidence.notices.status, 'disabled');
+  assert.equal(plan.entryRiskEvidence.notices.mode, undefined);
+  assert.equal(validState(f.store.load()), true);
 });
 
-test('默认监控明确不利标题或不完整目录不进入正文放行流程', async t => {
-  const f = fixture(t); let calls = 0;
-  f.service.getNoticeEvidence = async () => { calls++; throw Error('不应请求'); };
-  for (const change of [s => { s.notices.data.items[0].title = '关于被立案调查的公告'; }, s => { s.notices.data.total = 40; }, s => { s.notices.fetchedAt -= 300001; }]) {
-    const snapshot = resolvedNoticeSnapshot(f.snapshot('sz000001'), f.service.clock()); change(snapshot);
-    await f.service.withAutomaticEvidence('sz000001', snapshot);
+test('候选或执行等待期间公告新增更正或失败均不改变已停用的研究筛查', async t => {
+  for (const stage of [1, 2]) for (const failure of [false, true]) {
+    const f = fixture(t); let calls = 0;
+    f.service.getNoticeEvidence = () => { calls++; throw Error('不应读取正文'); };
+    f.refreshing((_symbols, count) => {
+      if (count !== stage) return;
+      const next = f.snapshot('sz000001');
+      next.notices = failure ? { status: 'unavailable', error: '离线' }
+        : { status: 'ready', data: { total: 1, items: [{ id: 'new-risk', title: '重大诉讼公告' }] } };
+      f.publishSnapshot('sz000001', next);
+    });
+    await f.run(); assert.equal(f.engine.s.trades.length, 1); assert.equal(calls, 0);
+    assert.equal(validState(f.store.load()), true);
   }
-  assert.equal(calls, 0); assert.equal(f.engine.s.trades.length, 0);
 });
-test('候选资格待核验时明确跳过持续条件，轮询及重启不伪报缺失或自行恢复资格', async t => {
+
+test('后台准备慢日线仍可取消，账户切换或停止后不发布旧准备完成通知', async t => {
+  for (const change of ['reset', 'stop']) {
+    const f = fixture(t); let release, notifications = 0;
+    f.service.onChange = () => notifications++;
+    f.loading(() => new Promise(resolve => { release = resolve; }));
+    const preparing = f.service.prepareEntry('sz000001', 'swing');
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(typeof release, 'function');
+    if (change === 'reset') f.reset(); else f.service.stop();
+    release(); await preparing;
+    assert.equal(notifications, 0); assert.equal(f.service.preparingEntries.size, 0);
+    assert.equal(f.engine.s.trades.length, 0); assert.equal(validState(f.store.load()), true);
+  }
+});
+
+test('兼容的研究包装入口不下载资料也不伪造研究通过结论', async t => {
+  const f = fixture(t), snapshot = f.snapshot('sz000001');
+  let calls = 0; const disabled = () => { calls++; throw Error('不可调用研究'); };
+  f.service.getAutomaticEvidence = disabled; f.service.getNoticeEvidence = disabled; f.service.getSelectionEvidence = disabled;
+  assert.equal(await f.service.withAutomaticEvidence('sz000001', snapshot), snapshot);
+  assert.equal(await f.service.withNoticeEvidence('sz000001', snapshot), snapshot);
+  assert.equal(f.service.withSelectionEvidence('sz000001', snapshot), snapshot);
+  assert.equal(snapshot.automaticEvidenceLoad, undefined); assert.equal(calls, 0);
+});
+
+test('严格候选资格待核验时转候补，轮询及重启不下载资料或自行恢复资格', async t => {
   const f = fixture(t), policy = poolPolicy('strict'); let status = 'pending', evidenceCalls = 0;
   const original = f.engine.s.agency.groups.find(group => group.id === 'swing').members[0];
   original.selectionMode = 'strict';
@@ -107,34 +227,38 @@ test('候选资格待核验时明确跳过持续条件，轮询及重启不伪�
   const before = structuredClone(f.engine.s.agency.pool), member = () => f.engine.s.agency.groups.find(group => group.id === 'swing').members[0];
   f.service.getAutomaticEvidence = async symbol => { evidenceCalls++; return { symbol, checkedAt: f.service.clock(), status: 'unavailable', documents: [], errors: ['isolated actual source failure'] }; };
   const load = await f.service.withAutomaticEvidence('sz000001', f.snapshot('sz000001'));
-  assert.equal(load.automaticEvidenceLoad.status, 'skipped'); assert.equal(load.automaticEvidenceLoad.code, 'pool-qualification');
+  assert.equal(load.automaticEvidenceLoad, undefined);
+  await f.poll();
+  const cold = f.engine.s.agency.decisions.findLast(item => item.symbol === 'sz000001');
+  assert.equal(cold, undefined, '候补不进入规则轮检，不虚构持续条件检查记录');
+  assert.equal(member().mode, 'standby'); assert.match(member().standbyReason, /资料待核验/);
+  assert.deepEqual(member().poolCheck.reasons, ['隔离候选：报告解析尚未完整']);
+  assert.equal(f.loads.length, 0); assert.equal(evidenceCalls, 0);
   for (let run = 0; run < 2; run++) { await f.run(); f.advance(300001); }
-  const decision = f.engine.s.agency.decisions.findLast(item => item.symbol === 'sz000001');
-  assert.equal(decision.entryConditionsCheck.status, 'skipped'); assert.equal(decision.entryConditionsCheck.skippedBy, 'pool-qualification');
-  assert.deepEqual(decision.entryConditionsCheck.reasons, ['隔离候选：报告解析尚未完整']);
-  assert.doesNotMatch(decision.reason, /当前公开研究资料缺失|股票代码不符/);
-  assert.deepEqual(f.engine.s.agency.pool, before); assert.equal(member().automaticCheck.status, 'clear'); assert.equal(evidenceCalls, 0);
+  assert.equal(f.engine.s.agency.decisions.findLast(item => item.symbol === 'sz000001'), undefined);
+  assert.deepEqual(f.engine.s.agency.pool, before);
+  assert.equal(member().automaticCheck, undefined, '资格尚未通过且未进行资料检查时，不虚构自动核验通过记录');
+  assert.equal(evidenceCalls, 0);
   assert.equal(f.engine.s.trades.length, 0); assert.equal(validState(f.store.load()), true);
   f.restart(); await f.run(); assert.equal(member().poolCheck.status, 'pending');
-  assert.equal(f.engine.s.agency.decisions.findLast(item => item.symbol === 'sz000001').entryConditionsCheck.status, 'skipped');
+  assert.equal(member().mode, 'standby'); assert.equal(f.engine.s.agency.decisions.findLast(item => item.symbol === 'sz000001'), undefined);
   // Only the separate manual pool operation changes candidate authorization.
   status = 'pass'; await pool.run({ screeningMode: 'strict' });
   f.service.getAutomaticEvidence = async symbol => { evidenceCalls++; return { symbol, checkedAt: f.service.clock(), status: 'unavailable', documents: [], errors: ['isolated actual source failure'] }; };
-  await f.run(); assert.equal(member().poolCheck.status, 'pass'); assert.ok(evidenceCalls > 0);
-  assert.notEqual(f.engine.s.agency.decisions.findLast(item => item.symbol === 'sz000001').entryConditionsCheck.status, 'skipped');
-  assert.equal(f.engine.s.trades.length, 0, '真实资料不足仍不能开仓');
+  await f.run(); assert.equal(member().poolCheck.status, 'pass'); assert.equal(evidenceCalls, 0);
+  assert.equal(f.engine.s.trades.length, 1, '候选已通过时财报研究接口失败不阻断行情技术开仓');
 });
 
-test('旧标准通过也须重新核验，伪造加载状态不能绕过当前候选门槛', async t => {
+test('旧严格研究资格停用后不再阻断技术条件，也不读取伪造的研究通过状态', async t => {
   const f = fixture(t), policy = poolPolicy('strict'), { createEntryConditions } = require('../core/entry-conditions.cjs');
   const member = f.engine.s.agency.groups.find(group => group.id === 'swing').members[0];
   member.selectionMode = 'strict';
   f.engine.s.agency.pool = { policy }; member.poolCheck = { status: 'pass', policyVersion: 1, reasons: ['旧标准结果'] };
   member.entryConditions = createEntryConditions({ ...policy.commonQuery, source: { kind: 'agency-pool', policyVersion: 2 } }); let calls = 0;
   f.service.getAutomaticEvidence = async () => { calls++; throw Error('不应调用'); };
-  assert.equal((await f.service.withAutomaticEvidence(member.symbol, {})).automaticEvidenceLoad.status, 'skipped'); assert.equal(calls, 0);
+  assert.equal((await f.service.withAutomaticEvidence(member.symbol, {})).automaticEvidenceLoad, undefined); assert.equal(calls, 0);
   const result = f.engine.agencyEvaluate('swing', member.symbol, f.quote(member.symbol), { ...f.snapshot(member.symbol), automaticEvidenceLoad: { status: 'ready' } });
-  assert.equal(result.buyable, false); assert.equal(result.entryConditionsCheck.status, 'skipped'); assert.match(result.reasons[0], /候选池资格/);
+  assert.equal(result.buyable, true); assert.notEqual(result.entryConditionsCheck?.status, 'skipped'); assert.doesNotMatch(result.reasons.join('；'), /候选池资格/);
 });
 
 test('无密钥和第三方服务即可按固定规则成交，旧配置不读取、不改写', async t => {
@@ -180,8 +304,8 @@ test('调度、候选和成交不请求完整历史快照，暂停组仍只检�
   assert.equal(validState(f.store.load()), true);
 });
 
-test('取数期间暂停策略，使在途检查失效且不恢复权限', async t => {
-  const f = fixture(t); f.loading(() => f.transaction(() => f.engine.agencyMode({ strategyId: 'swing', mode: 'paused' })));
+test('行情取数期间暂停策略，使在途检查失效且不恢复权限', async t => {
+  const f = fixture(t); f.refreshing(() => f.transaction(() => f.engine.agencyMode({ strategyId: 'swing', mode: 'paused' })));
   await f.run(); assert.equal(f.engine.s.trades.length, 0); assert.equal(f.engine.s.agency.groups.find(g => g.id === 'swing').mode, 'paused');
   assert.ok(f.engine.s.agency.decisions.some(d => d.status === 'stale'));
 });
@@ -195,7 +319,8 @@ test('强制刷新后使用最新通过规则的计划，保存实际价格、�
   assert.equal(f.engine.s.trades.length, 1); assert.equal(f.engine.s.trades[0].price, 10.13);
   const entry = f.engine.s.agency.decisions.find(d => d.status === 'executed');
   assert.equal(entry.inputSources[0].data.ask, 10.1); assert.equal(entry.executionCheck.quote.ask, 10.12);
-  assert.equal(entry.execution.plan.entry, 10.13); assert.ok(f.loads.every(load => load.force === true && load.notices === true));
+  assert.equal(entry.execution.plan.entry, 10.13); assert.equal(f.loads.length, 1);
+  assert.ok(f.loads.every(load => load.force === false && load.financial === false && load.notices === false), '后台准备遵循缓存，成交不强制下载资料');
 });
 test('强制刷新后条件不满足不得使用此前通过的检查结果', async t => {
   const f = fixture(t); f.refreshing((_symbols, calls) => { if (calls === 2) f.price(9.9); }); await f.run();
@@ -306,53 +431,53 @@ test('其他持仓的新价格改变策略权益与买入上限，实际成交�
   assert.deepEqual(f.engine.s.marks.sz000001, oldMark);
 });
 
-test('超过50只成员按20只连续批次覆盖全部，完成全轮后再按五分钟节流', async t => {
+test('65只成员只检查20只活跃候选，45只候补保留且正常完成后仍按五分钟节流', async t => {
   const f = fixture(t), symbols = ['sz000001', ...Array.from({ length: 64 }, (_, i) => `sh${600001 + i}`)];
   f.transaction(() => { for (const symbol of symbols.slice(1)) f.engine.agencyMember({ strategyId: 'swing', symbol, action: 'add' }); });
   f.price(9.9);
   let active = 0, peak = 0;
   f.loading(async () => { active++; peak = Math.max(peak, active); await new Promise(resolve => setImmediate(resolve)); active--; });
-  for (const expected of [20, 40, 60, 65]) {
-    await f.run({});
-    const progress = f.service.publicState().coverage.swing;
-    assert.equal(progress.total, 65); assert.equal(progress.processed, expected); assert.equal(progress.remaining, 65 - expected);
-  }
-  assert.equal(peak, 3); assert.deepEqual(f.marketCalls.flat(), symbols);
-  assert.deepEqual(f.loads.map(load => load.symbol), symbols); assert.equal(f.engine.s.trades.length, 0);
+  await f.run({});
+  const progress = f.service.publicState().coverage.swing;
+  assert.equal(progress.total, ACTIVE_CANDIDATE_LIMIT); assert.equal(progress.processed, ACTIVE_CANDIDATE_LIMIT); assert.equal(progress.remaining, 0);
+  assert.equal(f.engine.s.agency.groups.find(group => group.id === 'swing').members.filter(member => member.mode === 'standby').length, symbols.length - ACTIVE_CANDIDATE_LIMIT);
+  assert.equal(peak, 3); assert.deepEqual(f.marketCalls.flat(), symbols.slice(0, ACTIVE_CANDIDATE_LIMIT));
+  assert.deepEqual(f.loads.map(load => load.symbol), symbols.slice(0, ACTIVE_CANDIDATE_LIMIT)); assert.equal(f.engine.s.trades.length, 0);
   const completed = f.service.publicState().coverage.swing;
   assert.equal(completed.status, 'complete'); assert.ok(completed.completedAt);
-  await f.run({}); assert.equal(f.marketCalls.length, 4);
-  f.advance(300000); await f.run({}); assert.equal(f.marketCalls.length, 5);
+  await f.run({}); assert.equal(f.marketCalls.length, 1);
+  f.advance(300000); await f.run({}); assert.equal(f.marketCalls.length, 2);
   assert.equal(f.service.publicState().coverage.swing.cycle, completed.cycle + 1);
 });
 
-test('前批全部行情缺失仍记录拦截并推进后续成员，授权变化则保留当前批重检', async t => {
+test('活跃候选全部缺行情仍完成本轮，授权变化保留当前批重检且候补不请求行情', async t => {
   const f = fixture(t), symbols = ['sz000001', ...Array.from({ length: 24 }, (_, i) => `sh${600001 + i}`)];
   f.transaction(() => { for (const symbol of symbols.slice(1)) f.engine.agencyMember({ strategyId: 'swing', symbol, action: 'add' }); });
-  f.price(9.9); f.omit(symbols.slice(0, 20));
-  await f.run({}); assert.equal(f.service.publicState().coverage.swing.processed, 20);
-  assert.equal(f.engine.s.agency.decisions.filter(item => item.status === 'blocked' && item.symbol).length, 20);
-  f.loading(() => f.service.invalidate());
-  await f.run({}); assert.equal(f.service.publicState().coverage.swing.processed, 20);
-  f.loading(null); await f.run({});
-  assert.equal(f.service.publicState().coverage.swing.processed, 25);
-  assert.deepEqual(f.marketCalls.at(-1), symbols.slice(20)); assert.equal(f.engine.s.trades.length, 0);
+  f.price(9.9); f.omit(symbols.slice(0, ACTIVE_CANDIDATE_LIMIT));
+  await f.run({}); assert.equal(f.service.publicState().coverage.swing.processed, ACTIVE_CANDIDATE_LIMIT);
+  assert.equal(f.engine.s.agency.decisions.filter(item => item.status === 'blocked' && item.symbol).length, ACTIVE_CANDIDATE_LIMIT);
+  f.advance(300000); f.omit([]);
+  f.refreshing(() => f.service.invalidate());
+  await f.run({}); assert.equal(f.service.publicState().coverage.swing.processed, 0);
+  f.refreshing(null); await f.run();
+  assert.equal(f.service.publicState().coverage.swing.processed, ACTIVE_CANDIDATE_LIMIT);
+  assert.deepEqual(f.marketCalls.at(-1), symbols.slice(0, ACTIVE_CANDIDATE_LIMIT)); assert.equal(f.engine.s.trades.length, 0);
 });
 
 test('同批等待记录完整保留但只合并保存一次，日志保存失败时不推进覆盖进度', async t => {
   const prepare = () => {
     const f = fixture(t); f.price(9.9);
-    f.transaction(() => { for (let i = 0; i < 19; i++) f.engine.agencyMember({ strategyId: 'swing', symbol: `sh${600001 + i}`, action: 'add' }); });
+    f.transaction(() => { for (let i = 0; i < ACTIVE_CANDIDATE_LIMIT - 1; i++) f.engine.agencyMember({ strategyId: 'swing', symbol: `sh${600001 + i}`, action: 'add' }); });
     return f;
   };
   const f = prepare(), save = f.store.save.bind(f.store); let saves = 0;
   f.store.save = state => { saves++; return save(state); };
   await f.run({});
-  assert.equal(f.engine.s.agency.decisions.filter(item => item.status === 'waiting').length, 20);
+  assert.equal(f.engine.s.agency.decisions.filter(item => item.status === 'waiting').length, ACTIVE_CANDIDATE_LIMIT);
   assert.equal(saves, 2, '批开始并入候选核验，批完成并入等待日志，均保留原子保存');
   assert.equal(f.engine.s.agency.decisions.filter(item => item.status === 'request').length, 1);
   assert.equal(f.engine.s.agency.decisions.filter(item => item.status === 'complete').length, 1);
-  assert.equal(f.service.publicState().coverage.swing.processed, 20);
+  assert.equal(f.service.publicState().coverage.swing.processed, ACTIVE_CANDIDATE_LIMIT);
   const failed = prepare(), safeSave = failed.store.save.bind(failed.store);
   failed.store.save = state => { if (state.agency.decisions.some(item => item.status === 'waiting')) throw Error('合并日志保存失败'); return safeSave(state); };
   await failed.run({});
@@ -362,9 +487,9 @@ test('同批等待记录完整保留但只合并保存一次，日志保存失�
   const calls = failed.marketCalls.length; await failed.run({}); assert.equal(failed.marketCalls.length, calls);
 });
 
-test('公告新增、更正、撤回或失败发生在正文或行情等待期间，旧买入快照均失效', async t => {
+test('停用公告筛查后新增更正撤回及查新失败不会废弃技术买点', async t => {
   const { Research } = require('../core/research.cjs');
-  for (const stage of ['evidence', 'quote']) for (const change of ['added', 'corrected', 'withdrawn', 'failed']) {
+  for (const stage of ['candidate-quote', 'execution-quote']) for (const change of ['added', 'corrected', 'withdrawn', 'failed']) {
     const f = fixture(t); let failed = false;
     let data = { items: [{ id: 'AN20260929000001', date: '2026-09-29', title: '关于召开股东大会的公告' }], total: 1 };
     const research = new Research(() => { throw Error('隔离测试不访问网络'); }, { clock: f.service.clock });
@@ -373,20 +498,17 @@ test('公告新增、更正、撤回或失败发生在正文或行情等待期�
     const load = f.service.monitor.load;
     f.service.monitor.load = async (...args) => ({ ...await load(...args), notices: await research.get({ symbol: args[0], section: 'notices', force: args[1] }) });
     const invalidate = async () => {
-      assert.ok(f.service.pendingBuySymbols().includes('sz000001'));
+      if (stage === 'execution-quote') assert.ok(f.service.pendingBuySymbols().includes('sz000001'));
       if (change === 'added') { data.items.push({ id: 'AN20260929000002', date: '2026-09-29', title: '新增重大诉讼公告' }); data.total++; }
       if (change === 'corrected') data.items[0].title = '原公告更正：重大诉讼风险';
       if (change === 'withdrawn') data = { items: [], total: 0 };
       if (change === 'failed') failed = true;
       await research.get({ symbol: 'sz000001', section: 'notices', force: true });
     };
-    if (stage === 'evidence') {
-      const withEvidence = f.service.withAutomaticEvidence.bind(f.service); let calls = 0;
-      f.service.withAutomaticEvidence = async (...args) => { const result = await withEvidence(...args); if (++calls === 2) await invalidate(); return result; };
-    } else f.refreshing(async (_symbols, count) => { if (count === 2) await invalidate(); });
+    f.refreshing(async (_symbols, count) => { if (count === (stage === 'candidate-quote' ? 1 : 2)) await invalidate(); });
     await f.run();
-    assert.equal(f.engine.s.trades.length, 0, `${stage}/${change}`);
-    assert.ok(f.engine.s.agency.decisions.some(entry => entry.status === 'blocked' && /公告目录.*失效/.test(entry.message)), `${stage}/${change}`);
+    assert.equal(f.engine.s.trades.length, 1, `${stage}/${change}`);
+    assert.equal(f.engine.s.agency.decisions.some(entry => entry.status === 'blocked' && /公告目录.*失效/.test(entry.message)), false);
     assert.deepEqual(f.service.pendingBuySymbols(), []); assert.equal(validState(f.store.load()), true);
   }
 });

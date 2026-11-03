@@ -43,6 +43,25 @@ test('cold complete pagination checks both boundary pages and warm load only che
   assert.deepEqual(f.calls.slice(-2), [1, 3]); assert.equal(progress.at(-1).cached, true);
 });
 
+test('concurrent pre-open and live list consumers share one download with independent cancellation', async () => {
+  let release, entered, listSignal;
+  const started = new Promise(resolve => { entered = resolve; }), gate = new Promise(resolve => { release = resolve; });
+  const f = fixture(rows(), { response: async (_json, page, number, signal) => {
+    if (page === 1 && number === 1) { listSignal = signal; entered(); await gate; }
+  } });
+  const controller = new AbortController(), preparing = f.source.load({ signal: controller.signal }); await started;
+  const live = f.source.load(); controller.abort(); await assert.rejects(preparing); assert.equal(listSignal.aborted, false);
+  release(); assert.equal((await live).symbols.length, 205); assert.deepEqual(f.calls, [1, 2, 3, 1, 3]);
+});
+
+test('preparation renews an independent list five minutes before expiry without extending old timestamps', async () => {
+  const f = fixture(); const first = await f.source.load({ refreshBeforeMs: 300000 });
+  f.setTime(NOW + 24 * 60000); const warm = await f.source.load({ refreshBeforeMs: 300000 });
+  assert.equal(warm.validatedAt, first.validatedAt); assert.equal(f.calls.length, 7);
+  f.setTime(NOW + 25 * 60000); const renewed = await f.source.load({ refreshBeforeMs: 300000 });
+  assert.equal(renewed.validatedAt, NOW + 25 * 60000); assert.equal(f.calls.length, 12);
+});
+
 test('30 minute expiry, Beijing date rollover and clock rollback rebuild the whole universe', async t => {
   for (const [name, initial, next] of [['expiry', NOW, NOW + 1800000], ['day', Date.parse('2026-10-19T15:59:50Z'), Date.parse('2026-10-19T16:00:01Z')], ['rollback', NOW, NOW - 1]]) {
     await t.test(name, async () => {
