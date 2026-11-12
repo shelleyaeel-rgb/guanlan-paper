@@ -426,7 +426,7 @@ function holdingValuationEvidence(engine, fresh) {
 function candidateData(symbol, q, snapshot, evaluation, position, group) {
   const sources = [];
   for (const kind of ['marketRegime', 'entryConfirmation']) if (snapshot?.[kind]) sources.push({ id: `${kind}:${symbol}:${snapshot[kind].checkedAt}`, kind,
-    source: kind === 'marketRegime' ? '指数趋势与全市场广度' : '实际观察的盘中报价序列', fetchedAt: snapshot[kind].checkedAt, data: snapshot[kind] });
+    source: kind === 'marketRegime' ? '当日市场广度与指数波动' : '实际观察的盘中报价序列', fetchedAt: snapshot[kind].checkedAt, data: snapshot[kind] });
   if (q) sources.push({ id: `quote:${symbol}:${q.timestamp}`, kind: 'quote', source: q.source, timestamp: q.timestamp,
     data: Object.fromEntries(['price', 'prevClose', 'open', 'high', 'low', 'volume', 'amount', 'turnover', 'bid', 'ask', 'bidSize', 'askSize', 'limitUp', 'limitDown', 'screeningMetrics'].map(k => [k, q[k]])) });
   if (snapshot?.technical) sources.push({ id: `daily:${symbol}:${snapshot.technical.asOf}`, kind: 'completed-unadjusted-daily', source: snapshot.source,

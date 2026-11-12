@@ -134,10 +134,12 @@ function agencyUnopenedReason(member, held = false, group = agencyOwner(member.s
 }
 function agencyMonitoringHtml(member, held = false, group = agencyOwner(member.symbol)) {
   const reason = agencyUnopenedReason(member, held, group);
-  const unopened = reason ? `<span data-unopened-reason>未开仓原因：${esc(reason)}</span>` : '';
+  const check = agencyCurrentMonitoringCheck(member);
+  const reasonLabel = check?.reason && reason === check.reason ? '最近检查未开仓原因' : '未开仓原因';
+  const unopened = reason ? `<span data-unopened-reason>${reasonLabel}：${esc(reason)}</span>` : '';
   if (agencyMemberPhase(member, held) === 'standby') return `<div class="agency-monitoring-check agency-standby-note" data-monitoring-status="standby"><b>候补 · 不参与高频刷新</b>${unopened}<small>点击“更新四策略候选池”后重新评估；保留原归属和个人条件。</small></div>`;
   if (agencyMemberPhase(member, held) === 'exiting') return `<div class="agency-monitoring-check" data-monitoring-status="exiting"><b>退出安排</b>${unopened || '<span>不参与新开仓，等待退出或移除处理。</span>'}</div>`;
-  const check = agencyCurrentMonitoringCheck(member), status = agencyMonitoringStatus(member, held);
+  const status = agencyMonitoringStatus(member, held);
   const result = check?.reason && check.reason !== reason ? `<small>最近检查结果：${esc(check.reason)}</small>` : '';
   return `<div class="agency-monitoring-check" data-monitoring-status="${esc(status)}"><b class="${status === 'eligible' || status === 'holding' ? 'teal' : 'agency-pending'}">${esc(agencyMonitoringNames[status])}</b>${unopened}${result}${!reason && !check?.reason ? '<span>等待下一轮持仓检查。</span>' : ''}${check?.checkedAt ? `<small>最近检查 ${esc(timeText(check.checkedAt))}</small>` : ''}</div>`;
 }
@@ -620,32 +622,41 @@ function agencyMarketPreparationHtml(preparation) {
   return `<div data-market-preparation="${esc(preparation.status || 'idle')}"><b class="${preparation.ready ? 'teal' : 'agency-pending'}">${esc(labels[preparation.status] || labels.idle)}</b><span>${details.map(esc).join(' · ')}</span>${preparation.preparedAt ? `<small>资料检查 ${esc(timeText(preparation.preparedAt))}</small>` : ''}${missing.length ? `<span class="agency-pending">${[...new Set(missing)].map(esc).join('；')}</span>` : ''}<small>${live.length ? `${liveLabel}：${live.map(esc).join('、')}。` : ''}资料准备完成不代表策略信号成立；市场环境改善仍需至少 120 秒确认。</small></div>`;
 }
 
+function agencyMarketDisplay(snapshot) {
+  const names = { strong: '当日广度偏强', neutral: '当日广度中性', weak: '当日广度偏弱', unknown: '市场资料待核验' };
+  const candidate = snapshot?.metrics?.candidateStatus;
+  const awaitingConfirmation = ['strong', 'neutral', 'weak'].includes(candidate);
+  return { awaitingConfirmation, label: awaitingConfirmation ? `${names[candidate]} · 待持续确认` : names[snapshot?.status] || names.unknown };
+}
+
 function renderAgencyMarketRegime() {
   const card = $('agency-market-regime');
   if (!card) return;
   const snapshot = state.agency?.runtime?.marketRegime, enabled = state.agency?.marketPolicy?.enabled === true;
   const now = Number.isFinite(state.now) ? state.now : Date.now();
   const today = new Date(now + 8 * 3600000).toISOString().slice(0, 10);
-  const fresh = snapshot?.version === 1 && snapshot.policyVersion === 1 && snapshot.date === today
+  const fresh = snapshot?.version === 1 && snapshot.policyVersion === 2 && snapshot.date === today
     && Number.isFinite(snapshot.checkedAt) && snapshot.checkedAt <= now && snapshot.expiresAt > now;
   const status = fresh && ['strong', 'neutral', 'weak'].includes(snapshot.status) ? snapshot.status : 'unknown';
   const multiplier = enabled && fresh && ['strong', 'neutral'].includes(status) && snapshot.allowEntry === true && [0.5, 1].includes(snapshot.riskMultiplier) ? snapshot.riskMultiplier : 0;
   const breakout = multiplier === 1 && status === 'strong' && snapshot.allowBreakout === true;
-  const names = { strong: '偏强', neutral: '中性', weak: '偏弱', unknown: '待核验' };
+  const display = agencyMarketDisplay(fresh ? snapshot : null);
   card.dataset.marketStatus = enabled ? status : 'disabled';
-  $('agency-market-badge').textContent = enabled ? `${names[status]} · ${fresh && snapshot?.metrics?.highVolatility ? '高波动 · ' : ''}${multiplier === 1 ? '正常风险预算' : multiplier === 0.5 ? '半额风险预算' : '暂停新开仓'}` : '市场环境过滤未启用';
+  $('agency-market-badge').textContent = enabled ? `${display.label} · ${fresh && snapshot?.metrics?.highVolatility ? '高波动 · ' : ''}${multiplier === 1 ? '正常风险预算' : multiplier === 0.5 ? '半额风险预算' : '暂停新开仓'}` : '市场环境过滤未启用';
   $('agency-market-badge').className = 'small-badge ' + (enabled && !multiplier ? 'agency-pending' : multiplier === 1 ? 'teal' : '');
   $('agency-market-summary').textContent = !enabled ? '当前未启用市场环境过滤；按固定策略、资金及其他风控条件检查新开仓。'
     : !multiplier ? '当前暂停四类策略新开仓；已有持仓继续执行原退出计划。'
       : breakout ? '超短线、短线和波段可检查回踩或突破条件；长线仍只检查回踩条件。已有持仓不自动加仓。'
-        : '四类策略仅检查回踩条件，单笔计划风险预算减半；已有持仓不自动加仓。';
+        : '四类策略仅检查回踩条件，单笔及策略总计划风险预算减半；已有持仓不自动加仓。';
   const acquisition = snapshot?.acquisition, loading = enabled && acquisition?.loading === true;
   const prepared = enabled && !loading && acquisition?.stage === 'prepared';
   setHtml('agency-market-preparation', enabled ? agencyMarketPreparationHtml(snapshot?.preparation) : '');
   $('agency-market-preparation')?.classList.toggle('hidden', !enabled || !snapshot?.preparation);
   card.setAttribute('aria-busy', String(loading));
-  const reason = enabled && snapshot && !fresh && snapshot.status !== 'unknown'
-    ? '市场证据已过期或跨日，等待重新核验。' : snapshot?.reason || '等待指数完整日线、同日指数报价与全市场广度资料。';
+  const reason = enabled && snapshot && snapshot.policyVersion !== 2
+    ? '市场环境规则已更新，等待按当日广度与指数波动重新核验。'
+    : enabled && snapshot && !fresh && snapshot.status !== 'unknown'
+      ? '市场证据已过期或跨日，等待重新核验。' : snapshot?.reason || '等待指数完整日线、同日指数报价与全市场广度资料。';
   const stage = ({ indices: '指数日线', 'index-history': '指数日线', universe: '股票名单', 'screen-quotes': '全市场报价', 'breadth-quotes': '全市场报价',
     fallback: '切换备用来源', evaluating: '核对市场证据', cached: '核对已获取资料', complete: '核对市场证据' })[acquisition?.stage] || '市场资料';
   const progress = Number.isFinite(acquisition?.total) && acquisition.total > 0
@@ -655,14 +666,14 @@ function renderAgencyMarketRegime() {
       ? `上次失败（${timeText(acquisition.lastErrorAt)}）：${acquisition.lastError}` : '当前开仓权限仍按已完成的有效证据判断。'}`
     : `${reason}${acquisition?.source && acquisition.fallbackReason ? ` 本轮已使用备用来源：${acquisition.source}。` : ''}`;
   const breadth = snapshot?.metrics?.breadth, group = agencyGroup(), risk = group?.limits?.riskPercent;
-  setHtml('agency-market-metrics', `<div><span>有效报价上涨占比</span><strong>${pct(breadth?.advanceRatio)}</strong><small>${breadth ? `${num(breadth.advancing, 0)} 涨 / ${num(breadth.valid, 0)} 有效` : '等待沪深 A 股快照'}</small></div>`
+  setHtml('agency-market-metrics', `<div><span>当日市场广度 · 上涨占比</span><strong>${pct(breadth?.advanceRatio)}</strong><small>${breadth ? `${num(breadth.advancing, 0)} 涨 / ${num(breadth.valid, 0)} 有效` : '等待沪深 A 股快照'}</small></div>`
     + `<div><span>广度有效覆盖</span><strong>${pct(breadth?.coverage)}</strong><small>${breadth ? `${num(breadth.valid, 0)} / ${num(breadth.expected, 0)} 只 · 不含北交所` : '缺少有效覆盖证据'}</small></div>`
     + `<div><span>当前策略单笔风险预算上限</span><strong>${!enabled ? '按策略设置' : !multiplier ? '暂停新开仓' : Number.isFinite(risk) ? num(risk * multiplier) + '% 权益' : num(multiplier * 100, 0) + '% 原预算'}</strong><small>${enabled && multiplier && Number.isFinite(risk) ? `设置 ${num(risk)}% × ${num(multiplier * 100, 0)}%` : '计划止损估算，不是实际亏损上限'}</small></div>`);
   $('agency-market-time').textContent = prepared
     ? `历史资料准备完成 ${timeText(acquisition.finishedAt)} · 指数日线截至 ${acquisition.prepared?.[0]?.asOf || '待核验'} · 实时市场环境待开盘后自动确认`
     : `${loading ? `本次获取开始 ${timeText(acquisition.startedAt)} · ` : acquisition?.finishedAt ? `最近获取完成 ${timeText(acquisition.finishedAt)} · ` : ''}${snapshot && !fresh ? '最近证据已失效 · ' : ''}广度来源：${breadth?.source || acquisition?.source || '待获取'} · 原始行情最早时间 ${timeText(snapshot?.evidence?.quoteTime)} · 核验 ${timeText(snapshot?.checkedAt)} · 有效至 ${timeText(snapshot?.expiresAt)}`;
   const indices = snapshot?.metrics?.indices || [];
-  setHtml('agency-market-indices', indices.length ? table(['指数', '完整日线', '中期趋势', '5 日 MA20 变化', 'ATR / 收盘价', '指数原始报价时间'], indices.map(index => [
+  setHtml('agency-market-indices', indices.length ? table(['指数', '完整日线', '中期趋势（仅观察）', '5 日 MA20 变化（仅观察）', 'ATR / 收盘价', '指数原始报价时间'], indices.map(index => [
     esc(({ sh000001: '上证指数', sz399001: '深证成指', sz399006: '创业板指' })[index.symbol] || index.symbol), dailyHistoryHtml(index.dailyHistory) || esc(index.asOf),
     esc(({ up: '向上', down: '向下', mixed: '未形成一致趋势' })[index.trend] || '待核验'), pct(index.ma20Slope5), pct(index.atrRatio), esc(timeText(index.quoteTime))
   ])) : '<p class="tiny">尚无可核验的指数趋势数据。</p>');
@@ -763,8 +774,10 @@ function renderAgencyReconcile() {
 function agencyVerificationSummary(result) {
   const summary = result?.summary || result;
   if (!summary || !Number.isFinite(summary.checked)) return '自动核验已完成，请查看股票状态与处理流水';
-  const environment = result?.marketRegime, marketStatus = ({ strong: '偏强', neutral: '中性', weak: '偏弱', unknown: '待核验' })[environment?.status] || '待核验';
-  const marketSummary = environment ? ` · 市场环境：${marketStatus}${environment.allowEntry === true ? '（已确认）' : '（暂停新开仓）'}` : '';
+  const environment = result?.marketRegime, display = agencyMarketDisplay(environment);
+  const permission = environment?.allowEntry !== true ? '暂停新开仓'
+    : display.awaitingConfirmation ? environment.riskMultiplier === 0.5 ? '当前半额风险预算' : '按已确认预算' : '已确认';
+  const marketSummary = environment ? ` · 市场环境：${display.label}（${permission}）` : '';
   return `已检查 ${summary.checked} 只 · 通过 ${summary.clear || 0} 只 · 等待 ${summary.waiting || 0} 只 · 异常 ${summary.blocked || 0} 只${summary.skipped ? ` · 跳过 ${summary.skipped} 只` : ''}${summary.cached ? ` · 复用有效日线 ${summary.cached} 只${summary.degraded ? `（其中刷新失败 ${summary.degraded} 只）` : ''}` : summary.degraded ? ` · 日线刷新失败 ${summary.degraded} 只` : ''}${marketSummary}`;
 }
 

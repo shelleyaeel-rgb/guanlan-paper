@@ -5,6 +5,7 @@ const { INDEX_SYMBOLS, MARKET_REGIME_POLICY, evaluateMarketRegime, validateMarke
 const { MarketRegimeService } = require('../core/market-regime-service.cjs');
 const { cachedBreadthLoader } = require('../core/market-policy.cjs');
 const { AgencyService } = require('../core/agency-service.cjs');
+const { monitoringCheck } = require('../core/agency-monitoring.cjs');
 const { Engine, initialState } = require('../core/engine.cjs');
 
 const START = Date.parse('2026-10-16T10:00:00+08:00');
@@ -28,28 +29,57 @@ function harness(options = {}) {
     setFail() { fail = true; }, now: () => now, calls: () => calls };
 }
 
-test('市场环境组合指数中期趋势和同日广度，模板明确披露未回测', () => {
+test('市场环境仅按同日广度和指数波动分配权限，趋势继续作为观察证据', () => {
   const strong = evaluateMarketRegime(fixture(), START);
   assert.equal(strong.status, 'strong'); assert.equal(strong.riskMultiplier, 1); assert.equal(strong.allowBreakout, true);
   assert.equal(strong.metrics.indices.length, 3); assert.ok(strong.metrics.indices.every(index => index.ma20Slope5 > 0));
   assert.equal(strong.metrics.breadth.coverage, 1); assert.match(strong.policyNote, /尚未回测/);
+  assert.match(strong.policyNote, /指数中期趋势仅供观察/); assert.equal(strong.policyVersion, MARKET_REGIME_POLICY.version);
   assert.equal(validateMarketRegimeSnapshot(strong, START), strong);
-  const neutral = evaluateMarketRegime(fixture(START, { advancing: 0.5 }), START);
-  assert.equal(neutral.status, 'neutral'); assert.equal(neutral.riskMultiplier, 0.5); assert.equal(neutral.allowBreakout, false);
-  for (const options of [{ direction: -1 }, { advancing: 0.3 }]) {
-    const weak = evaluateMarketRegime(fixture(START, options), START);
-    assert.equal(weak.status, 'weak'); assert.equal(weak.allowEntry, false);
+  for (const direction of [-1, 0, 1]) {
+    for (const [advancing, status, multiplier] of [[0.6, 'strong', 1], [0.4, 'neutral', 0.5], [0.3, 'weak', 0]]) {
+      const result = evaluateMarketRegime(fixture(START, { direction, advancing }), START);
+      assert.equal(result.status, status, `direction=${direction}, advancing=${advancing}`);
+      assert.equal(result.riskMultiplier, multiplier); assert.equal(result.allowEntry, multiplier > 0);
+      assert.equal(result.allowBreakout, multiplier === 1);
+      assert.equal(result.metrics.downCount, direction === -1 ? 3 : 0);
+      assert.equal(result.metrics.upCount, direction === 1 ? 3 : 0);
+      assert.match(result.reason, /指数中期趋势仅供观察，不参与本次交易限制/);
+      assert.match(result.reason, /有效报价上涨占比/);
+      assert.equal(validateMarketRegimeSnapshot(result, START), result);
+    }
   }
 });
 
-test('高波动保持方向信息但限制计划风险和突破；平盘计入广度分母', () => {
-  const input = fixture(START, { highVolatility: true });
+test('弱广度暂停的观察文案不会把市场条件误归类为资金受限', () => {
+  for (const highVolatility of [false, true]) {
+    const marketRegime = evaluateMarketRegime(fixture(START, { direction: -1, advancing: 0.3, highVolatility }), START);
+    const check = monitoringCheck({ buyable: false, status: '市场环境暂停新开仓', reasons: marketRegime.reasons, marketRegime }, {}, START);
+    assert.equal(check.status, 'conditions');
+    assert.match(check.reason, /市场广度偏弱/);
+  }
+});
+
+test('广度35%含边界暂停、55%含边界正常，中间半额，不受三指数下降影响', () => {
+  for (const [advancing, status, multiplier] of [[0.35, 'weak', 0], [0.351, 'neutral', 0.5], [0.549, 'neutral', 0.5], [0.55, 'strong', 1]]) {
+    const result = evaluateMarketRegime(fixture(START, { direction: -1, advancing }), START);
+    assert.equal(result.metrics.downCount, 3); assert.equal(result.status, status);
+    assert.equal(result.riskMultiplier, multiplier); assert.equal(result.allowEntry, multiplier > 0);
+    assert.equal(result.allowBreakout, multiplier === 1);
+  }
+});
+
+test('三指数向下且广度60%时高波动仍半额禁突破；平盘计入广度分母', () => {
+  const input = fixture(START, { direction: -1, advancing: 0.6, highVolatility: true });
   const result = evaluateMarketRegime(input, START);
   assert.equal(result.status, 'strong'); assert.equal(result.riskMultiplier, 0.5); assert.equal(result.allowBreakout, false);
+  assert.equal(result.allowEntry, true); assert.equal(result.metrics.downCount, 3);
   assert.ok(result.metrics.indices[0].atrRatio >= MARKET_REGIME_POLICY.highAtrRatio);
+  assert.equal(validateMarketRegimeSnapshot(result, START), result);
   input.breadth.rows.slice(0, 600).forEach(row => { row.changePct = 0; });
   const flat = evaluateMarketRegime(input, START);
-  assert.equal(flat.metrics.breadth.unchanged, 600); assert.equal(flat.metrics.breadth.advanceRatio, 0.15);
+  assert.equal(flat.metrics.breadth.unchanged, 600); assert.equal(flat.metrics.breadth.advanceRatio, 0.1);
+  assert.equal(flat.status, 'weak'); assert.equal(flat.allowEntry, false);
 });
 
 test('指数缺失、日线滞后、未完成K线、跨日广度和覆盖不足全部关停新开仓', () => {
@@ -71,12 +101,17 @@ test('指数缺失、日线滞后、未完成K线、跨日广度和覆盖不足�
   assert.equal(evaluateMarketRegime(input, START).metrics.indices[0].asOf, '2026-10-15');
 });
 
-test('成交前校验拒绝过期、跨日、伪造权限及来源时间；不会刷新checkedAt', () => {
+test('成交前校验拒绝旧版、未知版本、过期、跨日、伪造权限及来源时间；不会刷新checkedAt', () => {
   const snapshot = evaluateMarketRegime(fixture(), START);
+  assert.equal(MARKET_REGIME_POLICY.version, 2);
   for (const [copy, at] of [[snapshot, START + 90000], [snapshot, START + 86400000], [{ ...snapshot, allowEntry: false }, START],
-    [{ ...snapshot, policyVersion: 2 }, START], [{ ...snapshot, evidence: { quoteTime: START + 1 } }, START]]) {
+    [{ ...snapshot, policyVersion: 1 }, START], [{ ...snapshot, policyVersion: MARKET_REGIME_POLICY.version + 1 }, START],
+    [{ ...snapshot, status: 'weak' }, START], [{ ...snapshot, allowBreakout: false }, START],
+    [{ ...snapshot, metrics: { ...snapshot.metrics, highVolatility: true } }, START],
+    [{ ...snapshot, evidence: { quoteTime: START + 1 } }, START]]) {
     const rejected = validateMarketRegimeSnapshot(copy, at);
     assert.equal(rejected.allowEntry, false); assert.equal(rejected.status, 'unknown'); assert.equal(rejected.checkedAt, snapshot.checkedAt);
+    assert.equal(rejected.policyVersion, MARKET_REGIME_POLICY.version);
   }
 });
 

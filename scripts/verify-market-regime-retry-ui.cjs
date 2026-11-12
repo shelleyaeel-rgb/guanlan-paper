@@ -62,7 +62,7 @@ async function waitIdle() {
     assert.match(await page.locator('#agency-market-badge').innerText(), /暂停新开仓/);
     if (profile.id === 'long') await capture('long-retry-progress');
     update({ marketHold: false }); await waitIdle();
-    assert.match(await page.locator('#toast').innerText(), /市场环境：待核验（暂停新开仓）/);
+    assert.match(await page.locator('#toast').innerText(), /市场环境：市场资料待核验（暂停新开仓）/);
     assert.match(await page.locator('#agency-market-reason').innerText(), /市场环境获取失败.*选股行情获取超时/);
     assert.doesNotMatch(await page.locator('#agency-market-reason').innerText(), /正在重新获取/);
     checks.push(`${profile.id}: real retry button starts one forced shared acquisition, exposes progress and keeps failed permissions closed`);
@@ -84,7 +84,7 @@ async function waitIdle() {
   assert.match(await page.locator('#agency-market-reason').innerText(), /本轮已使用备用来源.*新浪财经/);
   assert.match(await page.locator('#agency-market-time').innerText(), /广度来源：新浪财经/);
   assert.match(await page.locator('#agency-market-reason').innerText(), /改善等待持续确认/);
-  assert.match(await page.locator('#toast').innerText(), /市场环境：待核验（暂停新开仓）/);
+  assert.match(await page.locator('#toast').innerText(), /市场环境：市场资料待核验（暂停新开仓）/);
   assert.doesNotMatch(await page.locator('#agency-market-reason').innerText(), /选股行情获取超时|正在重新获取/);
   await capture('source-recovered-awaiting-confirmation');
   checks.push('fallback progress and final source are visible; recovered evidence clears the old timeout while the first sample still pauses all new entries');
@@ -96,7 +96,7 @@ async function waitIdle() {
   await page.waitForFunction(() => state.agency.runtime.marketRegime.status === 'strong');
   assert.match(await page.locator('#agency-market-badge').innerText(), /偏强.*正常风险预算/);
   await page.locator('#agency-verify').click(); await waitIdle();
-  assert.match(await page.locator('#toast').innerText(), /市场环境：偏强（已确认）/);
+  assert.match(await page.locator('#toast').innerText(), /市场环境：当日广度偏强（已确认）/);
   await capture('source-recovered-confirmed');
   checks.push('single-stock retry uses the same environment; only different evidence spanning 120 seconds restores permission');
   const current = await call('state');

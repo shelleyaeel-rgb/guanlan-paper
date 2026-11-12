@@ -4,6 +4,7 @@ const { Engine, initialState, validState } = require('../core/engine.cjs');
 const { EntryConfirmationTracker } = require('../core/entry-confirmation.cjs');
 const { enableMarketPolicy } = require('../core/market-policy.cjs');
 const { cnTime } = require('../core/common.cjs');
+const { MARKET_REGIME_POLICY } = require('../core/market-regime.cjs');
 
 const symbol = 'sz000001';
 function fixture() {
@@ -18,7 +19,7 @@ function fixture() {
   const technical = { asOf: '2026-10-14', close: 10.05, ma5: 10.02, ma20: 10, ma60: 9.5, atr: 0.4,
     macd: 0.1, rsi: 55, volumeRatio: 1, trend: true, breakout: false, support: 9.7, resistance: 11.5,
     entryLow: 9.9, entryHigh: 10.3, stop: 9.6, target: 11.5, dates: ['2026-10-14'] };
-  const regime = (status = 'neutral') => ({ version: 1, policyVersion: 1, status, label: status, riskMultiplier: status === 'weak' ? 0 : status === 'strong' ? 1 : 0.5,
+  const regime = (status = 'neutral') => ({ version: 1, policyVersion: MARKET_REGIME_POLICY.version, status, label: status, riskMultiplier: status === 'weak' ? 0 : status === 'strong' ? 1 : 0.5,
     allowEntry: status !== 'weak', allowBreakout: status === 'strong', checkedAt: now, expiresAt: now + 90000, date: cnTime(now).date, reasons: ['隔离市场状态'],
     metrics: { highVolatility: false }, evidence: { quoteTime: now, indexQuoteTimes: { sh000001: now, sz399001: now, sz399006: now }, breadthQuoteTime: now, breadthFetchedAt: now } });
   const quote = price => ({ symbol, name: '隔离测试', source: 'test', price, ask: price, bid: price - 0.01, prevClose: 10.05, open: 10,

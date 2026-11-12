@@ -12,7 +12,7 @@
     <button class="nav" data-page="stats"><span>▥</span> 交易统计</button>
     <button class="nav" data-page="settings"><span>⚙</span> 策略与设置</button>
   </nav>
-  <div class="sidebar-bottom"><div class="mini-label">交易原则</div><p>先定义风险<br>再等待机会</p><span>真实行情 · 虚拟资金</span><div class="version">WINDOWS DESKTOP / v1.9.2</div></div>
+  <div class="sidebar-bottom"><div class="mini-label">交易原则</div><p>先定义风险<br>再等待机会</p><span>真实行情 · 虚拟资金</span><div class="version">WINDOWS DESKTOP / v1.9.7</div></div>
 </aside>
 <main>
   <header><div><div class="eyebrow">A-SHARE TRADING WORKSPACE</div><h1 id="page-title">自动交易</h1></div><div class="header-right"><span id="session" class="pill">连接中</span><button id="refresh" class="subtle">↻ 刷新行情</button><span class="avatar">观</span></div></header>
@@ -124,7 +124,7 @@
       <div class="card-head"><h2>市场环境与开仓权限</h2></div>
       <p id="agency-market-summary" class="agency-market-summary" role="status">等待市场环境核验。</p><div id="agency-market-preparation" class="agency-preparation hidden" role="status"></div><p id="agency-market-reason" class="tiny"></p>
       <div id="agency-market-metrics" class="agency-market-metrics"></div><p id="agency-market-time" class="tiny"></p>
-      <details class="agency-market-details"><summary>查看指数证据与环境规则</summary><div id="agency-market-indices" class="table-wrap"></div><p class="tiny">偏弱或资料未知、过期：暂停新开仓。中性或高波动：单笔计划风险预算减半，只检查回踩。偏强且波动正常：使用原风险预算，超短线、短线和波段可检查突破，长线仍只检查回踩。环境改善需不同原始报价持续确认至少 120 秒，恶化立即降低权限。资金、盘口和其他策略规则仍须全部通过。非交易时段不自动更新开仓权限，旧证据过期后须重新核验。</p></details><p id="agency-market-policy-note" class="tiny"></p>
+      <details class="agency-market-details"><summary>查看当日广度、指数波动与趋势观察</summary><p class="tiny">四类策略均不使用指数中期趋势决定开仓权限、风险预算或突破权限；下表中期趋势与 MA20 变化仅供观察，指数波动仍参与风控。</p><div id="agency-market-indices" class="table-wrap"></div><p class="tiny">当日沪深 A 股有效报价上涨占比 ≤35% 为偏弱，暂停新开仓；≥55% 为偏强；其间为中性。中性使用单笔及策略总计划风险预算的 50%，只检查回踩；偏强且波动正常使用原预算，超短线、短线和波段可检查突破，长线仍只检查回踩。任一指数 ATR / 收盘价 ≥2.5% 时最多使用半额风险预算并关闭突破。资料未知、过期仍暂停新开仓；环境改善需不同原始报价持续确认至少 120 秒，恶化立即降低权限。资金、盘口和其他策略规则仍须全部通过。非交易时段不自动更新开仓权限，旧证据过期后须重新核验。</p></details><p id="agency-market-policy-note" class="tiny"></p>
     </section>
 
       <p class="tiny">程序须持续运行并联网；关闭、休眠或断线会中断检查，止损触发也不保证成交价格。固定规则不会学习或根据盈亏自行改写。</p></div></details>

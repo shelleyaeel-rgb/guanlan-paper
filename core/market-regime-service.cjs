@@ -111,19 +111,24 @@ class MarketRegimeService {
         signal.addEventListener('abort', abort, { once: true });
         Promise.resolve(promise).then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
       });
+      const readHistory = async (symbol, force) => {
+        try {
+          const history = await this.indexHistory(symbol, signal, force);
+          signal.throwIfAborted();
+          if (this.job === job) { this.preparedHistories[symbol] = history; this.preparationErrors[symbol] = ''; }
+          return history;
+        } catch (error) {
+          if (this.job === job && !signal.aborted) this.preparationErrors[symbol] = error.message;
+          throw error;
+        }
+      };
       try {
         if (!trading.known) throw Error(trading.label);
         if (typeof this.indexHistory !== 'function' || typeof this.getQuotes !== 'function' || typeof this.loadBreadth !== 'function') throw Error('市场环境数据源未配置');
         // Complete historical preparation while closed. Previous-session quotes
         // cannot confirm today's breadth or advance the live confirmation clock.
-        const outcomes = await wait(Promise.allSettled([...INDEX_SYMBOLS.map(async symbol => {
-          try {
-            const history = await this.indexHistory(symbol, signal, force);
-            signal.throwIfAborted(); preparedIndexHistory(symbol, history, this.now());
-            if (this.job === job) { this.preparedHistories[symbol] = history; this.preparationErrors[symbol] = ''; }
-            return history;
-          } catch (error) { if (this.job === job && !signal.aborted) this.preparationErrors[symbol] = error.message; throw error; }
-        }), ...(live ? [this.loadBreadth({ signal, force, onProgress: progress })] : typeof this.prepareUniverse === 'function' ? [(async () => {
+        const outcomes = await wait(Promise.allSettled([...INDEX_SYMBOLS.map(symbol => readHistory(symbol, force)),
+          ...(live ? [this.loadBreadth({ signal, force, onProgress: progress })] : typeof this.prepareUniverse === 'function' ? [(async () => {
           try {
             const universe = await this.prepareUniverse({ signal, force, onProgress: progress });
             signal.throwIfAborted(); validUniverse(universe, this.now());
@@ -137,37 +142,62 @@ class MarketRegimeService {
         if (failed) throw failed.reason;
         const histories = Object.fromEntries(INDEX_SYMBOLS.map((symbol, index) => [symbol, outcomes[index].value]));
         const currentTrading = this.calendar(new Date(this.now()));
-        if (!live) {
-          const prepared = INDEX_SYMBOLS.map(symbol => ({ symbol, asOf: preparedIndexHistory(symbol, histories[symbol], this.now()).asOf,
-            source: histories[symbol].source, fetchedAt: histories[symbol].fetchedAt }));
-          this.snapshot = unknownMarketRegime('指数历史资料已准备；等待开盘后自动获取当日指数报价与市场广度，并完成持续确认', this.now());
-          Object.assign(acquisition, { stage: 'prepared', completed: prepared.length, total: INDEX_SYMBOLS.length, prepared,
-            lastError: '', lastErrorAt: null });
-          if (this.getPreparation().ready) {
-            this.preparedAt = this.now();
-            this.snapshot = unknownMarketRegime('指数历史与完整证券名单已准备；等待开市后的实时行情和策略信号', this.now());
-          }
-        } else if (sessionKeyOf(currentTrading, this.now()) !== sessionKey) {
+        if (live && sessionKeyOf(currentTrading, this.now()) !== sessionKey) {
           this.confirmation = null;
           this.snapshot = unknownMarketRegime(`${currentTrading.label}；等待开盘后重新核验市场环境`, this.now());
           Object.assign(acquisition, { stage: 'waiting-open', lastError: '', lastErrorAt: null });
         } else {
-          // Read quotes after slow breadth work, so refresh loops supply current ticks.
-          const quotes = await wait(this.getQuotes()); signal.throwIfAborted();
-          if (this.job !== job) return this.getSnapshot();
-          if (sessionKeyOf(this.calendar(new Date(this.now())), this.now()) !== sessionKey) throw Error('获取实时行情期间交易时段已切换，等待当前时段重新核验');
-          const breadth = outcomes[3].value;
-          if (breadth?.universeSource && Number.isFinite(breadth.universeValidatedAt)) {
-            try {
-              this.preparedUniverse = validUniverse({ symbols: breadth.rows.map(row => row.symbol), source: breadth.universeSource,
-                sourceCount: breadth.sourceCount, excludedCount: breadth.excludedCount, validatedAt: breadth.universeValidatedAt,
-                date: cnTime(breadth.universeValidatedAt).date }, this.now());
-              this.preparationErrors.universe = '';
-            } catch { /* A permission evaluation still performs its own full evidence checks below. */ }
+          let quotes;
+          if (live) {
+            // Read quotes after slow breadth work, so refresh loops supply current ticks.
+            quotes = await wait(this.getQuotes());
           }
-          if (this.getPreparation().ready) this.preparedAt = this.now();
-          this.apply(evaluateMarketRegime({ histories, quotes, breadth: outcomes[3].value }, this.now()));
-          Object.assign(acquisition, { stage: 'complete', lastError: '', lastErrorAt: null, source: outcomes[3].value.source || '' });
+          // A background correction can revoke history during any source await.
+          // Read replacements at most twice, then validate and evaluate in this
+          // same synchronous turn so no extra Promise boundary reopens the race.
+          for (let attempt = 0; attempt <= 2; attempt++) {
+            signal.throwIfAborted();
+            if (this.job !== job) return this.getSnapshot();
+            if (sessionKeyOf(this.calendar(new Date(this.now())), this.now()) !== sessionKey) throw Error('核验指数日线期间交易时段已切换，等待当前时段重新核验');
+            const invalid = [];
+            let validationError;
+            for (const symbol of INDEX_SYMBOLS) {
+              try { preparedIndexHistory(symbol, histories[symbol], this.now()); }
+              catch (error) { invalid.push(symbol); validationError = error; this.preparationErrors[symbol] = error.message; }
+            }
+            if (!invalid.length) break;
+            if (attempt === 2) throw validationError;
+            const refreshed = await wait(Promise.allSettled(invalid.map(symbol => readHistory(symbol, false))));
+            signal.throwIfAborted();
+            if (this.job !== job) return this.getSnapshot();
+            const failed = refreshed.find(result => result.status === 'rejected');
+            if (failed) throw failed.reason;
+            for (const [index, symbol] of invalid.entries()) histories[symbol] = refreshed[index].value;
+          }
+          if (!live) {
+            const prepared = INDEX_SYMBOLS.map(symbol => ({ symbol, asOf: preparedIndexHistory(symbol, histories[symbol], this.now()).asOf,
+              source: histories[symbol].source, fetchedAt: histories[symbol].fetchedAt }));
+            this.snapshot = unknownMarketRegime('指数历史资料已准备；等待开盘后自动获取当日指数报价与市场广度，并完成持续确认', this.now());
+            Object.assign(acquisition, { stage: 'prepared', completed: prepared.length, total: INDEX_SYMBOLS.length, prepared,
+              lastError: '', lastErrorAt: null });
+            if (this.getPreparation().ready) {
+              this.preparedAt = this.now();
+              this.snapshot = unknownMarketRegime('指数历史与完整证券名单已准备；等待开市后的实时行情和策略信号', this.now());
+            }
+          } else {
+            const breadth = outcomes[3].value;
+            if (breadth?.universeSource && Number.isFinite(breadth.universeValidatedAt)) {
+              try {
+                this.preparedUniverse = validUniverse({ symbols: breadth.rows.map(row => row.symbol), source: breadth.universeSource,
+                  sourceCount: breadth.sourceCount, excludedCount: breadth.excludedCount, validatedAt: breadth.universeValidatedAt,
+                  date: cnTime(breadth.universeValidatedAt).date }, this.now());
+                this.preparationErrors.universe = '';
+              } catch { /* A permission evaluation still performs its own full evidence checks below. */ }
+            }
+            if (this.getPreparation().ready) this.preparedAt = this.now();
+            this.apply(evaluateMarketRegime({ histories, quotes, breadth }, this.now()));
+            Object.assign(acquisition, { stage: 'complete', lastError: '', lastErrorAt: null, source: breadth.source || '' });
+          }
         }
       } catch (error) {
         if (this.job !== job) return this.getSnapshot();

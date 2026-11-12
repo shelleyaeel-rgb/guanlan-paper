@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { Engine, initialState } = require('../core/engine.cjs');
 const { STRATEGY_PROFILES } = require('../core/strategy-profiles.cjs');
+const { MARKET_REGIME_POLICY } = require('../core/market-regime.cjs');
 
 const root = path.resolve(__dirname, '..');
 fs.mkdirSync(path.join(root, 'work'), { recursive: true });
@@ -28,7 +29,7 @@ const member = state.agency.groups.find(group => group.id === 'swing').members.f
 member.automaticCheck = { status: 'clear', checkedAt: now, reason: '限定公告窗口与价格基准已检查', dailyHistory: history };
 member.corporateVerification = { status: 'clear', checkedAt: now };
 member.reconciliation = { status: 'clear' }; member.awaitingVerification = false; member.lastVerifiedAt = now;
-state.agency.runtime.marketRegime = { version: 1, policyVersion: 1, date: '2026-10-22', status: 'unknown', label: '待核验',
+state.agency.runtime.marketRegime = { version: 1, policyVersion: MARKET_REGIME_POLICY.version, date: '2026-10-22', status: 'unknown', label: '待核验',
   riskMultiplier: 0, allowEntry: false, allowBreakout: false, checkedAt: now, expiresAt: now + 90000,
   reason: '改善等待持续确认', metrics: { indices: ['sh000001', 'sz399001', 'sz399006'].map(index => ({
     symbol: index, asOf: history.asOf, dailyHistory: history, quoteTime: now, trend: 'up', ma20Slope5: 0.003, atrRatio: 0.012
@@ -107,7 +108,7 @@ async function setHistory(patch) {
   await capture('indices-retained-cache-1120', '#agency-market-regime');
   const summary = await page.evaluate(() => agencyVerificationSummary({ summary: { checked: 4, clear: 4, waiting: 0, blocked: 0, cached: 3, degraded: 2 }, marketRegime: state.agency.runtime.marketRegime }));
   assert.match(summary, /复用有效日线 3 只（其中刷新失败 2 只）/);
-  assert.match(summary, /市场环境：待核验（暂停新开仓）/);
+  assert.match(summary, /市场环境：市场资料待核验（暂停新开仓）/);
   checks.push('all index sources and aggregate verification preserve failure visibility without granting market permission');
 
   for (const [status, label] of [['cached', '有效日线已缓存'], ['refreshing', '正在刷新完整日线'], ['fresh', '完整日线已获取']]) {

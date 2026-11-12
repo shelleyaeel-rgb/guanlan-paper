@@ -6,11 +6,11 @@ const { preparedHistoryValid, publicDailyHistory } = require('./daily-history.cj
 
 const INDEX_SYMBOLS = Object.freeze(['sh000001', 'sz399001', 'sz399006']);
 // These are disclosed product defaults, not fitted parameters or evidence of profitability.
-const MARKET_REGIME_POLICY = Object.freeze({ version: 1, quoteMaxAgeMs: 90000, breadthMaxAgeMs: 180000,
+const MARKET_REGIME_POLICY = Object.freeze({ version: 2, quoteMaxAgeMs: 90000, breadthMaxAgeMs: 180000,
   dailyMaxAgeMs: 21600000, minBreadthCount: 1000, minBreadthCoverage: 0.8,
   strongAdvanceRatio: 0.55, weakAdvanceRatio: 0.35, highAtrRatio: 0.025,
   confirmationMs: 120000, confirmationSamples: 2, confirmationMaxGapMs: 180000, pollIntervalMs: 30000,
-  note: '市场环境阈值为尚未回测及样本外验证的产品模板，不代表收益优势。广度为沪深 A 股有效同日报价中上涨股票占比，不含北交所；平盘计入分母。' });
+  note: '市场环境阈值为尚未回测及样本外验证的产品模板，不代表收益优势。开仓权限按当日市场广度与指数波动确定，指数中期趋势仅供观察，不影响任何策略的开仓权限或风险预算。广度为沪深 A 股有效同日报价中上涨股票占比，不含北交所；平盘计入分母。' });
 const mean = values => values.reduce((sum, value) => sum + value, 0) / values.length;
 const timeOf = now => now instanceof Date ? now.getTime() : Number(now);
 const goodTime = value => Number.isFinite(value) && value > 0 && value <= 8640000000000000;
@@ -18,7 +18,7 @@ const labels = { strong: '偏强', neutral: '中性', weak: '偏弱', unknown: '
 
 function unknownMarketRegime(reason = '市场环境尚未完成核验', now = Date.now(), previous = null) {
   const at = timeOf(now), validAt = goodTime(at) ? at : null;
-  return { version: 1, policyVersion: 1, status: 'unknown', label: labels.unknown, riskMultiplier: 0,
+  return { version: 1, policyVersion: MARKET_REGIME_POLICY.version, status: 'unknown', label: labels.unknown, riskMultiplier: 0,
     allowEntry: false, allowBreakout: false, checkedAt: previous?.checkedAt ?? validAt,
     expiresAt: previous?.expiresAt ?? validAt, date: previous?.date ?? (validAt ? cnTime(validAt).date : ''),
     reason, reasons: [reason], metrics: previous?.metrics || {}, evidence: previous?.evidence || {}, policyNote: MARKET_REGIME_POLICY.note };
@@ -27,7 +27,7 @@ function unknownMarketRegime(reason = '市场环境尚未完成核验', now = Da
 // The account boundary treats a missing, stale or inconsistent permission as closed.
 function validateMarketRegimeSnapshot(snapshot, now = Date.now()) {
   const at = timeOf(now), fail = reason => unknownMarketRegime(reason, at, snapshot);
-  if (!goodTime(at) || !snapshot || snapshot.version !== 1 || snapshot.policyVersion !== 1 || !Object.hasOwn(labels, snapshot.status)) return fail('市场环境快照身份或版本无效');
+  if (!goodTime(at) || !snapshot || snapshot.version !== 1 || snapshot.policyVersion !== MARKET_REGIME_POLICY.version || !Object.hasOwn(labels, snapshot.status)) return fail('市场环境快照身份或版本无效');
   if (!goodTime(snapshot.checkedAt) || !goodTime(snapshot.expiresAt) || snapshot.checkedAt > at || snapshot.expiresAt <= at
     || snapshot.expiresAt - snapshot.checkedAt > MARKET_REGIME_POLICY.quoteMaxAgeMs
     || snapshot.date !== cnTime(at).date || cnTime(snapshot.checkedAt).date !== snapshot.date) return fail(snapshot.status === 'unknown' && snapshot.reason ? snapshot.reason : '市场环境证据过期、跨日或时间无效，暂停新开仓');
@@ -122,14 +122,20 @@ function evaluateMarketRegime({ histories = {}, quotes = {}, breadth } = {}, now
     const expected = expectedDailyDate(at), indices = INDEX_SYMBOLS.map(symbol => indexMetrics(symbol, histories[symbol], quotes[symbol], at, expected));
     const broad = breadthMetrics(breadth, at), upCount = indices.filter(index => index.trend === 'up').length, downCount = indices.filter(index => index.trend === 'down').length;
     const highVolatility = indices.some(index => index.atrRatio >= policy.highAtrRatio);
-    const status = downCount >= 2 || broad.advanceRatio <= policy.weakAdvanceRatio ? 'weak'
-      : upCount >= 2 && broad.advanceRatio >= policy.strongAdvanceRatio ? 'strong' : 'neutral';
+    // Index direction is retained as observation evidence only. It cannot change
+    // entry permission, breakout permission or risk sizing for any strategy.
+    const status = broad.advanceRatio <= policy.weakAdvanceRatio ? 'weak'
+      : broad.advanceRatio >= policy.strongAdvanceRatio ? 'strong' : 'neutral';
     const riskMultiplier = status === 'weak' ? 0 : status === 'strong' && !highVolatility ? 1 : 0.5;
-    const reasons = [`三个指数中 ${upCount} 个中期向上、${downCount} 个中期向下；有效报价上涨占比 ${(broad.advanceRatio * 100).toFixed(1)}%`,
+    const breadthReason = status === 'weak' ? `不高于 ${(policy.weakAdvanceRatio * 100).toFixed(0)}%，市场广度偏弱`
+      : status === 'strong' ? `达到 ${(policy.strongAdvanceRatio * 100).toFixed(0)}%，市场广度偏强`
+        : `介于 ${(policy.weakAdvanceRatio * 100).toFixed(0)}% 与 ${(policy.strongAdvanceRatio * 100).toFixed(0)}% 之间，市场广度中性`;
+    const reasons = [`有效报价上涨占比 ${(broad.advanceRatio * 100).toFixed(1)}%，${breadthReason}`,
+      `三个指数中 ${upCount} 个中期向上、${downCount} 个中期向下；指数中期趋势仅供观察，不参与本次交易限制`,
       highVolatility ? '指数 ATR/收盘价达到高波动阈值，计划风险最多减半，暂停突破入场' : '指数波动未达到高波动阈值',
       riskMultiplier === 0 ? '暂停新开仓，已有持仓退出继续执行' : riskMultiplier === 0.5 ? '新开仓采用一半计划风险预算' : '新开仓采用正常计划风险预算，允许检查突破条件'];
     const quoteTime = Math.min(...indices.map(index => index.quoteTime), broad.oldestQuote);
-    return { version: 1, policyVersion: 1, status, label: labels[status], riskMultiplier, allowEntry: riskMultiplier > 0,
+    return { version: 1, policyVersion: policy.version, status, label: labels[status], riskMultiplier, allowEntry: riskMultiplier > 0,
       allowBreakout: status === 'strong' && riskMultiplier === 1, checkedAt: at,
       expiresAt: Math.min(...indices.map(index => index.quoteTime + policy.quoteMaxAgeMs), broad.oldestQuote + policy.breadthMaxAgeMs, broad.fetchedAt + policy.breadthMaxAgeMs),
       date: cnTime(at).date, reason: reasons.join('；'), reasons, metrics: { indices, breadth: broad, upCount, downCount, highVolatility },
